@@ -909,7 +909,7 @@ function TabBar({active,onNav,onFAB}){
   /* Portal the tab bar into document.body so it sits outside .app's overflow:hidden.
      On iOS PWA, position:fixed is trapped by overflow:hidden ancestors; portalling out fixes this. */
   return ReactDOM.createPortal(
-    <div className="tabbar" style={{background:t.tabbar}}>
+    <div className="tabbar" style={{background:t.tabbar,paddingBottom:'max(12px,env(safe-area-inset-bottom,12px))'}}>
       <div style={{display:'flex',alignItems:'center',height:58,padding:'0 8px'}}>
         {tab('dashboard',Ico.home,homeFilled)}
         {tab('map',Ico.map,mapFilled)}
@@ -4006,7 +4006,7 @@ function App(){
         {screen==='burrow-profile'&&<div className="scroll noscroll"><BurrowProfile burrowId={selectedId} data={data} nav={nav} dispatch={syncDispatch} openProfile={openProfile} authProfile={authProfile}/></div>}
       </div>
       {/* ── single tab bar, pinned below content, never overlapping ── */}
-      <div style={{flexShrink:0,height:'58px',background:'var(--tabbar)',borderTop:'1px solid var(--tabborder)'}}/>
+      <div style={{flexShrink:0,height:'calc(58px + max(12px,env(safe-area-inset-bottom,12px)))',background:'var(--tabbar)',borderTop:'1px solid var(--tabborder)'}}/>
       <TabBar active={screen} onNav={nav} onFAB={onFAB}/>
 
       {modal==='profile'&&<ProfileSheet onClose={()=>setModal(null)} onToggleTheme={toggleTheme} theme={theme} onEditProfile={()=>setModal('edit-profile')} onFAQ={()=>setModal('faq')} signedIn={signedIn} onToggleSignIn={toggleSignIn} data={data} onExport={()=>setModal('export')} onCSVImport={()=>setModal('csv-import')} authUser={authUser} authProfile={authProfile}/>}
