@@ -26,6 +26,8 @@ html,body{height:100%;overflow:hidden;background:#fff;font-family:-apple-system,
    left/right math centres it on desktop (>480px) and makes it full-width on mobile. */
 .tabbar{position:fixed;bottom:0;z-index:800;
   left:max(0px,calc(50vw - 240px));right:max(0px,calc(50vw - 240px));}
+/* Extend the tab bar background below the home indicator so no white gap shows in PWA mode */
+.tabbar::after{content:'';position:absolute;top:100%;left:0;right:0;height:80px;background:inherit;}
 /* Scrollable content area — sits above the tab bar, never behind it */
 .content-area{flex:1;position:relative;overflow:hidden;min-height:0;}
 .scroll{position:absolute;top:0;left:0;right:0;bottom:0;overflow-y:auto;-webkit-overflow-scrolling:touch;}
