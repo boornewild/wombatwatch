@@ -19,9 +19,10 @@
 <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin=""></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
-html,body{height:100%;overflow:hidden;background:#fff;font-family:-apple-system,"SF Pro Text","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;}
+html{height:100%;height:-webkit-fill-available;}
+body{height:100%;min-height:-webkit-fill-available;overflow:hidden;background:#fff;font-family:-apple-system,"SF Pro Text","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;}
 #root{height:100%;display:flex;justify-content:center;align-items:flex-start;}
-.app{width:100%;max-width:480px;height:100%;height:100svh;display:flex;flex-direction:column;overflow:hidden;background:var(--bg);}
+.app{width:100%;max-width:480px;height:100%;height:100svh;min-height:-webkit-fill-available;display:flex;flex-direction:column;overflow:hidden;background:var(--bg);}
 /* Tab bar: fixed to the true screen bottom so it's never left floating in PWA standalone mode.
    left/right math centres it on desktop (>480px) and makes it full-width on mobile. */
 .tabbar{position:fixed;bottom:0;z-index:800;
@@ -909,7 +910,7 @@ function TabBar({active,onNav,onFAB}){
   /* Portal the tab bar into document.body so it sits outside .app's overflow:hidden.
      On iOS PWA, position:fixed is trapped by overflow:hidden ancestors; portalling out fixes this. */
   return ReactDOM.createPortal(
-    <div className="tabbar" style={{background:t.tabbar,paddingBottom:'max(12px,env(safe-area-inset-bottom,12px))'}}>
+    <div className="tabbar" style={{background:t.tabbar}}>
       <div style={{display:'flex',alignItems:'center',height:58,padding:'0 8px'}}>
         {tab('dashboard',Ico.home,homeFilled)}
         {tab('map',Ico.map,mapFilled)}
@@ -4006,7 +4007,7 @@ function App(){
         {screen==='burrow-profile'&&<div className="scroll noscroll"><BurrowProfile burrowId={selectedId} data={data} nav={nav} dispatch={syncDispatch} openProfile={openProfile} authProfile={authProfile}/></div>}
       </div>
       {/* ── single tab bar, pinned below content, never overlapping ── */}
-      <div style={{flexShrink:0,height:'calc(58px + max(12px,env(safe-area-inset-bottom,12px)))',background:'var(--tabbar)',borderTop:'1px solid var(--tabborder)'}}/>
+      <div style={{flexShrink:0,height:'62px',background:'var(--tabbar)',borderTop:'1px solid var(--tabborder)'}}/>
       <TabBar active={screen} onNav={nav} onFAB={onFAB}/>
 
       {modal==='profile'&&<ProfileSheet onClose={()=>setModal(null)} onToggleTheme={toggleTheme} theme={theme} onEditProfile={()=>setModal('edit-profile')} onFAQ={()=>setModal('faq')} signedIn={signedIn} onToggleSignIn={toggleSignIn} data={data} onExport={()=>setModal('export')} onCSVImport={()=>setModal('csv-import')} authUser={authUser} authProfile={authProfile}/>}
