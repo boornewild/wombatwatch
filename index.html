@@ -27,8 +27,6 @@ body{height:100%;min-height:-webkit-fill-available;overflow:hidden;background:#f
    left/right math centres it on desktop (>480px) and makes it full-width on mobile. */
 .tabbar{position:fixed;bottom:0;z-index:800;
   left:max(0px,calc(50vw - 240px));right:max(0px,calc(50vw - 240px));}
-/* Extend the tab bar background below the home indicator so no white gap shows in PWA mode */
-.tabbar::after{content:'';position:absolute;top:100%;left:0;right:0;height:120px;background:var(--tabbar);}
 /* Scrollable content area — sits above the tab bar, never behind it */
 .content-area{flex:1;position:relative;overflow:hidden;min-height:0;}
 .scroll{position:absolute;top:0;left:0;right:0;bottom:0;overflow-y:auto;-webkit-overflow-scrolling:touch;}
@@ -1054,7 +1052,7 @@ function SwipeToDelete({children,onDelete}){
 }
 function ModalWrap({title,subtitle,onClose,onSave,saveLabel='Save',children}){
   const t=useTheme();
-  return <div style={{position:'fixed',inset:0,zIndex:1000,background:'rgba(15,25,18,0.5)',display:'flex',alignItems:'center',justifyContent:'center',padding:'16px calc(var(--sal) + 16px) calc(var(--sab) + 16px) calc(var(--sar) + 16px)'}}>
+  return <div style={{position:'fixed',inset:0,zIndex:1000,background:'rgba(15,25,18,0.5)',display:'flex',alignItems:'center',justifyContent:'center',padding:'calc(var(--sat) + 16px) calc(var(--sal) + 16px) calc(var(--sab) + 16px) calc(var(--sar) + 16px)'}}>
     <div style={{background:t.surface,borderRadius:20,padding:20,width:'100%',maxWidth:440,maxHeight:'90svh',overflowY:'auto',boxShadow:'0 20px 50px rgba(0,0,0,0.25)'}}>
       <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:14}}>
         <div style={{flex:1,textAlign:'center',paddingLeft:18}}>
@@ -1314,22 +1312,32 @@ function ActivityScreen({data,nav}){
    Full-screen celebration overlay with dismiss button.                         */
 function RecoveryModal({name,onClose}){
   const t=useTheme();
-  return <div style={{position:'fixed',inset:0,zIndex:9000,background:'rgba(15,30,18,0.72)',display:'flex',alignItems:'center',justifyContent:'center',padding:28}} onClick={onClose}>
-    <div onClick={e=>e.stopPropagation()} style={{background:t.surface,borderRadius:24,padding:'36px 28px 28px',textAlign:'center',maxWidth:340,width:'100%',boxShadow:'0 8px 40px rgba(0,0,0,0.28)',position:'relative'}}>
-      {/* Confetti dots */}
-      {[{c:'#E07B39',x:30,y:18},{c:'#4A7C52',x:78,y:10},{c:'#7A6AB8',x:55,y:6},{c:'#3B5B7A',x:15,y:40},{c:'#E07B39',x:85,y:35}].map((d,i)=>
-        <div key={i} style={{position:'absolute',width:10,height:10,borderRadius:'50%',background:d.c,left:`${d.x}%`,top:`${d.y}%`,opacity:0.75}}/>
-      )}
-      {/* Big wombat + heart */}
-      <div style={{fontSize:64,lineHeight:1,marginBottom:8}}>🐾</div>
-      <div style={{fontSize:22,fontWeight:800,color:t.ink,marginBottom:6}}>Recovery!</div>
-      <div style={{fontSize:15,color:t.mid,marginBottom:24,lineHeight:1.5}}>
-        <span style={{fontWeight:700,color:t.f700}}>{name}</span> has been marked healthy.<br/>
-        Great work getting this wombat back on their feet!
+  // Scattered confetti dots at fixed positions
+  const dots=[{c:'#E07B39',x:12,y:22,r:5},{c:'#7A6AB8',x:82,y:16,r:7},{c:'#4A7C52',x:55,y:8,r:5},{c:'#3B8FAA',x:88,y:52,r:5},{c:'#E07B39',x:8,y:62,r:7},{c:'#D4A84B',x:70,y:6,r:5},{c:'#C0506A',x:92,y:30,r:5},{c:'#7A6AB8',x:22,y:10,r:7}];
+  return <div style={{position:'fixed',inset:0,zIndex:9000,background:'rgba(10,22,14,0.78)',display:'flex',alignItems:'center',justifyContent:'center',padding:28}} onClick={onClose}>
+    <div onClick={e=>e.stopPropagation()} style={{background:t.surface,borderRadius:24,width:'100%',maxWidth:340,overflow:'hidden',boxShadow:'0 16px 60px rgba(0,0,0,0.35)'}}>
+      {/* Green gradient banner — matches PageHeader style */}
+      <div style={{background:`linear-gradient(150deg,${t.f600} 0%,${t.f800} 80%,${t.f900} 100%)`,padding:'32px 24px 28px',textAlign:'center',position:'relative',overflow:'hidden'}}>
+        {/* Confetti dots inside banner */}
+        {dots.map((d,i)=><div key={i} style={{position:'absolute',width:d.r*2,height:d.r*2,borderRadius:'50%',background:d.c,left:`${d.x}%`,top:`${d.y}%`,opacity:0.55,pointerEvents:'none'}}/>)}
+        {/* Wombat avatar */}
+        <div style={{width:80,height:80,borderRadius:20,background:'rgba(255,255,255,0.14)',display:'inline-flex',alignItems:'center',justifyContent:'center',marginBottom:14}}>
+          {Ico.wombat('rgba(255,255,255,0.92)',46)}
+        </div>
+        <div style={{fontSize:22,fontWeight:800,color:'#fff',letterSpacing:-0.3,lineHeight:1.1}}>Wombat recovered!</div>
+        <div style={{fontSize:13,color:'rgba(255,255,255,0.65)',marginTop:5,fontWeight:500}}>Milestone reached</div>
       </div>
-      <button onClick={onClose} style={{width:'100%',padding:'13px 0',borderRadius:14,background:'linear-gradient(135deg,#1F3A2A 0%,#3A6A42 100%)',color:'#fff',fontSize:15,fontWeight:700,letterSpacing:0.3}}>
-        Celebrate 🎉
-      </button>
+      {/* Body */}
+      <div style={{padding:'22px 24px 24px',textAlign:'center'}}>
+        <div style={{fontSize:15,color:t.mid,lineHeight:1.6,marginBottom:20}}>
+          <span style={{fontWeight:700,color:t.ink}}>{name}</span> has been marked healthy.{' '}
+          Great work getting this wombat back on their feet! 🐾
+        </div>
+        <Pill tone="sage">✓ Status set to Healthy</Pill>
+        <button onClick={onClose} style={{display:'block',width:'100%',marginTop:18,padding:'13px 0',borderRadius:14,background:`linear-gradient(135deg,${t.f700} 0%,${t.f600} 100%)`,color:'#fff',fontSize:15,fontWeight:700,letterSpacing:0.2,border:'none',cursor:'pointer'}}>
+          Celebrate 🎉
+        </button>
+      </div>
     </div>
   </div>;
 }
