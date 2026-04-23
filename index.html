@@ -848,10 +848,10 @@ async function supaFullSync(){
   // Build a set of record IDs that have a pending upsert in the offline queue.
   // These represent edits the user made offline that haven't uploaded yet —
   // the local version must always win over whatever the server returned.
+  let _pendingOps=[];
+  try{_pendingOps=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');}catch(e){}
   const queuedIds=new Set(
-    (()=>{try{return JSON.parse(localStorage.getItem(SQ_KEY)||'[]');}catch{return[];}}())
-      .filter(op=>op.t==='upsert'&&op.row?.id)
-      .map(op=>op.row.id)
+    _pendingOps.filter(op=>op.t==='upsert'&&op.row&&op.row.id).map(op=>op.row.id)
   );
   const merge=(remote,localKey,conv)=>{
     const map=Object.fromEntries((remote||[]).map(r=>[r.id,conv(r)]));
