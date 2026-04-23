@@ -88,9 +88,9 @@ const {useState,useEffect,useRef}=React;
 /* ════════════════════════════════════════════════════════════════
    WOMBATWATCH — ARCHITECTURE OVERVIEW
    ────────────────────────────────────────────────────────────────
-   Single-file React 18 PWA. No build step required for the source
-   (WombatWatch.html uses @babel/standalone at runtime). Run
-   `node build.mjs` to compile + minify into index.html for production.
+   Single-file React 18 PWA. No build step — @babel/standalone
+   transpiles JSX at runtime. To deploy: copy WombatWatch.html →
+   index.html and push to GitHub Pages alongside sw.js + manifest.json.
 
    DATA FLOW
      load() → useReducer(reducer, ...) → dispatch(action)
@@ -120,10 +120,12 @@ const {useState,useEffect,useRef}=React;
 
    OFFLINE  sw.js caches the app shell and map tiles.
      Tiles can be pre-fetched via the map page download button,
-     which writes directly to the 'wombatwatch-tiles-v2' cache.
+     which writes directly to the 'wombatwatch-tiles-v4' cache.
 
-   SYNC  _sync flag on records marks unsynced changes for a future
-     backend. Not currently wired to any remote endpoint.
+   SYNC  Records coming from Supabase carry _sync:true. Records
+     created offline have _sync:false (or undefined). The queue-aware
+     merge in supaFullSync uses _sync + the pending queue to decide
+     whether local or server state wins on reconnect.
 ════════════════════════════════════════════════════════════════ */
 
 /* ════════════════════════════════════════════════════════════════
@@ -281,6 +283,7 @@ const Ico={
   cloudDl:(c='#2E5536',s=18)=><svg width={s} height={s} viewBox="0 0 24 24" {...IS(c,1.8)}><path d="M6 16c-2 0-3.5-1.5-3.5-3.5S4 9 6 9c.5-2 2.5-3.5 5-3.5 3 0 5 2 5 4.5v.5c.3-.1.5-.1.8-.1 1.8 0 3.2 1.5 3.2 3.3s-1.5 3.3-3.2 3.3H6z"/><path d="M9 19l3 3 3-3M12 12v10"/></svg>,
   minus:(c='#2E5536',s=18)=><svg width={s} height={s} viewBox="0 0 24 24" {...IS(c,2.4)}><path d="M5 12h14"/></svg>,
   sort:(c='#2E5536',s=18)=><svg width={s} height={s} viewBox="0 0 24 24" {...IS(c,2)}><path d="M4 6h16M4 12h10M4 18h6"/></svg>,
+  close:(c='#2E5536',s=18)=><svg width={s} height={s} viewBox="0 0 24 24" {...IS(c,2)}><path d="M18 6L6 18M6 6l12 12"/></svg>,
 };
 
 /* ════════════════════════════════════════════════════════════════
@@ -441,20 +444,25 @@ const SD={
    Preference keys (theme, userName, signedIn) are NOT versioned
    so they survive data resets.
 ════════════════════════════════════════════════════════════════ */
+// SK — localStorage key registry
+// Short keys (w, b, t…) are used throughout the codebase via save(key, val).
+// To wipe all data and start fresh, bump the version suffix (ww2_ → ww3_).
+// Photo blobs are NOT stored here — they live in IndexedDB (see openPhotoIdb).
+// Photo metadata (id, wombatId, isProfile, etc.) IS stored here with dataUrl:null.
 const SK={
   // Versioned data — bump suffix (ww2_ → ww3_) to reset to seed data
-  w:  'ww2_wombats',
-  b:  'ww2_burrows',
-  t:  'ww2_treatments',
-  s:  'ww2_sightings',
-  bl: 'ww2_burrow_logs',
-  wp: 'ww2_wombat_photos',
-  bp: 'ww2_burrow_photos',
-  // User preferences — survive data resets
-  theme:        'ww_theme',
-  userName:     'ww_user_name',
-  signedIn:     'ww_signed_in',
-  offlineSaved: 'ww_offlineSaved',
+  w:  'ww2_wombats',       // Wombat[]       — wombat records
+  b:  'ww2_burrows',       // Burrow[]        — burrow records
+  t:  'ww2_treatments',    // Treatment[]     — treatment logs
+  s:  'ww2_sightings',     // Sighting[]      — sighting logs
+  bl: 'ww2_burrow_logs',   // BurrowLog[]     — burrow check logs
+  wp: 'ww2_wombat_photos', // Photo[]         — wombat photo metadata (blobs in IDB)
+  bp: 'ww2_burrow_photos', // Photo[]         — burrow photo metadata (blobs in IDB)
+  // User preferences — not versioned; survive data resets
+  theme:        'ww_theme',        // 'light' | 'dark'
+  userName:     'ww_user_name',    // display name string
+  signedIn:     'ww_signed_in',    // boolean — was user signed in at last launch
+  offlineSaved: 'ww_offlineSaved', // boolean — offline-mode intro seen
 };
 const load=()=>{try{return{
   wombats:JSON.parse(localStorage.getItem(SK.w))||SD.wombats,
@@ -470,10 +478,70 @@ const save=(key,val)=>{
   try{localStorage.setItem(SK[key],JSON.stringify(val));}
   catch(e){
     if(e&&(e.name==='QuotaExceededError'||e.code===22)){
-      alert('Storage full — photo could not be saved. Try clearing old photos or freeing up device storage.');
+      console.warn('[Storage] Quota exceeded for key:',key);
     }
   }
 };
+
+// ── IndexedDB photo store ─────────────────────────────────────────
+// Keeps base64 photo data out of localStorage's 5 MB quota.
+// Records (wombats, burrows, etc.) are small and stay in localStorage.
+// Photos from Supabase Storage are URLs (tiny) and also stay in localStorage.
+// Only offline-captured base64 images go into IDB.
+let _photoIdb=null;
+function openPhotoIdb(){
+  if(_photoIdb)return Promise.resolve(_photoIdb);
+  return new Promise((res,rej)=>{
+    const req=indexedDB.open('ww_photo_data',1);
+    req.onupgradeneeded=e=>e.target.result.createObjectStore('p');
+    req.onsuccess=e=>{_photoIdb=e.target.result;res(_photoIdb);};
+    req.onerror=e=>rej(e.target.error);
+  });
+}
+async function idbPutPhoto(id,dataUrl){
+  try{
+    const db=await openPhotoIdb();
+    return new Promise((res,rej)=>{
+      const tx=db.transaction('p','readwrite');
+      tx.objectStore('p').put(dataUrl,id);
+      tx.oncomplete=res;tx.onerror=rej;
+    });
+  }catch(e){console.warn('[IDB] put failed',e);}
+}
+async function idbGetAllPhotos(){
+  try{
+    const db=await openPhotoIdb();
+    return new Promise((res,rej)=>{
+      const tx=db.transaction('p','readonly');
+      const map={};
+      tx.objectStore('p').openCursor().onsuccess=e=>{
+        const c=e.target.result;
+        if(c){map[c.key]=c.value;c.continue();}else res(map);
+      };
+      tx.onerror=()=>res({});
+    });
+  }catch(e){return{};}
+}
+async function idbGetPhoto(id){
+  try{
+    const db=await openPhotoIdb();
+    return new Promise((res)=>{
+      const req=db.transaction('p','readonly').objectStore('p').get(id);
+      req.onsuccess=()=>res(req.result||null);
+      req.onerror=()=>res(null);
+    });
+  }catch(e){return null;}
+}
+async function idbDeletePhoto(id){
+  try{
+    const db=await openPhotoIdb();
+    const tx=db.transaction('p','readwrite');
+    tx.objectStore('p').delete(id);
+  }catch(e){}
+}
+// Strip base64 dataUrls before saving to localStorage (they live in IDB instead).
+// Supabase Storage URLs (https://...) are small and safe to keep.
+const noB64=p=>p.dataUrl?.startsWith('data:')?{...p,dataUrl:null}:p;
 /* ── Streak helpers ──────────────────────────────────────────────
    A "week key" is YYYY-WNN. Any logging activity within a calendar
    week counts. Missing a full week resets the streak to 1.        */
@@ -610,32 +678,57 @@ async function resolvePhotoUrl(dataUrl,photoId,localKey){
 // ── Offline queue ─────────────────────────────────────────────
 const SQ_KEY='ww_sync_queue';
 const SQ_MAX_RETRIES=5; // drop an op after this many consecutive failures
-function queueOp(op){try{const q=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');q.push({...op,_retries:0});localStorage.setItem(SQ_KEY,JSON.stringify(q));}catch(e){}}
+function queueOp(op){
+  try{const q=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');q.push({...op,_retries:0});localStorage.setItem(SQ_KEY,JSON.stringify(q));}catch(e){}
+  // Register a Background Sync tag so the queue flushes once connectivity is confirmed stable.
+  // No-op on iOS (BackgroundSync not supported there) and degrades silently on older browsers.
+  try{navigator.serviceWorker?.ready.then(r=>r.sync?.register('ww-queue-flush')).catch(()=>{});}catch(e){}
+}
 async function flushQueue(userId){
   try{
     const q=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');
     if(!q.length)return;
+    // Process parents before children so FK constraints are never violated
+    // wombats/burrows → treatments/sightings/logs → photos
+    const TABLE_PRI={wombats:0,burrows:0,treatments:1,sightings:1,burrow_logs:1,wombat_photos:2,burrow_photos:2};
+    q.sort((a,b)=>(TABLE_PRI[a.table]??1)-(TABLE_PRI[b.table]??1));
     const remaining=[];
     for(const op of q){
       let ok=false;
+      let skip=false;
       try{
         if(op.t==='upsert'){
           let row={...op.row,created_by:op.row.created_by||userId};
-          // If the queued row still has base64 photo data, upload to Storage first
-          if(row.data_url&&row.data_url.startsWith('data:')){
-            const lk=op.table==='wombat_photos'?SK.wp:SK.bp;
-            const url=await resolvePhotoUrl(row.data_url,row.id,lk);
-            row={...row,data_url:url};
+          // Photo rows: if data_url is still base64, upload it; if null, load from IDB first
+          if(op.table==='wombat_photos'||op.table==='burrow_photos'){
+            if(row.data_url&&row.data_url.startsWith('data:')){
+              const lk=op.table==='wombat_photos'?SK.wp:SK.bp;
+              const url=await resolvePhotoUrl(row.data_url,row.id,lk);
+              row={...row,data_url:url};
+            }else if(!row.data_url){
+              const idbData=await idbGetPhoto(row.id);
+              if(!idbData){
+                // Blob is gone from IDB — silently discard to avoid pushing a null record
+                console.warn('[Queue] Photo blob missing from IDB, discarding op:',row.id);
+                skip=true;
+              }else{
+                const url=await resolvePhotoUrl(idbData,row.id,op.table==='wombat_photos'?SK.wp:SK.bp);
+                row={...row,data_url:url};
+              }
+            }
           }
-          ok=await supaUpsert(op.table,row);
+          if(!skip) ok=await supaUpsert(op.table,row);
         }else if(op.t==='delete'){
           ok=await supaDelete(op.table,op.id);
         }
       }catch(e){}
+      if(skip) continue; // already handled above
       if(!ok){
         const retries=(op._retries||0)+1;
         if(retries>=SQ_MAX_RETRIES){
           console.warn('[Queue] Dropping op after',retries,'failures:',op.t,op.table||op.id);
+          // Notify the user so data loss doesn't go unnoticed
+          if(typeof alert!=='undefined') alert('⚠️ A record could not be synced after several attempts and has been dropped.\n\nThis may be due to a permissions issue or a schema mismatch. Please check your data and re-enter if needed.');
         }else{
           remaining.push({...op,_retries:retries});
         }
@@ -679,9 +772,10 @@ async function syncAction(action,userId){
       }
       case'DELETE_BURROW_LOG': await del('burrow_logs',action.logId); break;
       case'ADD_WOMBAT_PHOTO': {
-        // Upload photo data to Supabase Storage; store URL in DB (not base64)
+        // Upload photo data to Supabase Storage; store URL in DB (not base64).
+        // Offline: queue with null data_url — flushQueue loads the blob from IDB.
         const wp=action.photo;
-        const url=navigator.onLine?await resolvePhotoUrl(wp.dataUrl,wp.id,SK.wp):wp.dataUrl;
+        const url=navigator.onLine?await resolvePhotoUrl(wp.dataUrl,wp.id,SK.wp):null;
         await push('wombat_photos',wombatPhotoToDb({...wp,dataUrl:url},userId));
         break;
       }
@@ -700,8 +794,9 @@ async function syncAction(action,userId){
         break;
       }
       case'ADD_BURROW_PHOTO': {
+        // Offline: queue with null data_url — flushQueue loads the blob from IDB.
         const bp=action.photo;
-        const url=navigator.onLine?await resolvePhotoUrl(bp.dataUrl,bp.id,SK.bp):bp.dataUrl;
+        const url=navigator.onLine?await resolvePhotoUrl(bp.dataUrl,bp.id,SK.bp):null;
         await push('burrow_photos',burrowPhotoToDb({...bp,dataUrl:url},userId));
         break;
       }
@@ -750,10 +845,18 @@ async function supaFullSync(){
   };
   const[w,b,t,s,bl,wp,bp]=[val(results[0],'wombats'),val(results[1],'burrows'),val(results[2],'treatments'),val(results[3],'sightings'),val(results[4],'burrow_logs'),val(results[5],'wombat_photos'),val(results[6],'burrow_photos')];
   if(!(w?.length||0)&&!(b?.length||0))return null; // new user
+  // Build a set of record IDs that have a pending upsert in the offline queue.
+  // These represent edits the user made offline that haven't uploaded yet —
+  // the local version must always win over whatever the server returned.
+  const queuedIds=new Set(
+    (()=>{try{return JSON.parse(localStorage.getItem(SQ_KEY)||'[]');}catch{return[];}}())
+      .filter(op=>op.t==='upsert'&&op.row?.id)
+      .map(op=>op.row.id)
+  );
   const merge=(remote,localKey,conv)=>{
     const map=Object.fromEntries((remote||[]).map(r=>[r.id,conv(r)]));
-    // Layer in any local unsynced records (offline edits win)
-    (JSON.parse(localStorage.getItem(SK[localKey])||'[]')).filter(r=>!r._sync).forEach(r=>{map[r.id]=r;});
+    // Local record wins if: never synced to server (!_sync), OR has a pending edit in the queue
+    (JSON.parse(localStorage.getItem(SK[localKey])||'[]')).filter(r=>!r._sync||queuedIds.has(r.id)).forEach(r=>{map[r.id]=r;});
     return Object.values(map);
   };
   return{
@@ -1071,7 +1174,8 @@ function ModalWrap({title,subtitle,onClose,onSave,saveLabel='Save',children}){
 }
 
 /* ════════════════════════════════════════════════════════════════
-   SCREENS
+   UTILITY WIDGETS
+   Acknowledgement footer, weather widget — reusable across screens.
 ════════════════════════════════════════════════════════════════ */
 function AcknowledgementFooter(){
   const t=useTheme();
@@ -1228,7 +1332,12 @@ function WeatherWidget(){
   </Card>;
 }
 
-/* ── ALL ACTIVITY SCREEN ── */
+/* ════════════════════════════════════════════════════════════════
+   SCREENS — ACTIVITY & DASHBOARD
+   ActivityScreen: chronological feed of all events across the program.
+   RecoveryModal:  celebration shown when a wombat is marked healthy.
+   Dashboard:      home screen — summary tiles, quick-add, streaks.
+════════════════════════════════════════════════════════════════ */
 function ActivityScreen({data,nav}){
   const t=useTheme();
   const wombats=data.wombats;
@@ -1342,6 +1451,7 @@ function RecoveryModal({name,onClose}){
   </div>;
 }
 
+/* ── DASHBOARD ── */
 function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
   const t=useTheme();
   const wombats=data.wombats;
@@ -1459,7 +1569,7 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
 // Bounding box covering the Macdonald Valley / St Albans operational area
 const OFFLINE_BBOX={n:-33.0,s:-33.35,w:150.75,e:151.1};
 const OFFLINE_ZOOM_MIN=10, OFFLINE_ZOOM_MAX=15;
-const TILE_CACHE_NAME='wombatwatch-tiles-v3'; // must match sw.js TILE_CACHE
+const TILE_CACHE_NAME='wombatwatch-tiles-v4'; // must match sw.js TILE_CACHE
 
 function latToTY(lat,z){
   const r=lat*Math.PI/180;
@@ -1481,6 +1591,11 @@ const OFFLINE_TILES=Object.freeze([...genTiles(OFFLINE_BBOX,OFFLINE_ZOOM_MIN,OFF
 const OFFLINE_SIZE_MB=(OFFLINE_TILES.length*5/1024).toFixed(0);
 
 /* ── MAP ── */
+/* ════════════════════════════════════════════════════════════════
+   SCREEN — MAP
+   Full-screen Leaflet map. Long-press to add a wombat or burrow
+   at a chosen location. Offline tile download managed here.
+════════════════════════════════════════════════════════════════ */
 function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
   const t=useTheme();
   const mapRef=useRef(null);
@@ -1816,6 +1931,11 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
 
 /* ── WOMBAT LIST ── */
 const selStyle=(t)=>({flex:1,height:38,borderRadius:19,background:t.surface,boxShadow:t.shadow,padding:'0 36px 0 14px',border:'none',fontSize:13,color:t.ink,fontFamily:'inherit',appearance:'none',WebkitAppearance:'none',backgroundImage:`url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238A9E8A' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E")`,backgroundRepeat:'no-repeat',backgroundPosition:'right 14px center'});
+/* ════════════════════════════════════════════════════════════════
+   SCREENS — WOMBATS
+   WombatList:    searchable list of all wombats.
+   WombatProfile: detail view — health, treatments, sightings, photos.
+════════════════════════════════════════════════════════════════ */
 function WombatList({data,nav,onFAB,openProfile}){
   const t=useTheme();
   const [search,setSearch]=useState('');
@@ -1987,8 +2107,11 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
         </div>
       </>}
       {activeTab===1&&<>
-        <SectionLabel action={<label style={{border:'none',background:t.f700,color:'#fff',padding:'8px 14px',borderRadius:999,fontSize:12.5,fontWeight:600,display:'inline-flex',alignItems:'center',gap:6,cursor:'pointer'}}>{Ico.plus('#fff',14)} Add Photo<input type="file" accept="image/*" style={{display:'none'}} onChange={handlePhotoUpload}/></label>}>Photos</SectionLabel>
-        {photos.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'30px 0',fontSize:14}}>No photos yet. Tap "Add Photo" to get started.</div>}
+        <SectionLabel action={<div style={{display:'flex',gap:6}}>
+          <label style={{border:'none',background:t.f700,color:'#fff',padding:'7px 12px',borderRadius:999,fontSize:12,fontWeight:600,display:'inline-flex',alignItems:'center',gap:5,cursor:'pointer'}}>{Ico.camera('#fff',13)} Camera<input type="file" accept="image/*" capture="environment" style={{display:'none'}} onChange={handlePhotoUpload}/></label>
+          <label style={{border:'none',background:t.f700,color:'#fff',padding:'7px 12px',borderRadius:999,fontSize:12,fontWeight:600,display:'inline-flex',alignItems:'center',gap:5,cursor:'pointer'}}>{Ico.layers('#fff',13)} Gallery<input type="file" accept="image/*" style={{display:'none'}} onChange={handlePhotoUpload}/></label>
+        </div>}>Photos</SectionLabel>
+        {photos.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'30px 0',fontSize:14}}>No photos yet.</div>}
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
           {photos.map(p=><div key={p.id} style={{borderRadius:16,overflow:'hidden',position:'relative',background:t.soft,aspectRatio:'1'}}>
             <img src={p.dataUrl} style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}} alt=""/>
@@ -2119,6 +2242,11 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
 }
 
 /* ── BURROW LIST ── */
+/* ════════════════════════════════════════════════════════════════
+   SCREENS — BURROWS
+   BurrowList:    searchable list of all burrows.
+   BurrowProfile: detail view — status, logs, linked wombats, photos.
+════════════════════════════════════════════════════════════════ */
 function BurrowList({data,nav,onFAB,openProfile}){
   const t=useTheme();
   const [search,setSearch]=useState('');
@@ -2315,8 +2443,11 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
         </Card>
       </>}
       {activeTab===2&&<>
-        <SectionLabel action={<label style={{border:'none',background:t.f700,color:'#fff',padding:'8px 14px',borderRadius:999,fontSize:12.5,fontWeight:600,display:'inline-flex',alignItems:'center',gap:6,cursor:'pointer'}}>{Ico.plus('#fff',14)} Add Photo<input type="file" accept="image/*" style={{display:'none'}} onChange={handleBurrowPhotoUpload}/></label>}>Photos</SectionLabel>
-        {bPhotos.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'30px 0',fontSize:14}}>No photos yet. Tap "Add Photo" to get started.</div>}
+        <SectionLabel action={<div style={{display:'flex',gap:6}}>
+          <label style={{border:'none',background:t.f700,color:'#fff',padding:'7px 12px',borderRadius:999,fontSize:12,fontWeight:600,display:'inline-flex',alignItems:'center',gap:5,cursor:'pointer'}}>{Ico.camera('#fff',13)} Camera<input type="file" accept="image/*" capture="environment" style={{display:'none'}} onChange={handleBurrowPhotoUpload}/></label>
+          <label style={{border:'none',background:t.f700,color:'#fff',padding:'7px 12px',borderRadius:999,fontSize:12,fontWeight:600,display:'inline-flex',alignItems:'center',gap:5,cursor:'pointer'}}>{Ico.layers('#fff',13)} Gallery<input type="file" accept="image/*" style={{display:'none'}} onChange={handleBurrowPhotoUpload}/></label>
+        </div>}>Photos</SectionLabel>
+        {bPhotos.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'30px 0',fontSize:14}}>No photos yet.</div>}
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
           {bPhotos.map(p=><div key={p.id} style={{borderRadius:16,overflow:'hidden',position:'relative',background:t.soft,aspectRatio:'1'}}>
             <img src={p.dataUrl} style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}} alt=""/>
@@ -2350,6 +2481,12 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
 
 /* ════════════════════════════════════════════════════════════════
    BOTTOM SHEETS & MODALS
+   ProfileSheet:    user account, theme toggle, export, sign out.
+   ExportSheet:     JSON / CSV data export.
+   CSVImportModal:  bulk import wombats or burrows from CSV.
+   EditProfileModal: change display name.
+   FAQSheet:        help & FAQ content.
+   FABSheet:        "add" action picker (wombat / burrow).
 ════════════════════════════════════════════════════════════════ */
 
 /* ── PROFILE SHEET ── */
@@ -2473,6 +2610,7 @@ function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,
 }
 
 /* ── EXPORT SHEET ── */
+/* ── EXPORT SHEET ── */
 function ExportSheet({data,onClose}){
   const t=useTheme();
   const ds=new Date().toISOString().slice(0,10);
@@ -2583,6 +2721,7 @@ function ExportSheet({data,onClose}){
   </div>;
 }
 
+/* ── CSV IMPORT MODAL ── */
 /* ── CSV IMPORT MODAL ── */
 function CSVImportModal({onClose,onImportWombats,onImportBurrows}){
   const t=useTheme();
@@ -2742,6 +2881,7 @@ function CSVImportModal({onClose,onImportWombats,onImportBurrows}){
 }
 
 /* ── EDIT PROFILE MODAL ── */
+/* ── EDIT PROFILE MODAL ── */
 function EditProfileModal({onClose}){
   const t=useTheme();
   const [name,setName]=useState((typeof localStorage!=='undefined'&&localStorage.getItem(SK.userName))||'');
@@ -2770,6 +2910,7 @@ const FAQ_ITEMS=[
   {q:'How do I link a wombat to a burrow?',a:'When logging a treatment, expand "More options" → Location → Burrow, then search for the burrow. This creates a two-way link automatically.'},
   {q:'Does WombatWatch work offline?',a:'Yes — all data is stored locally on your device. Records sync when you\'re back online.'},
 ];
+/* ── FAQ SHEET ── */
 function FAQSheet({onClose}){
   const t=useTheme();
   const [open,setOpen]=useState(null);
@@ -2811,6 +2952,7 @@ function FAQSheet({onClose}){
 }
 
 /* ── FAB SHEET ── */
+/* ── FAB SHEET ── */
 function FABSheet({onClose,onSelect}){
   const t=useTheme();
   const actions=[
@@ -2835,12 +2977,13 @@ function FABSheet({onClose,onSelect}){
   </div>;
 }
 
-/* ── MAP PICKER MODAL ── */
 /* ════════════════════════════════════════════════════════════════
-   GEO SEARCH — Nominatim address autocomplete
-   Calls the free OpenStreetMap geocoder, debounced at 400 ms.
-   onSelect({lat, lng, address}) — address is the short display name
-   onCancel() — user dismissed without selecting
+   MAP COMPONENTS
+   GeoSearch:      Nominatim address autocomplete (debounced 400ms).
+                   onSelect({lat,lng,address}) / onCancel()
+   MapPickerModal: full-screen map sheet for choosing a lat/lng.
+                   Bottom-sheet style; GPS snap button; backdrop-dismiss.
+   MiniMap:        small static Leaflet embed used on profile screens.
 ════════════════════════════════════════════════════════════════ */
 function GeoSearch({onSelect,onCancel}){
   const t=useTheme();
@@ -2950,10 +3093,13 @@ function GeoSearch({onSelect,onCancel}){
 // Uses Nominatim at zoom=14 (neighbourhood level). Returns null on failure.
 async function reverseGeocode(lat,lng){
   try{
+    const ctrl=new AbortController();
+    const timer=setTimeout(()=>ctrl.abort(),5000); // 5 s field timeout
     const res=await fetch(
       `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&zoom=14&accept-language=en`,
-      {headers:{'Accept':'application/json'}}
+      {headers:{'Accept':'application/json'},signal:ctrl.signal}
     );
+    clearTimeout(timer);
     const d=await res.json();
     const a=d.address||{};
     // Prefer the most local name available, fall back up the hierarchy
@@ -2970,34 +3116,79 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
   const [picked,setPicked]=useState(initialLat?{lat:initialLat,lng:initialLng}:null);
   useEffect(()=>{
     if(!mapRef.current||leafRef.current)return;
-    const lat=initialLat||-33.5;const lng=initialLng||149.5;
-    const map=L.map(mapRef.current,{zoomControl:true}).setView([lat,lng],initialLat?14:7);
-    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap'}).addTo(map);
-    if(initialLat){markerRef.current=L.marker([initialLat,initialLng]).addTo(map);}
-    map.on('click',e=>{
-      const{lat,lng}=e.latlng;
-      if(markerRef.current)markerRef.current.remove();
-      markerRef.current=L.marker([lat,lng]).addTo(map);
-      setPicked({lat,lng});
-    });
-    leafRef.current=map;
+    // If we have an initial location, use it. Otherwise try GPS, fall back to Macdonald Valley.
+    const initMap=(lat,lng,zoom)=>{
+      if(leafRef.current)return; // guard against double-init if GPS came back late
+      const map=L.map(mapRef.current,{zoomControl:true}).setView([lat,lng],zoom);
+      L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap',maxZoom:19}).addTo(map);
+      if(initialLat){markerRef.current=L.marker([initialLat,initialLng]).addTo(map);}
+      map.on('click',e=>{
+        const{lat,lng}=e.latlng;
+        if(markerRef.current)markerRef.current.remove();
+        markerRef.current=L.marker([lat,lng]).addTo(map);
+        setPicked({lat,lng});
+      });
+      leafRef.current=map;
+    };
+    if(initialLat){
+      initMap(initialLat,initialLng,14);
+    }else if(navigator.geolocation){
+      // Start at a rough view immediately, then snap to GPS if it arrives quickly
+      initMap(-33.166,150.983,12); // Macdonald Valley default
+      navigator.geolocation.getCurrentPosition(
+        pos=>{ if(leafRef.current)leafRef.current.setView([pos.coords.latitude,pos.coords.longitude],14); },
+        ()=>{}, // silent fallback — already showing default view
+        {timeout:4000,maximumAge:30000}
+      );
+    }else{
+      initMap(-33.166,150.983,12);
+    }
     return()=>{if(leafRef.current){leafRef.current.remove();leafRef.current=null;}};
   },[]);
-  return <div style={{position:'fixed',inset:0,zIndex:1100,display:'flex',flexDirection:'column',alignItems:'center',background:'rgba(0,0,0,0.5)'}}>
-    <div style={{width:'100%',maxWidth:480,height:'100%',display:'flex',flexDirection:'column',background:t.bg}}>
-      <div style={{display:'flex',alignItems:'center',gap:12,padding:'max(16px,calc(var(--sat)+12px)) 16px 12px',background:t.surface,borderBottom:`1px solid ${t.div}`}}>
-        <button onClick={onClose} style={{width:32,height:32,borderRadius:16,background:t.soft,border:'none',display:'flex',alignItems:'center',justifyContent:'center'}}>{Ico.chevDown(t.ink,16)}</button>
-        <div style={{fontSize:17,fontWeight:700,color:t.ink}}>Pick location</div>
-      </div>
-      <div ref={mapRef} style={{flex:1}}/>
-      <div style={{padding:'12px 20px calc(var(--sab)+16px)',background:t.surface,borderTop:`1px solid ${t.div}`}}>
-        {picked
-          ? <button onClick={()=>onConfirm(picked)} style={{width:'100%',height:50,borderRadius:16,background:t.f700,color:'#fff',fontSize:15,fontWeight:700,border:'none'}}>Use this location — {picked.lat.toFixed(4)}, {picked.lng.toFixed(4)}</button>
-          : <div style={{textAlign:'center',color:t.mid,fontSize:14,padding:'12px 0'}}>Tap the map to place a pin</div>
-        }
+  return(
+    // Backdrop — tap to cancel
+    <div onClick={onClose} style={{position:'fixed',inset:0,zIndex:1100,display:'flex',flexDirection:'column',justifyContent:'flex-end',alignItems:'center',background:'rgba(0,0,0,0.55)',paddingTop:'calc(var(--sat) + 48px)'}}>
+      <div onClick={e=>e.stopPropagation()} style={{width:'100%',maxWidth:480,height:'88%',display:'flex',flexDirection:'column',background:t.bg,borderRadius:'20px 20px 0 0',overflow:'hidden',boxShadow:'0 -8px 32px rgba(0,0,0,0.25)'}}>
+        <div style={{display:'flex',alignItems:'center',gap:12,padding:'14px 16px 12px',background:t.surface,borderBottom:`1px solid ${t.div}`,flexShrink:0}}>
+          <button onClick={onClose} style={{width:36,height:36,borderRadius:18,background:t.soft,border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>
+            {Ico.close(t.ink,16)}
+          </button>
+          <div style={{fontSize:17,fontWeight:700,color:t.ink,flex:1}}>Pick location</div>
+          {picked&&<button onClick={()=>onConfirm(picked)} style={{padding:'8px 16px',borderRadius:12,background:t.f700,color:'#fff',fontSize:13,fontWeight:700,border:'none',cursor:'pointer'}}>Confirm</button>}
+        </div>
+        <div style={{flex:1,position:'relative'}}>
+          <div ref={mapRef} style={{width:'100%',height:'100%'}}/>
+          {/* GPS button overlay */}
+          <button
+            onClick={()=>{
+              if(!navigator.geolocation)return;
+              navigator.geolocation.getCurrentPosition(pos=>{
+                const{latitude:lat,longitude:lng}=pos.coords;
+                if(leafRef.current){
+                  leafRef.current.setView([lat,lng],16);
+                  // Place a pin at the GPS position
+                  if(markerRef.current)markerRef.current.remove();
+                  markerRef.current=L.marker([lat,lng]).addTo(leafRef.current);
+                  setPicked({lat,lng});
+                }
+              },()=>alert('Could not get your location. Check permissions.'),{timeout:8000,maximumAge:10000});
+            }}
+            style={{position:'absolute',bottom:16,right:16,zIndex:500,width:44,height:44,borderRadius:12,background:t.surface,boxShadow:'0 2px 10px rgba(0,0,0,0.2)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}
+          >
+            {Ico.crosshair(t.f700,20)}
+          </button>
+        </div>
+        <div style={{padding:'12px 20px calc(var(--sab)+16px)',background:t.surface,borderTop:`1px solid ${t.div}`,flexShrink:0}}>
+          {picked
+            ? <button onClick={()=>onConfirm(picked)} style={{width:'100%',height:50,borderRadius:16,background:t.f700,color:'#fff',fontSize:15,fontWeight:700,border:'none',cursor:'pointer'}}>
+                Use this location — {picked.lat.toFixed(4)}, {picked.lng.toFixed(4)}
+              </button>
+            : <div style={{textAlign:'center',color:t.mid,fontSize:14,padding:'12px 0'}}>Tap the map to place a pin</div>
+          }
+        </div>
       </div>
     </div>
-  </div>;
+  );
 }
 
 /* ── MINI MAP ── */
@@ -3031,6 +3222,15 @@ function MiniMap({lat,lng,label,height=200,onOpen}){
 }
 
 /* ── ADD TREATMENT MODAL ── */
+/* ════════════════════════════════════════════════════════════════
+   ADD / EDIT MODALS
+   AddTreatmentModal: log a Cydectin/Bravecto treatment for a wombat.
+   CompassField:      reusable compass-rose direction picker.
+   LogStatusModal:    log a burrow check with status + measurements.
+   AddWombatModal:    create a new wombat record with optional photo.
+   AddBurrowModal:    create a new burrow record with optional photo.
+   AddSightingModal:  log a wombat sighting with optional GPS coords.
+════════════════════════════════════════════════════════════════ */
 function AddTreatmentModal({wombatId,wombatName,wombatStatus='mange',onClose,onSave,burrows=[]}){
   const t=useTheme();
   const savedUser=typeof localStorage!=='undefined'?localStorage.getItem(SK.userName)||'':'';
@@ -3469,12 +3669,18 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
       {photoDataUrl
         ? <div style={{position:'relative',display:'inline-block'}}>
             <img src={photoDataUrl} alt="Wombat" style={{width:'100%',maxWidth:240,height:160,objectFit:'cover',borderRadius:14,display:'block'}}/>
-            <button onClick={()=>setPhotoDataUrl(null)} style={{position:'absolute',top:6,right:6,width:26,height:26,borderRadius:13,background:'rgba(0,0,0,0.55)',border:'none',color:'#fff',fontSize:15,lineHeight:'26px',textAlign:'center',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>×</button>
+            <button onClick={()=>setPhotoDataUrl(null)} style={{position:'absolute',top:6,right:6,width:26,height:26,borderRadius:13,background:'rgba(0,0,0,0.55)',border:'none',color:'#fff',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{Ico.close('#fff',12)}</button>
           </div>
-        : <label style={{display:'inline-flex',alignItems:'center',gap:7,padding:'10px 16px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13.5,fontWeight:600,color:t.ink}}>
-            {Ico.plus(t.f700,14)} Add Photo
-            <input type="file" accept="image/*" capture="environment" style={{display:'none'}} onChange={e=>{const f=e.target.files?.[0];if(!f)return;e.target.value='';compressImage(f).then(d=>setPhotoDataUrl(d));}}/>
-          </label>
+        : <div style={{display:'flex',gap:8}}>
+            <label style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.ink}}>
+              {Ico.camera(t.f700,15)} Camera
+              <input type="file" accept="image/*" capture="environment" style={{display:'none'}} onChange={e=>{const f=e.target.files?.[0];if(!f)return;e.target.value='';compressImage(f).then(d=>setPhotoDataUrl(d));}}/>
+            </label>
+            <label style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.ink}}>
+              {Ico.layers(t.f700,15)} Gallery
+              <input type="file" accept="image/*" style={{display:'none'}} onChange={e=>{const f=e.target.files?.[0];if(!f)return;e.target.value='';compressImage(f).then(d=>setPhotoDataUrl(d));}}/>
+            </label>
+          </div>
       }
     </FormField>
     <FormField label="Notes"><FTextarea value={form.notes} onChange={v=>set('notes',v)} placeholder="Field observations…"/></FormField>
@@ -3492,6 +3698,7 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
   const [showMapPicker,setShowMapPicker]=useState(false);
   const [showGeoSearch,setShowGeoSearch]=useState(false);
   const [showMore,setShowMore]=useState(false);
+  const [photoDataUrl,setPhotoDataUrl]=useState(null);
   const set=(k,v)=>setForm(f=>({...f,[k]:v}));
   const useCurrentLocation=()=>{
     if(!navigator.geolocation)return alert('Geolocation is not available on this device.');
@@ -3518,7 +3725,9 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
     if(!form.status)return alert('Please select a status.');
     if(!location)return alert('Please add a location.');
     const{substrate,vegetation,notes,trailCamera,orientation,entranceHeightCm,entranceWidthCm,...rest}=form;
-    onSave({id:uid(),code:nextCode,...rest,orientation:orientation||undefined,entranceHeightCm:entranceHeightCm?Number(entranceHeightCm):undefined,entranceWidthCm:entranceWidthCm?Number(entranceWidthCm):undefined,lat:location.lat??null,lng:location.lng??null,location:location.locality||location.address||null,habitat:{substrate,vegetation,notes,trailCamera},wombatIds:[],_sync:true});
+    const bId=uid();
+    const photo=photoDataUrl?{id:'ph_'+Date.now(),burrowId:bId,dataUrl:photoDataUrl,isProfile:true,at:new Date().toISOString()}:null;
+    onSave({id:bId,code:nextCode,...rest,orientation:orientation||undefined,entranceHeightCm:entranceHeightCm?Number(entranceHeightCm):undefined,entranceWidthCm:entranceWidthCm?Number(entranceWidthCm):undefined,lat:location.lat??null,lng:location.lng??null,location:location.locality||location.address||null,habitat:{substrate,vegetation,notes,trailCamera},wombatIds:[],_sync:true},photo);
   }}>
     <FormField label="Name" required><FInput value={form.name} onChange={v=>set('name',v)} placeholder="e.g. Burrow Zeta"/></FormField>
     <FormField label="Status" required>
@@ -3558,6 +3767,24 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
     </FormField>
     <FormField label="Entrance Orientation">
       <CompassField value={form.orientation} onChange={v=>set('orientation',v)}/>
+    </FormField>
+    <FormField label="Photo">
+      {photoDataUrl
+        ? <div style={{position:'relative',display:'inline-block'}}>
+            <img src={photoDataUrl} alt="Burrow" style={{width:'100%',maxWidth:240,height:160,objectFit:'cover',borderRadius:14,display:'block'}}/>
+            <button onClick={()=>setPhotoDataUrl(null)} style={{position:'absolute',top:6,right:6,width:26,height:26,borderRadius:13,background:'rgba(0,0,0,0.55)',border:'none',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{Ico.close('#fff',12)}</button>
+          </div>
+        : <div style={{display:'flex',gap:8}}>
+            <label style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.ink}}>
+              {Ico.camera(t.f700,15)} Camera
+              <input type="file" accept="image/*" capture="environment" style={{display:'none'}} onChange={e=>{const f=e.target.files?.[0];if(!f)return;e.target.value='';compressImage(f).then(d=>setPhotoDataUrl(d));}}/>
+            </label>
+            <label style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.ink}}>
+              {Ico.layers(t.f700,15)} Gallery
+              <input type="file" accept="image/*" style={{display:'none'}} onChange={e=>{const f=e.target.files?.[0];if(!f)return;e.target.value='';compressImage(f).then(d=>setPhotoDataUrl(d));}}/>
+            </label>
+          </div>
+      }
     </FormField>
     {(()=>{
       const extras=(form.wombatIds.length>0?1:0)+(form.entranceHeightCm||form.entranceWidthCm?1:0)+(form.substrate?1:0)+(form.vegetation?1:0)+(form.notes?1:0)+(form.trailCamera?1:0);
@@ -3622,11 +3849,11 @@ function AddSightingModal({wombats,onClose,onSave}){
   const [form,setForm]=useState({wombatId:wombats[0]?.id||'',at:today()+'T08:00',lat:'',lng:'',note:''});
   const set=(k,v)=>setForm(f=>({...f,[k]:v}));
   const getGPS=()=>{
-    if(!navigator.geolocation)return;
-    navigator.geolocation.getCurrentPosition(pos=>{
-      set('lat',pos.coords.latitude.toFixed(6));
-      set('lng',pos.coords.longitude.toFixed(6));
-    });
+    if(!navigator.geolocation)return alert('Geolocation is not available on this device.');
+    navigator.geolocation.getCurrentPosition(
+      pos=>{set('lat',pos.coords.latitude.toFixed(6));set('lng',pos.coords.longitude.toFixed(6));},
+      ()=>alert('Could not get your location. Please check permissions.')
+    );
   };
   return <ModalWrap title="Log Sighting" subtitle="Record a wombat spotted in the field" onClose={onClose} saveLabel="Save Sighting" onSave={()=>{
     onSave({id:uid(),...form,lat:parseFloat(form.lat)||null,lng:parseFloat(form.lng)||null,_sync:true});
@@ -3659,53 +3886,90 @@ function AddSightingModal({wombats,onClose,onSave}){
    as a side-effect.
 ════════════════════════════════════════════════════════════════ */
 function reducer(state,action){
+  // NOTE ON PHOTO SAVES: all photo arrays are saved via .map(noB64) which strips
+  // base64 dataUrls before writing to localStorage. The actual blobs live in
+  // IndexedDB (see idbPutPhoto). HYDRATE_PHOTO_DATA re-merges IDB data into
+  // state after startup — it does NOT write to localStorage.
   switch(action.type){
+
+    // ── Wombats ──────────────────────────────────────────────────
     case 'ADD_WOMBAT':{const wombats=[...state.wombats,action.wombat];save('w',wombats);return{...state,wombats};}
     case 'UPDATE_WOMBAT':{const wombats=state.wombats.map(w=>w.id===action.id?{...w,...action.patch}:w);save('w',wombats);return{...state,wombats};}
     case 'IMPORT_WOMBATS':{const wombats=[...state.wombats,...action.wombats];save('w',wombats);return{...state,wombats};}
     case 'DELETE_WOMBAT':{
-      // Remove the wombat and all its associated local records
+      // Cascade: remove all child records (treatments, sightings, photos)
+      // and unlink from any burrows that referenced this wombat.
+      // ON DELETE CASCADE in Supabase handles the server side; this mirrors it locally.
       const wombats=state.wombats.filter(w=>w.id!==action.id);
-      const treatments=state.treatments.filter(t=>t.wombatId!==action.id);
+      const treatments=state.treatments.filter(tr=>tr.wombatId!==action.id);
       const sightings=state.sightings.filter(s=>s.wombatId!==action.id);
       const wombatPhotos=state.wombatPhotos.filter(p=>p.wombatId!==action.id);
-      // Unlink from any burrows that referenced this wombat
       const burrows=state.burrows.map(b=>b.wombatIds?.includes(action.id)?{...b,wombatIds:b.wombatIds.filter(id=>id!==action.id)}:b);
-      save('w',wombats);save('t',treatments);save('s',sightings);save('wp',wombatPhotos);save('b',burrows);
+      save('w',wombats);save('t',treatments);save('s',sightings);save('wp',wombatPhotos.map(noB64));save('b',burrows);
       return{...state,wombats,treatments,sightings,wombatPhotos,burrows};
     }
+
+    // ── Burrows ──────────────────────────────────────────────────
     case 'ADD_BURROW':{const burrows=[...state.burrows,action.burrow];save('b',burrows);return{...state,burrows};}
     case 'IMPORT_BURROWS':{const burrows=[...state.burrows,...action.burrows];save('b',burrows);return{...state,burrows};}
     case 'UPDATE_BURROW':{const burrows=state.burrows.map(b=>b.id===action.id?{...b,...action.patch}:b);save('b',burrows);return{...state,burrows};}
     case 'DELETE_BURROW':{
-      // Remove the burrow and all its associated local records
+      // Cascade: remove all child records (logs, photos) and unlink from wombats.
       const burrows=state.burrows.filter(b=>b.id!==action.id);
       const burrowLogs=state.burrowLogs.filter(l=>l.burrowId!==action.id);
       const burrowPhotos=state.burrowPhotos.filter(p=>p.burrowId!==action.id);
-      // Unlink from any wombats that referenced this burrow
       const wombats=state.wombats.map(w=>w.burrowIds?.includes(action.id)?{...w,burrowIds:w.burrowIds.filter(id=>id!==action.id)}:w);
-      save('b',burrows);save('bl',burrowLogs);save('bp',burrowPhotos);save('w',wombats);
+      save('b',burrows);save('bl',burrowLogs);save('bp',burrowPhotos.map(noB64));save('w',wombats);
       return{...state,burrows,burrowLogs,burrowPhotos,wombats};
     }
+
+    // ── Treatments ───────────────────────────────────────────────
     case 'ADD_TREATMENT':{const treatments=[...state.treatments,action.treatment];save('t',treatments);return{...state,treatments};}
-    case 'DELETE_TREATMENT':{const treatments=state.treatments.filter(t=>t.id!==action.treatmentId);save('t',treatments);return{...state,treatments};}
+    case 'DELETE_TREATMENT':{const treatments=state.treatments.filter(tr=>tr.id!==action.treatmentId);save('t',treatments);return{...state,treatments};}
+
+    // ── Sightings ────────────────────────────────────────────────
     case 'ADD_SIGHTING':{const sightings=[...state.sightings,action.sighting];save('s',sightings);return{...state,sightings};}
-    case 'ADD_WOMBAT_PHOTO':{const wombatPhotos=[...state.wombatPhotos,action.photo];save('wp',wombatPhotos);return{...state,wombatPhotos};}
-    case 'SET_PROFILE_PHOTO':{const wombatPhotos=state.wombatPhotos.map(p=>p.wombatId===action.wombatId?{...p,isProfile:p.id===action.photoId}:p);save('wp',wombatPhotos);return{...state,wombatPhotos};}
-    case 'DELETE_WOMBAT_PHOTO':{const wombatPhotos=state.wombatPhotos.filter(p=>p.id!==action.photoId);save('wp',wombatPhotos);return{...state,wombatPhotos};}
-    case 'ADD_BURROW_PHOTO':{const burrowPhotos=[...state.burrowPhotos,action.photo];save('bp',burrowPhotos);return{...state,burrowPhotos};}
-    case 'SET_BURROW_PROFILE_PHOTO':{const burrowPhotos=state.burrowPhotos.map(p=>p.burrowId===action.burrowId?{...p,isProfile:p.id===action.photoId}:p);save('bp',burrowPhotos);return{...state,burrowPhotos};}
-    case 'DELETE_BURROW_PHOTO':{const burrowPhotos=state.burrowPhotos.filter(p=>p.id!==action.photoId);save('bp',burrowPhotos);return{...state,burrowPhotos};}
+
+    // ── Photos ───────────────────────────────────────────────────
+    // base64 blobs live in IDB; localStorage only holds metadata (dataUrl:null).
+    case 'ADD_WOMBAT_PHOTO':{const wombatPhotos=[...state.wombatPhotos,action.photo];save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};}
+    case 'SET_PROFILE_PHOTO':{
+      // Mark one photo as the profile image; clear the flag on all others for this wombat
+      const wombatPhotos=state.wombatPhotos.map(p=>p.wombatId===action.wombatId?{...p,isProfile:p.id===action.photoId}:p);
+      save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};
+    }
+    case 'DELETE_WOMBAT_PHOTO':{const wombatPhotos=state.wombatPhotos.filter(p=>p.id!==action.photoId);save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};}
+    case 'ADD_BURROW_PHOTO':{const burrowPhotos=[...state.burrowPhotos,action.photo];save('bp',burrowPhotos.map(noB64));return{...state,burrowPhotos};}
+    case 'SET_BURROW_PROFILE_PHOTO':{
+      // Mark one photo as the profile image; clear the flag on all others for this burrow
+      const burrowPhotos=state.burrowPhotos.map(p=>p.burrowId===action.burrowId?{...p,isProfile:p.id===action.photoId}:p);
+      save('bp',burrowPhotos.map(noB64));return{...state,burrowPhotos};
+    }
+    case 'DELETE_BURROW_PHOTO':{const burrowPhotos=state.burrowPhotos.filter(p=>p.id!==action.photoId);save('bp',burrowPhotos.map(noB64));return{...state,burrowPhotos};}
+    case 'HYDRATE_PHOTO_DATA':{
+      // Runs once on startup (and after every REPLACE_ALL sync).
+      // Merges IDB blobs back into in-memory state so photos render.
+      // Does NOT write to localStorage — blobs belong in IDB only.
+      const m=action.map; // { [photoId]: dataUrl }
+      const wombatPhotos=state.wombatPhotos.map(p=>m[p.id]?{...p,dataUrl:m[p.id]}:p);
+      const burrowPhotos=state.burrowPhotos.map(p=>m[p.id]?{...p,dataUrl:m[p.id]}:p);
+      return{...state,wombatPhotos,burrowPhotos};
+    }
+
+    // ── Burrow logs ──────────────────────────────────────────────
     case 'DELETE_BURROW_LOG':{
       const bl=state.burrowLogs.filter(l=>l.id!==action.logId);
-      // revert burrow status/lastChecked to most recent remaining log if any
+      // Revert burrow.status and burrow.lastChecked to the most recent remaining log.
+      // If no logs remain, leave the existing values in place.
       const remaining=bl.filter(l=>l.burrowId===action.burrowId).sort((a,b)=>new Date(b.at)-new Date(a.at));
       const burs=state.burrows.map(b=>b.id===action.burrowId?{...b,status:remaining[0]?.status||b.status,lastChecked:remaining[0]?.at||b.lastChecked}:b);
       save('bl',bl);save('b',burs);
       return{...state,burrowLogs:bl,burrows:burs};}
     case 'ADD_BURROW_LOG':{
       const bl=[...state.burrowLogs,action.log];
-      // update burrow status + entrance measurements + habitat if provided
+      // Mirror log data onto the parent burrow: status, lastChecked, entrance
+      // measurements, and habitat fields (substrate, vegetation, trailCamera).
+      // Only fields present in the log are patched — missing fields are left alone.
       const logPatch={status:action.log.status,lastChecked:action.log.at};
       if(action.log.heightCm!=null&&action.log.heightCm!=='') logPatch.entranceHeightCm=action.log.heightCm;
       if(action.log.widthCm!=null&&action.log.widthCm!=='') logPatch.entranceWidthCm=action.log.widthCm;
@@ -3721,29 +3985,42 @@ function reducer(state,action){
       save('bl',bl);save('b',burs);
       return{...state,burrowLogs:bl,burrows:burs};
     }
+
+    // ── Links ────────────────────────────────────────────────────
     case 'LINK_WOMBAT_BURROW':{
+      // Wombat↔burrow links are bidirectional: wombat.burrowIds and burrow.wombatIds
+      // both need updating. Always use this action — never patch either array directly.
+      // Deduplicates before adding so dispatching twice is safe.
       const{wombatId,burrowId}=action;
       const wombats=state.wombats.map(w=>w.id===wombatId?{...w,burrowIds:[...(w.burrowIds||[]).filter(id=>id!==burrowId),burrowId]}:w);
       const burrows=state.burrows.map(b=>b.id===burrowId?{...b,wombatIds:[...(b.wombatIds||[]).filter(id=>id!==wombatId),wombatId]}:b);
       save('w',wombats);save('b',burrows);
       return{...state,wombats,burrows};
     }
+
+    // ── Full sync ────────────────────────────────────────────────
     case 'REPLACE_ALL':{
+      // Dispatched by supaFullSync after a successful server pull.
+      // action.data is already queue-aware merged (local edits preserved).
+      // After this runs, the App re-dispatches HYDRATE_PHOTO_DATA to
+      // restore any IDB photo blobs that don't live in Supabase.
       const{wombats,burrows,treatments,sightings,burrowLogs,wombatPhotos,burrowPhotos}=action.data;
       save('w',wombats);save('b',burrows);save('t',treatments);
-      save('s',sightings);save('bl',burrowLogs);save('wp',wombatPhotos);save('bp',burrowPhotos);
+      save('s',sightings);save('bl',burrowLogs);save('wp',wombatPhotos.map(noB64));save('bp',burrowPhotos.map(noB64));
       return{...state,wombats,burrows,treatments,sightings,burrowLogs,wombatPhotos,burrowPhotos};
     }
+
     default:return state;
   }
 }
 
 /* ════════════════════════════════════════════════════════════════
-   SIGN IN / SIGN UP MODAL
+   AUTH & UTILITY MODALS
+   ConfirmModal: generic "are you sure?" bottom sheet for deletions.
+   SignInModal:  email + password sign-in / sign-up (Supabase Auth).
 ════════════════════════════════════════════════════════════════ */
-/* ════════════════════════════════════════════════════════════════
-   CONFIRM MODAL  — generic "are you sure?" sheet used for deletions
-════════════════════════════════════════════════════════════════ */
+
+/* ── CONFIRM MODAL ── */
 function ConfirmModal({title,message,confirmLabel='Delete',onConfirm,onCancel}){
   const t=useTheme();
   return(
@@ -3766,6 +4043,7 @@ function ConfirmModal({title,message,confirmLabel='Delete',onConfirm,onCancel}){
   );
 }
 
+/* ── SIGN IN MODAL ── */
 function SignInModal({onClose}){
   const t=useTheme();
   const [email,setEmail]=useState('');
@@ -3833,6 +4111,35 @@ function App(){
     wombats:init.wombats,burrows:init.burrows,treatments:init.treatments,
     sightings:init.sightings,burrowLogs:init.burrowLogs,wombatPhotos:init.wombatPhotos,burrowPhotos:init.burrowPhotos,
   });
+  // ── Photo IDB hydration (runs once on mount) ─────────────────
+  // 1. Migrates any existing base64 dataUrls still in localStorage → IDB
+  // 2. Merges IDB photo data back into React state
+  React.useEffect(()=>{
+    async function hydratePhotos(){
+      try{
+        // Migrate: pull any base64 still sitting in localStorage into IDB
+        const wpRaw=JSON.parse(localStorage.getItem(SK.wp)||'[]');
+        const bpRaw=JSON.parse(localStorage.getItem(SK.bp)||'[]');
+        let migrated=false;
+        for(const p of [...wpRaw,...bpRaw]){
+          if(p.dataUrl?.startsWith('data:')){
+            await idbPutPhoto(p.id,p.dataUrl);
+            migrated=true;
+          }
+        }
+        if(migrated){
+          // Re-save without base64 so localStorage is freed up
+          localStorage.setItem(SK.wp,JSON.stringify(wpRaw.map(noB64)));
+          localStorage.setItem(SK.bp,JSON.stringify(bpRaw.map(noB64)));
+        }
+        // Load all IDB photo data and merge into state
+        const map=await idbGetAllPhotos();
+        if(Object.keys(map).length>0) dispatch({type:'HYDRATE_PHOTO_DATA',map});
+      }catch(e){console.warn('[IDB] hydration failed',e);}
+    }
+    hydratePhotos();
+  },[]);
+
   const [screen,setScreen]=useState('dashboard');
   const [selectedId,setSelectedId]=useState(null);
   const [theme,setTheme]=useState(init.theme);
@@ -3916,6 +4223,8 @@ function App(){
             const{records:wombats,changed:changedW}=deduplicateCodes(merged.wombats,'W');
             const{records:burrows,changed:changedB}=deduplicateCodes(merged.burrows,'B');
             dispatch({type:'REPLACE_ALL',data:{...merged,wombats,burrows}});
+            // Re-hydrate IDB photo data after the sync wipes dataUrls from state
+            idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
             // Patch renumbered records back to Supabase so everyone stays consistent
             changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).catch(()=>{}));
             changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).catch(()=>{}));
@@ -3941,6 +4250,21 @@ function App(){
     return()=>{window.removeEventListener('online',on);window.removeEventListener('offline',off);};
   },[authUser]);
 
+  // ── Background Sync message from service worker ───────────────
+  // On Android/Chrome the SW fires a 'sync' event once connectivity is confirmed
+  // stable (more reliable than the 'online' event). The SW messages the open tab
+  // which then flushes the queue. iOS doesn't support BackgroundSync — no-op there.
+  useEffect(()=>{
+    if(!navigator.serviceWorker)return;
+    const handler=e=>{
+      if(e.data?.type==='WW_FLUSH_QUEUE'&&authUser){
+        flushQueue(authUser.id).catch(()=>{}).finally(refreshQueue);
+      }
+    };
+    navigator.serviceWorker.addEventListener('message',handler);
+    return()=>navigator.serviceWorker.removeEventListener('message',handler);
+  },[authUser]);
+
   // ── Sync-aware dispatch ───────────────────────────────────────
   // Calls the reducer synchronously then pushes the action to Supabase.
   // Offline writes are queued in localStorage and flushed on reconnect.
@@ -3963,6 +4287,22 @@ function App(){
       const newCount=touchStreak();
       setStreak(newCount);
     }
+    // IDB: persist base64 photo data outside localStorage
+    if((action.type==='ADD_WOMBAT_PHOTO'||action.type==='ADD_BURROW_PHOTO')&&action.photo?.dataUrl?.startsWith('data:')){
+      const _pid=action.photo.id, _pdata=action.photo.dataUrl;
+      const _plsKey=action.type==='ADD_WOMBAT_PHOTO'?SK.wp:SK.bp;
+      idbPutPhoto(_pid,_pdata).catch(()=>{
+        // IDB write failed — restore base64 to localStorage so the photo survives a reload.
+        // On next startup the migration will re-attempt the IDB write automatically.
+        try{
+          const list=JSON.parse(localStorage.getItem(_plsKey)||'[]');
+          const patched=list.map(p=>p.id===_pid?{...p,dataUrl:_pdata}:p);
+          localStorage.setItem(_plsKey,JSON.stringify(patched));
+        }catch(e2){console.warn('[IDB fallback] localStorage also failed',e2);}
+      });
+    }
+    if(action.type==='DELETE_WOMBAT_PHOTO'&&action.photoId) idbDeletePhoto(action.photoId).catch(()=>{});
+    if(action.type==='DELETE_BURROW_PHOTO'&&action.photoId) idbDeletePhoto(action.photoId).catch(()=>{});
     dispatch(action);
     if(authUser)syncAction(action,authUser.id).catch(e=>console.warn('[Supa]',e)).finally(refreshQueue);
     else refreshQueue();
@@ -4025,7 +4365,7 @@ function App(){
       {modal==='csv-import'&&<CSVImportModal onClose={()=>setModal(null)} onImportWombats={wombats=>{syncDispatch({type:'IMPORT_WOMBATS',wombats});nav('wombats');}} onImportBurrows={burrows=>{syncDispatch({type:'IMPORT_BURROWS',burrows});nav('burrows');}}/>}
       {modal==='fab'&&<FABSheet onClose={()=>setModal(null)} onSelect={fabSelect}/>}
       {modal==='add-wombat'&&<AddWombatModal burrows={data.burrows} initialLocation={addAtLoc} nextCode={nextWombatCode(data.wombats)} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(w,linkedBurrowId,photo)=>{syncDispatch({type:'ADD_WOMBAT',wombat:w});if(linkedBurrowId)syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(photo)syncDispatch({type:'ADD_WOMBAT_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('wombat-profile',w.id);}}/>}
-      {modal==='add-burrow'&&<AddBurrowModal initialLocation={addAtLoc} nextCode={nextBurrowCode(data.burrows)} wombats={data.wombats} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={b=>{syncDispatch({type:'ADD_BURROW',burrow:b});(b.wombatIds||[]).forEach(wId=>syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:wId,burrowId:b.id}));setModal(null);setAddAtLoc(null);nav('burrow-profile',b.id);}}/>}
+      {modal==='add-burrow'&&<AddBurrowModal initialLocation={addAtLoc} nextCode={nextBurrowCode(data.burrows)} wombats={data.wombats} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(b,photo)=>{syncDispatch({type:'ADD_BURROW',burrow:b});(b.wombatIds||[]).forEach(wId=>syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:wId,burrowId:b.id}));if(photo)syncDispatch({type:'ADD_BURROW_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('burrow-profile',b.id);}}/>}
       {modal==='add-sighting'&&<AddSightingModal wombats={data.wombats} onClose={()=>setModal(null)} onSave={s=>{syncDispatch({type:'ADD_SIGHTING',sighting:s});setModal(null);}}/>}
       {modal==='sign-in'&&<SignInModal onClose={()=>setModal(null)}/>}
       {recoveredWombat&&<RecoveryModal name={recoveredWombat.name} onClose={()=>setRecoveredWombat(null)}/>}

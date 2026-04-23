@@ -10,7 +10,7 @@
  * are cleared automatically on the next launch.
  */
 
-const CACHE_VERSION = 'v3';
+const CACHE_VERSION = 'v4';
 const SHELL_CACHE   = `wombatwatch-shell-${CACHE_VERSION}`;
 const TILE_CACHE    = `wombatwatch-tiles-${CACHE_VERSION}`;
 
@@ -105,6 +105,23 @@ async function cacheFirst(request) {
     return new Response('Offline — resource not cached', { status: 503 });
   }
 }
+
+// ── Background Sync: flush the offline queue when connectivity is confirmed ───
+// Fires on Android/Chrome when the browser is satisfied connectivity is stable.
+// The SW can't call Supabase directly (no credentials here), so it messages the
+// open tab instead. If no tab is open the sync is skipped — the app's 'online'
+// event listener will catch it the next time the user opens the app.
+self.addEventListener('sync', event => {
+  if (event.tag === 'ww-queue-flush') {
+    event.waitUntil(
+      self.clients
+        .matchAll({ includeUncontrolled: true, type: 'window' })
+        .then(clients => {
+          clients.forEach(c => c.postMessage({ type: 'WW_FLUSH_QUEUE' }));
+        })
+    );
+  }
+});
 
 // ── Strategy: network-first for map tiles ────────────────────────────────────
 async function networkFirstTile(request) {
