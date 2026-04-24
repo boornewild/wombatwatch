@@ -4451,6 +4451,63 @@ function ConfirmModal({title,message,confirmLabel='Delete',onConfirm,onCancel}){
   );
 }
 
+/* ── SET PASSWORD MODAL (password-reset link flow) ── */
+function SetPasswordModal({onDone}){
+  const t=useTheme();
+  const [pw,setPw]=useState('');
+  const [pw2,setPw2]=useState('');
+  const [loading,setLoading]=useState(false);
+  const [err,setErr]=useState('');
+  const [done,setDone]=useState(false);
+
+  const submit=async e=>{
+    e&&e.preventDefault();setErr('');
+    if(pw.length<8){setErr('Password must be at least 8 characters.');return;}
+    if(pw!==pw2){setErr('Passwords do not match.');return;}
+    setLoading(true);
+    try{
+      const{error}=await supa.auth.updateUser({password:pw});
+      if(error)throw error;
+      setDone(true);
+      setTimeout(()=>onDone&&onDone(),2000);
+    }catch(e){setErr(e.message||'Could not update password.');}
+    finally{setLoading(false);}
+  };
+
+  const inp={background:t.soft,color:t.ink,borderRadius:12,padding:'13px 14px',fontSize:16,width:'100%',border:`1.5px solid ${t.div}`,marginBottom:10,display:'block'};
+  const overlay={position:'fixed',inset:0,zIndex:2000,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',background:t.bg,padding:'0 24px'};
+  const card={background:t.surface,borderRadius:24,padding:'28px 20px',width:'100%',maxWidth:380,boxShadow:t.shadow};
+
+  return(
+    <div style={overlay}>
+      <div style={{marginBottom:32,textAlign:'center'}}>
+        <div style={{width:84,height:84,borderRadius:22,background:'linear-gradient(135deg,#1F3A2A 0%,#3A6A42 100%)',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 18px',boxShadow:'0 4px 24px rgba(31,58,42,0.28)'}}>
+          {Ico.wombat('#fff',44)}
+        </div>
+        <div style={{fontSize:11,letterSpacing:2,textTransform:'uppercase',color:t.f600,fontWeight:700,marginBottom:5}}>WombatWatch</div>
+        <div style={{fontSize:14,color:t.mid}}>Set your password</div>
+      </div>
+      <div style={card}>
+        {done
+          ? <div style={{textAlign:'center',padding:'8px 0'}}>
+              <div style={{fontSize:32,marginBottom:12}}>✅</div>
+              <div style={{fontWeight:700,fontSize:16,color:t.ink,marginBottom:6}}>Password updated!</div>
+              <div style={{fontSize:14,color:t.mid}}>Taking you into the app…</div>
+            </div>
+          : <form onSubmit={submit}>
+              <input style={inp} placeholder="New password" type="password" value={pw} onChange={e=>setPw(e.target.value)} autoComplete="new-password" autoFocus/>
+              <input style={inp} placeholder="Confirm password" type="password" value={pw2} onChange={e=>setPw2(e.target.value)} autoComplete="new-password"/>
+              {err&&<div style={{color:t.rose700,fontSize:13,marginBottom:10,padding:'9px 12px',background:t.rose50,borderRadius:8,lineHeight:1.4}}>{err}</div>}
+              <button type="submit" disabled={loading||!pw||!pw2} style={{width:'100%',background:(loading||!pw||!pw2)?t.faint:t.f700,color:'#fff',borderRadius:14,padding:'14px 0',fontSize:16,fontWeight:700,marginTop:4,opacity:loading?0.7:1,transition:'background 0.2s'}}>
+                {loading?'Saving…':'Set Password'}
+              </button>
+            </form>
+        }
+      </div>
+    </div>
+  );
+}
+
 /* ── SIGN IN MODAL ── */
 function SignInModal({onClose}){
   const t=useTheme();
@@ -4458,6 +4515,8 @@ function SignInModal({onClose}){
   const [pw,setPw]=useState('');
   const [loading,setLoading]=useState(false);
   const [err,setErr]=useState('');
+  const [forgotMode,setForgotMode]=useState(false);
+  const [resetSent,setResetSent]=useState(false);
 
   const submit=async e=>{
     e&&e.preventDefault();setErr('');setLoading(true);
@@ -4466,6 +4525,17 @@ function SignInModal({onClose}){
       if(error)throw error;
       onClose&&onClose();
     }catch(e){setErr(e.message||'Incorrect email or password.');}
+    finally{setLoading(false);}
+  };
+
+  const sendReset=async e=>{
+    e&&e.preventDefault();setErr('');setLoading(true);
+    try{
+      const redirectTo=window.location.href.split('?')[0].split('#')[0];
+      const{error}=await supa.auth.resetPasswordForEmail(email,{redirectTo});
+      if(error)throw error;
+      setResetSent(true);
+    }catch(e){setErr(e.message||'Could not send reset email.');}
     finally{setLoading(false);}
   };
 
@@ -4482,7 +4552,7 @@ function SignInModal({onClose}){
           {Ico.wombat('#fff',44)}
         </div>
         <div style={{fontSize:11,letterSpacing:2,textTransform:'uppercase',color:t.f600,fontWeight:700,marginBottom:5}}>WombatWatch</div>
-        <div style={{fontSize:14,color:t.mid}}>Sign in to continue</div>
+        <div style={{fontSize:14,color:t.mid}}>{forgotMode?'Reset your password':'Sign in to continue'}</div>
       </div>}
       <div style={card}>
         {!isWall&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginBottom:20}}>
@@ -4491,17 +4561,44 @@ function SignInModal({onClose}){
           </div>
           <span style={{fontSize:18,fontWeight:800,color:t.ink,letterSpacing:-0.3}}>WombatWatch</span>
         </div>}
-        <form onSubmit={submit}>
-          <input style={inp} placeholder="Email address" type="email" value={email} onChange={e=>setEmail(e.target.value)} autoComplete="email" autoCapitalize="none" autoFocus={isWall}/>
-          <input style={inp} placeholder="Password" type="password" value={pw} onChange={e=>setPw(e.target.value)} autoComplete="current-password"/>
-          {err&&<div style={{color:t.rose700,fontSize:13,marginBottom:10,padding:'9px 12px',background:t.rose50,borderRadius:8,lineHeight:1.4}}>{err}</div>}
-          <button type="submit" disabled={loading||!email||!pw} style={{width:'100%',background:(loading||!email||!pw)?t.faint:t.f700,color:'#fff',borderRadius:14,padding:'14px 0',fontSize:16,fontWeight:700,marginTop:4,opacity:loading?0.7:1,transition:'background 0.2s'}}>
-            {loading?'Please wait…':'Sign In'}
-          </button>
-        </form>
-        <div style={{marginTop:16,textAlign:'center',fontSize:13,color:t.mid,lineHeight:1.5}}>
-          Need access? Contact your WombatWatch coordinator<br/>to have an account set up for you.
-        </div>
+
+        {forgotMode
+          ? resetSent
+            ? <div style={{textAlign:'center',padding:'8px 0'}}>
+                <div style={{fontSize:32,marginBottom:12}}>📬</div>
+                <div style={{fontWeight:700,fontSize:16,color:t.ink,marginBottom:6}}>Check your email</div>
+                <div style={{fontSize:14,color:t.mid,lineHeight:1.5,marginBottom:20}}>A password reset link has been sent to <b>{email}</b>.</div>
+                <button onClick={()=>{setForgotMode(false);setResetSent(false);}} style={{color:t.f700,fontSize:14,fontWeight:600}}>Back to sign in</button>
+              </div>
+            : <form onSubmit={sendReset}>
+                <input style={inp} placeholder="Email address" type="email" value={email} onChange={e=>setEmail(e.target.value)} autoComplete="email" autoCapitalize="none" autoFocus/>
+                {err&&<div style={{color:t.rose700,fontSize:13,marginBottom:10,padding:'9px 12px',background:t.rose50,borderRadius:8,lineHeight:1.4}}>{err}</div>}
+                <button type="submit" disabled={loading||!email} style={{width:'100%',background:(loading||!email)?t.faint:t.f700,color:'#fff',borderRadius:14,padding:'14px 0',fontSize:16,fontWeight:700,marginTop:4,opacity:loading?0.7:1,transition:'background 0.2s'}}>
+                  {loading?'Sending…':'Send Reset Link'}
+                </button>
+                <button type="button" onClick={()=>{setForgotMode(false);setErr('');}} style={{marginTop:12,width:'100%',textAlign:'center',color:t.mid,fontSize:14,padding:'8px 0'}}>
+                  Back to sign in
+                </button>
+              </form>
+          : <>
+              <form onSubmit={submit}>
+                <input style={inp} placeholder="Email address" type="email" value={email} onChange={e=>setEmail(e.target.value)} autoComplete="email" autoCapitalize="none" autoFocus={isWall}/>
+                <input style={inp} placeholder="Password" type="password" value={pw} onChange={e=>setPw(e.target.value)} autoComplete="current-password"/>
+                {err&&<div style={{color:t.rose700,fontSize:13,marginBottom:10,padding:'9px 12px',background:t.rose50,borderRadius:8,lineHeight:1.4}}>{err}</div>}
+                <button type="submit" disabled={loading||!email||!pw} style={{width:'100%',background:(loading||!email||!pw)?t.faint:t.f700,color:'#fff',borderRadius:14,padding:'14px 0',fontSize:16,fontWeight:700,marginTop:4,opacity:loading?0.7:1,transition:'background 0.2s'}}>
+                  {loading?'Please wait…':'Sign In'}
+                </button>
+              </form>
+              <div style={{marginTop:14,textAlign:'center'}}>
+                <button onClick={()=>{setForgotMode(true);setErr('');}} style={{color:t.f700,fontSize:13,fontWeight:600}}>
+                  Forgot password?
+                </button>
+              </div>
+              <div style={{marginTop:10,textAlign:'center',fontSize:13,color:t.mid,lineHeight:1.5}}>
+                Need access? Contact your WombatWatch coordinator<br/>to have an account set up for you.
+              </div>
+            </>
+        }
         {!isWall&&onClose&&<button onClick={onClose} style={{marginTop:14,width:'100%',textAlign:'center',color:t.mid,fontSize:14,padding:'8px 0'}}>
           Cancel
         </button>}
@@ -4575,6 +4672,7 @@ function App(){
   const [authProfile,setAuthProfile]=useState(()=>getCachedProfile());
   const [syncing,setSyncing]=useState(false);
   const [authChecked,setAuthChecked]=useState(false);
+  const [resetMode,setResetMode]=useState(false); // true while handling a password-reset link
   const explicitSignOut=React.useRef(false);
   const signedIn=!!authUser;
 
@@ -4616,6 +4714,14 @@ function App(){
       .catch(()=>{clearTimeout(fallback);resolveAuth(null);});
     // Live auth state changes (sign-in, sign-out, token refresh)
     const{data:{subscription}}=supa.auth.onAuthStateChange(async(event,session)=>{
+      // Password-reset link clicked — show the set-new-password screen.
+      // Supabase has already set the session so we know who the user is.
+      if(event==='PASSWORD_RECOVERY'){
+        setAuthUser(session?.user||null);
+        setResetMode(true);
+        setAuthChecked(true);
+        return;
+      }
       // Only honour SIGNED_OUT if the volunteer explicitly tapped Sign Out.
       // Any automatic sign-out (token expiry, network blip, etc.) is ignored.
       if(event==='SIGNED_OUT'){
@@ -4782,6 +4888,8 @@ function App(){
       <div style={{width:36,height:36,border:`3px solid ${t.sage50}`,borderTopColor:t.f700,borderRadius:'50%',animation:'spin 0.8s linear infinite'}}/>
     </div>
   </ThemeCtx.Provider>;
+  // Password reset flow — user clicked the email link; let them set a new password
+  if(resetMode)return <ThemeCtx.Provider value={t}><div data-theme={theme} className="app" style={{background:t.bg}}><SetPasswordModal onDone={()=>setResetMode(false)}/></div></ThemeCtx.Provider>;
   // Gate: show only the login wall until signed in
   if(!authUser)return <ThemeCtx.Provider value={t}><div data-theme={theme} className="app" style={{background:t.bg}}><SignInModal/></div></ThemeCtx.Provider>;
 
