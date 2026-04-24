@@ -738,6 +738,11 @@ async function flushQueue(userId){
           if(!skip) ok=await supaUpsert(op.table,row);
         }else if(op.t==='delete'){
           ok=await supaDelete(op.table,op.id);
+        }else if(op.t==='storage-delete'){
+          // Remove a file from Supabase Storage (queued when photo was deleted offline)
+          const{error}=await supa.storage.from('photos').remove([op.path]);
+          ok=!error;
+          if(error)console.warn('[Queue] Storage delete failed:',op.path,error.message);
         }
       }catch(e){console.warn('[Queue] op threw:',op.t,op.table||op.id,e);}
       if(skip) continue; // already handled above
@@ -801,8 +806,10 @@ async function syncAction(action,userId){
       }
       case'DELETE_WOMBAT_PHOTO': {
         await del('wombat_photos',action.photoId);
-        // Also remove from Storage (best-effort)
-        supa.storage.from('photos').remove([`${action.photoId}.jpg`]).catch(()=>{});
+        // Remove the Storage file — queue it if offline so it's cleaned up on reconnect
+        const wPath=`${action.photoId}.jpg`;
+        if(navigator.onLine){supa.storage.from('photos').remove([wPath]).catch(()=>{});}
+        else{queueOp({t:'storage-delete',path:wPath});}
         break;
       }
       case'SET_PROFILE_PHOTO': {
@@ -823,7 +830,10 @@ async function syncAction(action,userId){
       }
       case'DELETE_BURROW_PHOTO': {
         await del('burrow_photos',action.photoId);
-        supa.storage.from('photos').remove([`${action.photoId}.jpg`]).catch(()=>{});
+        // Remove the Storage file — queue it if offline so it's cleaned up on reconnect
+        const bPath=`${action.photoId}.jpg`;
+        if(navigator.onLine){supa.storage.from('photos').remove([bPath]).catch(()=>{});}
+        else{queueOp({t:'storage-delete',path:bPath});}
         break;
       }
       case'SET_BURROW_PROFILE_PHOTO': {
@@ -870,13 +880,18 @@ async function supaFullSync(){
   const anySucceeded=results.some(r=>r.status==='fulfilled'&&!r.value?.error);
   if(!anySucceeded)return undefined;
   if(!(w?.length||0)&&!(b?.length||0))return null; // confirmed new user, genuinely empty DB
-  // Build a set of record IDs that have a pending upsert in the offline queue.
-  // These represent edits the user made offline that haven't uploaded yet —
-  // the local version must always win over whatever the server returned.
+  // Build sets of IDs from the offline queue so the merge can respect pending operations.
   let _pendingOps=[];
   try{_pendingOps=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');}catch(e){}
+  // Pending upserts — local version must win over whatever the server returned
   const queuedIds=new Set(
     _pendingOps.filter(op=>op.t==='upsert'&&op.row&&op.row.id).map(op=>op.row.id)
+  );
+  // Pending deletes — these records haven't been removed from Supabase yet, so the
+  // server will return them during sync. We must filter them out so they don't
+  // reappear after the user deleted them offline.
+  const deletedIds=new Set(
+    _pendingOps.filter(op=>op.t==='delete'&&op.id).map(op=>op.id)
   );
   const merge=(remote,localKey,conv)=>{
     const local=JSON.parse(localStorage.getItem(SK[localKey])||'[]');
@@ -887,7 +902,8 @@ async function supaFullSync(){
     const map=Object.fromEntries(remote.map(r=>[r.id,conv(r)]));
     // Local record wins if: never synced to server (!_sync), OR has a pending edit in the queue
     local.filter(r=>!r._sync||queuedIds.has(r.id)).forEach(r=>{map[r.id]=r;});
-    return Object.values(map);
+    // Strip out anything the user deleted offline but hasn't uploaded yet
+    return Object.values(map).filter(r=>!deletedIds.has(r.id));
   };
   return{
     wombats:     merge(w, 'w',  dbToWombat),
@@ -4432,8 +4448,8 @@ function EditBurrowModal({burrow,wombats=[],onClose,onSave}){
 function ConfirmModal({title,message,confirmLabel='Delete',onConfirm,onCancel}){
   const t=useTheme();
   return(
-    <div style={{position:'fixed',inset:0,zIndex:2100,display:'flex',alignItems:'flex-end',justifyContent:'center',background:'rgba(0,0,0,0.45)',padding:'0 0 var(--sab)'}}>
-      <div style={{width:'100%',maxWidth:480,background:t.surface,borderRadius:'24px 24px 0 0',padding:'24px 24px calc(24px + var(--sab))',boxShadow:'0 -4px 32px rgba(0,0,0,0.18)'}}>
+    <div style={{position:'fixed',inset:0,zIndex:2100,display:'flex',alignItems:'flex-end',justifyContent:'center',background:'rgba(0,0,0,0.45)',padding:'0 0 calc(72px + var(--sab))'}}>
+      <div style={{width:'100%',maxWidth:480,background:t.surface,borderRadius:24,padding:'24px 24px 28px',boxShadow:'0 -4px 32px rgba(0,0,0,0.18)'}}>
         {/* Red warning icon */}
         <div style={{width:48,height:48,borderRadius:16,background:t.rose50,display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 16px'}}>
           {Ico.trash(t.rose700,22)}
@@ -4793,7 +4809,22 @@ function App(){
           changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).catch(()=>{}));
         }
       }catch(e){console.warn('[Sync] reconnect sync failed',e);}
-      flushQueue(authUser.id).catch(()=>{}).finally(refreshQueue);
+      // After flushing, do a second full sync so records created by other volunteers
+      // while we were offline appear immediately. The queue is empty at this point so
+      // whatever the server returns is authoritative.
+      flushQueue(authUser.id).catch(()=>{}).finally(()=>{
+        refreshQueue();
+        supaFullSync().then(merged=>{
+          if(merged){
+            const{records:wombats,changed:changedW}=deduplicateCodes(merged.wombats,'W');
+            const{records:burrows,changed:changedB}=deduplicateCodes(merged.burrows,'B');
+            dispatch({type:'REPLACE_ALL',data:{...merged,wombats,burrows}});
+            idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
+            changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).catch(()=>{}));
+            changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).catch(()=>{}));
+          }
+        }).catch(e=>console.warn('[Sync] post-flush re-sync failed',e));
+      });
     };
     const off=()=>setOnline(false);
     window.addEventListener('online',on);window.addEventListener('offline',off);
