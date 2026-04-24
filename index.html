@@ -82,6 +82,22 @@ button{cursor:pointer;font-family:inherit;border:none;background:none;padding:0;
 </head>
 <body>
 <div id="root"></div>
+<script>
+/* Surface any JS error visibly on screen so blank-white-screen bugs show their cause */
+window.onerror = function(msg, src, line, col, err) {
+  var root = document.getElementById('root');
+  if (root) {
+    root.innerHTML = '<div style="padding:24px;font-family:monospace;font-size:13px;color:#c00;background:#fff;position:fixed;inset:0;overflow:auto;z-index:99999"><h2 style="margin:0 0 12px">⚠️ WombatWatch crash</h2><b>' + msg + '</b><br><br>Source: ' + src + '<br>Line: ' + line + ':' + col + '<br><br><pre style="white-space:pre-wrap">' + (err && err.stack ? err.stack : '(no stack)') + '</pre></div>';
+  }
+};
+window.onunhandledrejection = function(e) {
+  var root = document.getElementById('root');
+  if (root) {
+    var reason = e.reason || e;
+    root.innerHTML = '<div style="padding:24px;font-family:monospace;font-size:13px;color:#c00;background:#fff;position:fixed;inset:0;overflow:auto;z-index:99999"><h2 style="margin:0 0 12px">⚠️ WombatWatch unhandled rejection</h2><pre style="white-space:pre-wrap">' + (reason && reason.stack ? reason.stack : String(reason)) + '</pre></div>';
+  }
+};
+</script>
 <script type="text/babel">
 const {useState,useEffect,useRef}=React;
 
@@ -120,7 +136,7 @@ const {useState,useEffect,useRef}=React;
 
    OFFLINE  sw.js caches the app shell and map tiles.
      Tiles can be pre-fetched via the map page download button,
-     which writes directly to the 'wombatwatch-tiles-v4' cache.
+     which writes directly to the 'wombatwatch-tiles-v6' cache.
 
    SYNC  Records coming from Supabase carry _sync:true. Records
      created offline have _sync:false (or undefined). The queue-aware
@@ -383,7 +399,7 @@ const Ico={
    bump the version suffix on the SK data keys (e.g. ww2_ → ww3_).
 ════════════════════════════════════════════════════════════════ */
 const SD={
-  // Macdonald Valley, NSW — from Wisemans Ferry north to Higher Macdonald
+  // Hawkesbury–Macdonald region, NSW — Wisemans Ferry, Webbs Creek, Colo, Wrights Creek, Fernances, Macdonald Valley
   wombats:[
     {id:'w1',name:'Maggie',sex:'F',ageClass:'adult',status:'healthy',severity:{},burrowIds:['b1','b2'],firstSeen:'2026-02-14',location:'St Albans',lat:-33.127,lng:150.975,notes:'Resident near the Settlers Arms Inn paddocks. Healthy weight and coat. Regular at both burrows.',_sync:true},
     {id:'w2',name:'Bruce',sex:'M',ageClass:'adult',status:'under_treatment',severity:{back:3,shoulders:2},burrowIds:['b3'],firstSeen:'2026-01-28',location:'Lower Macdonald',lat:-33.358,lng:150.968,notes:'Moderate mange on back and shoulders. Responding well to fortnightly cydectin flap treatments.',_sync:true},
@@ -432,6 +448,8 @@ const SD={
     {id:'bl4',burrowId:'b8',at:'2026-04-12',status:'active',condition:'Excellent — 3 entrances, heavy use',occupants:1,heightCm:35,widthCm:44,orientation:'SSW (202°)',note:'Matilda clearly using north entrance most. Joey footprints visible near entrance.',by:'Sarah M.',_sync:true},
     {id:'bl5',burrowId:'b12',at:'2026-04-05',status:'damaged',condition:'Flood debris blocking main entrance',occupants:1,heightCm:29,widthCm:38,orientation:'W (278°)',note:'Rocky still accessing via rear entrance. Main entrance cleared by hand. At risk during next flood event.',by:'Sarah M.',_sync:true},
   ],
+  wombatPhotos:[],
+  burrowPhotos:[],
 };
 
 /* ════════════════════════════════════════════════════════════════
@@ -721,7 +739,7 @@ async function flushQueue(userId){
         }else if(op.t==='delete'){
           ok=await supaDelete(op.table,op.id);
         }
-      }catch(e){}
+      }catch(e){console.warn('[Queue] op threw:',op.t,op.table||op.id,e);}
       if(skip) continue; // already handled above
       if(!ok){
         const retries=(op._retries||0)+1;
@@ -773,8 +791,10 @@ async function syncAction(action,userId){
       case'DELETE_BURROW_LOG': await del('burrow_logs',action.logId); break;
       case'ADD_WOMBAT_PHOTO': {
         // Upload photo data to Supabase Storage; store URL in DB (not base64).
-        // Offline: queue with null data_url — flushQueue loads the blob from IDB.
+        // Offline: ensure IDB write completes BEFORE queuing with null data_url —
+        // otherwise flushQueue can run on reconnect before the blob is available.
         const wp=action.photo;
+        if(!navigator.onLine&&wp.dataUrl?.startsWith('data:'))await idbPutPhoto(wp.id,wp.dataUrl).catch(()=>{});
         const url=navigator.onLine?await resolvePhotoUrl(wp.dataUrl,wp.id,SK.wp):null;
         await push('wombat_photos',wombatPhotoToDb({...wp,dataUrl:url},userId));
         break;
@@ -794,8 +814,9 @@ async function syncAction(action,userId){
         break;
       }
       case'ADD_BURROW_PHOTO': {
-        // Offline: queue with null data_url — flushQueue loads the blob from IDB.
+        // Offline: ensure IDB write completes BEFORE queuing with null data_url.
         const bp=action.photo;
+        if(!navigator.onLine&&bp.dataUrl?.startsWith('data:'))await idbPutPhoto(bp.id,bp.dataUrl).catch(()=>{});
         const url=navigator.onLine?await resolvePhotoUrl(bp.dataUrl,bp.id,SK.bp):null;
         await push('burrow_photos',burrowPhotoToDb({...bp,dataUrl:url},userId));
         break;
@@ -844,7 +865,11 @@ async function supaFullSync(){
     return r.value?.data||null;
   };
   const[w,b,t,s,bl,wp,bp]=[val(results[0],'wombats'),val(results[1],'burrows'),val(results[2],'treatments'),val(results[3],'sightings'),val(results[4],'burrow_logs'),val(results[5],'wombat_photos'),val(results[6],'burrow_photos')];
-  if(!(w?.length||0)&&!(b?.length||0))return null; // new user
+  // If every single query failed the device is almost certainly offline.
+  // Return undefined (distinct from null) so the caller knows NOT to touch local state.
+  const anySucceeded=results.some(r=>r.status==='fulfilled'&&!r.value?.error);
+  if(!anySucceeded)return undefined;
+  if(!(w?.length||0)&&!(b?.length||0))return null; // confirmed new user, genuinely empty DB
   // Build a set of record IDs that have a pending upsert in the offline queue.
   // These represent edits the user made offline that haven't uploaded yet —
   // the local version must always win over whatever the server returned.
@@ -854,9 +879,14 @@ async function supaFullSync(){
     _pendingOps.filter(op=>op.t==='upsert'&&op.row&&op.row.id).map(op=>op.row.id)
   );
   const merge=(remote,localKey,conv)=>{
-    const map=Object.fromEntries((remote||[]).map(r=>[r.id,conv(r)]));
+    const local=JSON.parse(localStorage.getItem(SK[localKey])||'[]');
+    // If this table's query failed entirely (permissions error, network blip, etc.),
+    // remote is null. We can't safely merge — keep everything local so we don't
+    // silently drop records that were previously synced (_sync:true).
+    if(remote===null)return local;
+    const map=Object.fromEntries(remote.map(r=>[r.id,conv(r)]));
     // Local record wins if: never synced to server (!_sync), OR has a pending edit in the queue
-    (JSON.parse(localStorage.getItem(SK[localKey])||'[]')).filter(r=>!r._sync||queuedIds.has(r.id)).forEach(r=>{map[r.id]=r;});
+    local.filter(r=>!r._sync||queuedIds.has(r.id)).forEach(r=>{map[r.id]=r;});
     return Object.values(map);
   };
   return{
@@ -1104,15 +1134,15 @@ function ChipPicker({options,value,onChange,multi=false,deselectable=false}){
     })}
   </div>;
 }
-function SwipeToDelete({children,onDelete}){
-  const t=useTheme();
+// ── Shared swipe gesture logic ──────────────────────────────────────────
+// Used by both SwipeToDelete (treatments/logs) and SwipeActions (wombats/burrows).
+function useSwipeGesture(revealWidth){
   const [offset,setOffset]=useState(0);
   const [swiping,setSwiping]=useState(false);
   const startX=useRef(0);
   const startY=useRef(0);
   const startOff=useRef(0);
-  const gesture=useRef(null); // null | 'h' | 'v'
-  const REVEAL=80;
+  const gesture=useRef(null);
   const onTouchStart=e=>{
     startX.current=e.touches[0].clientX;
     startY.current=e.touches[0].clientY;
@@ -1126,30 +1156,69 @@ function SwipeToDelete({children,onDelete}){
       gesture.current=Math.abs(dx)>Math.abs(dy)?'h':'v';
       if(gesture.current==='h')setSwiping(true);
     }
-    if(gesture.current==='h') setOffset(Math.min(0,Math.max(-REVEAL,startOff.current+dx)));
+    if(gesture.current==='h')setOffset(Math.min(0,Math.max(-revealWidth,startOff.current+dx)));
   };
   const onTouchEnd=()=>{
     setSwiping(false);
-    if(gesture.current==='h') setOffset(o=>o<-REVEAL/2?-REVEAL:0);
+    if(gesture.current==='h')setOffset(o=>o<-revealWidth/2?-revealWidth:0);
     gesture.current=null;
   };
-  const handleDelete=()=>{setOffset(0);onDelete();};
-  const handleTap=()=>{if(offset!==0)setOffset(0);};
+  const close=()=>setOffset(0);
+  return{offset,swiping,onTouchStart,onTouchMove,onTouchEnd,close};
+}
+
+// SwipeToDelete — used for treatments and burrow logs (delete only)
+function SwipeToDelete({children,onDelete}){
+  const t=useTheme();
+  const REVEAL=80;
+  const{offset,swiping,onTouchStart,onTouchMove,onTouchEnd,close}=useSwipeGesture(REVEAL);
+  const handleTap=()=>{if(offset!==0)close();};
   return <div style={{overflow:'hidden',borderRadius:16}}>
     <div
       style={{display:'flex',alignItems:'stretch',transform:`translateX(${offset}px)`,transition:swiping?'none':'transform 0.22s cubic-bezier(0.25,0.46,0.45,0.94)',touchAction:'pan-y'}}
       onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
       onClick={handleTap}
     >
-      <div style={{flex:'1 0 100%',minWidth:0}}>
-        {children}
-      </div>
-      <div style={{width:REVEAL,flexShrink:0,background:t.rose700,borderRadius:'0 16px 16px 0',display:'flex',alignItems:'center',justifyContent:'center'}}>
-        <button onClick={handleDelete} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:3,background:'none',border:'none',cursor:'pointer',padding:8}}>
+      <div style={{flex:'1 0 100%',minWidth:0}}>{children}</div>
+      <div style={{width:REVEAL,flexShrink:0,background:t.rose700,display:'flex',alignItems:'center',justifyContent:'center'}}>
+        <button onClick={()=>{close();onDelete();}} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:3,background:'none',border:'none',cursor:'pointer',padding:8}}>
           {Ico.trash('#fff',18)}
           <span style={{fontSize:10.5,fontWeight:700,color:'#fff',letterSpacing:0.3}}>Delete</span>
         </button>
       </div>
+    </div>
+  </div>;
+}
+
+// SwipeActions — used for wombat and burrow list tiles.
+// Shows an Edit button (blue) and/or a Delete button (red) depending on
+// which callbacks are provided. Pass null for a callback to hide that button.
+function SwipeActions({children,onEdit,onDelete}){
+  const t=useTheme();
+  const BTN=72;
+  const REVEAL=(onEdit?BTN:0)+(onDelete?BTN:0);
+  const{offset,swiping,onTouchStart,onTouchMove,onTouchEnd,close}=useSwipeGesture(REVEAL);
+  const handleTap=()=>{if(offset!==0)close();};
+  if(!onEdit&&!onDelete)return <>{children}</>;
+  return <div style={{overflow:'hidden',borderRadius:16}}>
+    <div
+      style={{display:'flex',alignItems:'stretch',transform:`translateX(${offset}px)`,transition:swiping?'none':'transform 0.22s cubic-bezier(0.25,0.46,0.45,0.94)',touchAction:'pan-y'}}
+      onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
+      onClick={handleTap}
+    >
+      <div style={{flex:'1 0 100%',minWidth:0}}>{children}</div>
+      {onEdit&&<div style={{width:BTN,flexShrink:0,background:t.f700,display:'flex',alignItems:'center',justifyContent:'center'}}>
+        <button onClick={e=>{e.stopPropagation();close();onEdit();}} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:3,background:'none',border:'none',cursor:'pointer',padding:8}}>
+          {Ico.edit('#fff',18)}
+          <span style={{fontSize:10.5,fontWeight:700,color:'#fff',letterSpacing:0.3}}>Edit</span>
+        </button>
+      </div>}
+      {onDelete&&<div style={{width:BTN,flexShrink:0,background:t.rose700,display:'flex',alignItems:'center',justifyContent:'center'}}>
+        <button onClick={e=>{e.stopPropagation();close();onDelete();}} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:3,background:'none',border:'none',cursor:'pointer',padding:8}}>
+          {Ico.trash('#fff',18)}
+          <span style={{fontSize:10.5,fontWeight:700,color:'#fff',letterSpacing:0.3}}>Delete</span>
+        </button>
+      </div>}
     </div>
   </div>;
 }
@@ -1315,7 +1384,7 @@ function WeatherWidget(){
   return <Card padding={20}>
     <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
       <div>
-        <div style={{display:'flex',alignItems:'center',gap:4,fontSize:12.5,color:t.mid,fontWeight:500}}>{Ico.pin(t.mid,12)} Macdonald Valley{cacheLabel&&<span style={{marginLeft:6,fontSize:11,color:t.faint,fontWeight:400}}>{fromCache?'cached ':'updated '}{cacheLabel}</span>}</div>
+        <div style={{display:'flex',alignItems:'center',gap:4,fontSize:12.5,color:t.mid,fontWeight:500}}>{Ico.pin(t.mid,12)} Hawkesbury–Macdonald{cacheLabel&&<span style={{marginLeft:6,fontSize:11,color:t.faint,fontWeight:400}}>{fromCache?'cached ':'updated '}{cacheLabel}</span>}</div>
         <div style={{display:'flex',alignItems:'baseline',gap:6,marginTop:6}}>
           <span style={{fontSize:30,fontWeight:700,color:t.ink,letterSpacing:-0.6,lineHeight:1}}>{tempStr}</span>
           {wx?.temp!=null&&<span style={{fontSize:13,color:t.mid}}>C</span>}
@@ -1348,6 +1417,9 @@ function ActivityScreen({data,nav}){
     ...data.burrowLogs.map(x=>({...x,type:'burrowlog',at:x.at})),
     ...wombats.filter(x=>x.firstSeen).map(x=>({...x,type:'wombat_added',at:x.firstSeen})),
     ...burrows.filter(x=>x.lastChecked).map(x=>({...x,type:'burrow_added',at:x.lastChecked})),
+    // Photos — only include entries that have a timestamp so they sort correctly
+    ...(data.wombatPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'wombat_photo',at:x.at})),
+    ...(data.burrowPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'burrow_photo',at:x.at})),
   ].sort((a,b)=>new Date(b.at)-new Date(a.at));
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
     <Header showBack onBack={()=>nav('dashboard')} title="All Activity" showAvatar={false}/>
@@ -1407,6 +1479,28 @@ function ActivityScreen({data,nav}){
               <div style={{fontSize:12,color:t.mid,marginTop:2}}>Burrow recorded · {fmtDate(a.at)}</div>
             </div>
             <Pill tone={burrowTone(a.status)} size="sm">{(a.status||'').charAt(0).toUpperCase()+(a.status||'').slice(1)}</Pill>
+          </Card>;
+        }
+        if(a.type==='wombat_photo'){
+          const w=wombats.find(x=>x.id===a.wombatId);
+          return <Card key={i} padding={12} onClick={()=>w&&nav('wombat-profile',w.id)} style={{display:'flex',alignItems:'center',gap:12,cursor:w?'pointer':'default'}}>
+            <WAvatar size={44} photoUrl={a.dataUrl}/>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{w?.name||'Unknown Wombat'}</div>
+              <div style={{fontSize:12,color:t.mid,marginTop:2}}>Photo added · {fmtDate(a.at)}</div>
+            </div>
+            {w&&<Pill tone={statusTone(w.status||'healthy')} size="sm">{statusLabel(w.status||'healthy')}</Pill>}
+          </Card>;
+        }
+        if(a.type==='burrow_photo'){
+          const b=burrows.find(x=>x.id===a.burrowId);
+          return <Card key={i} padding={12} onClick={()=>b&&nav('burrow-profile',b.id)} style={{display:'flex',alignItems:'center',gap:12,cursor:b?'pointer':'default'}}>
+            <BAvatar size={44} photoUrl={a.dataUrl}/>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{b?.name||'Unknown Burrow'}</div>
+              <div style={{fontSize:12,color:t.mid,marginTop:2}}>Photo added · {fmtDate(a.at)}</div>
+            </div>
+            {b&&<Pill tone={burrowTone(b.status)} size="sm">{(b.status||'').charAt(0).toUpperCase()+(b.status||'').slice(1)}</Pill>}
           </Card>;
         }
       })}
@@ -1475,6 +1569,8 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
     ...data.burrowLogs.map(x=>({...x,type:'burrowlog',at:x.at})),
     ...wombats.filter(x=>x.firstSeen).map(x=>({...x,type:'wombat_added',at:x.firstSeen})),
     ...burrows.filter(x=>x.lastChecked).map(x=>({...x,type:'burrow_added',at:x.lastChecked})),
+    ...(data.wombatPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'wombat_photo',at:x.at})),
+    ...(data.burrowPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'burrow_photo',at:x.at})),
   ].sort((a,b)=>new Date(b.at)-new Date(a.at)).slice(0,4);
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:20}}>
     <Header overline="WOMBATWATCH" title={<span>{(()=>{const h=new Date().getHours();return h<12?'Good morning':h<17?'Good afternoon':'Good evening';})()},<br/>Ranger! 👋</span>} subtitle="It's time to help some creatures" showAvatar onAvatarClick={openProfile}>
@@ -1558,6 +1654,28 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
               <Pill tone={burrowTone(a.status)} size="sm">{(a.status||'').charAt(0).toUpperCase()+(a.status||'').slice(1)}</Pill>
             </Card>;
           }
+          if(a.type==='wombat_photo'){
+            const w=wombats.find(x=>x.id===a.wombatId);
+            return <Card key={i} padding={12} onClick={()=>w&&nav('wombat-profile',w.id)} style={{display:'flex',alignItems:'center',gap:12,cursor:w?'pointer':'default'}}>
+              <WAvatar size={44} photoUrl={a.dataUrl}/>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{w?.name||'Unknown Wombat'}</div>
+                <div style={{fontSize:12,color:t.mid,marginTop:2}}>Photo added · {fmtDate(a.at)}</div>
+              </div>
+              {w&&<Pill tone={statusTone(w.status||'healthy')} size="sm">{statusLabel(w.status||'healthy')}</Pill>}
+            </Card>;
+          }
+          if(a.type==='burrow_photo'){
+            const b=burrows.find(x=>x.id===a.burrowId);
+            return <Card key={i} padding={12} onClick={()=>b&&nav('burrow-profile',b.id)} style={{display:'flex',alignItems:'center',gap:12,cursor:b?'pointer':'default'}}>
+              <BAvatar size={44} photoUrl={a.dataUrl}/>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{b?.name||'Unknown Burrow'}</div>
+                <div style={{fontSize:12,color:t.mid,marginTop:2}}>Photo added · {fmtDate(a.at)}</div>
+              </div>
+              {b&&<Pill tone={burrowTone(b.status)} size="sm">{(b.status||'').charAt(0).toUpperCase()+(b.status||'').slice(1)}</Pill>}
+            </Card>;
+          }
         })}
       </div>
     </div>
@@ -1566,10 +1684,11 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
 }
 
 /* ── OFFLINE MAP TILE UTILITIES ── */
-// Bounding box covering the Macdonald Valley / St Albans operational area
-const OFFLINE_BBOX={n:-33.0,s:-33.35,w:150.75,e:151.1};
+// Bounding box covering the full operational area:
+// Fernances Creek (N) → Wisemans Ferry / Colo (S) → Wrights Creek / Colo (W) → Webbs Creek (E)
+const OFFLINE_BBOX={n:-32.88,s:-33.58,w:150.52,e:151.18};
 const OFFLINE_ZOOM_MIN=10, OFFLINE_ZOOM_MAX=15;
-const TILE_CACHE_NAME='wombatwatch-tiles-v4'; // must match sw.js TILE_CACHE
+const TILE_CACHE_NAME='wombatwatch-tiles-v6'; // must match sw.js TILE_CACHE
 
 function latToTY(lat,z){
   const r=lat*Math.PI/180;
@@ -1592,6 +1711,20 @@ const OFFLINE_SIZE_MB=(OFFLINE_TILES.length*5/1024).toFixed(0);
 
 /* ── MAP ── */
 /* ════════════════════════════════════════════════════════════════
+   MAP TILE URLS
+   OSM / CartoDB: free, no API key. Used for standard and dark modes.
+   Esri World Imagery: free for non-commercial use, no API key needed.
+   Satellite tiles are network-only — the offline cache stores only OSM
+   tiles. If offline with satellite active the map will be blank until
+   the user switches back to street view.
+════════════════════════════════════════════════════════════════ */
+const TILE_OSM   = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+const TILE_CARTO = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+const TILE_SAT   = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+const ATTR_OSM   = '© OpenStreetMap | © CartoDB';
+const ATTR_SAT   = '© Esri World Imagery';
+
+/* ════════════════════════════════════════════════════════════════
    SCREEN — MAP
    Full-screen Leaflet map. Long-press to add a wombat or burrow
    at a chosen location. Offline tile download managed here.
@@ -1600,11 +1733,13 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
   const t=useTheme();
   const mapRef=useRef(null);
   const leafletRef=useRef(null);
+  const tileLayerRef=useRef(null); // current base tile layer — swapped on satellite toggle
   const markersRef=useRef([]);
   const userMarkerRef=useRef(null);
   const longPressMarkerRef=useRef(null);
   const [selected,setSelected]=useState(null);
   const [longPressMenu,setLongPressMenu]=useState(null);
+  const [satellite,setSatellite]=useState(false); // true = Esri aerial, false = OSM/CartoDB
   const dismissLongPress=()=>{
     if(longPressMarkerRef.current){longPressMarkerRef.current.remove();longPressMarkerRef.current=null;}
     setLongPressMenu(null);
@@ -1696,14 +1831,12 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
 
   useEffect(()=>{
     if(!mapRef.current||leafletRef.current)return;
-    // Macdonald Valley — centred to show Wisemans Ferry → Higher Macdonald
-    const center=[-33.175,150.960];
+    // Centred on the operational area: Macdonald Valley, Webbs Creek,
+    // Colo, Wrights Creek, Fernances Creek, and Wisemans Ferry
+    const center=[-33.22,150.97];
     const map=L.map(mapRef.current,{zoomControl:false}).setView(center,11);
     leafletRef.current=map;
-    const tileUrl=theme==='dark'
-      ?'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
-      :'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
-    L.tileLayer(tileUrl,{attribution:'© OpenStreetMap | © CartoDB',maxZoom:18}).addTo(map);
+    // Tile layer is created by the satellite effect below (runs after this effect on mount)
     // Long press detection
     let pressTimer=null;
     let hasMoved=false;
@@ -1728,6 +1861,16 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
     map.on('mousemove touchmove',moveCancel);
     return()=>{map.remove();leafletRef.current=null;};
   },[]);
+
+  // Tile layer effect — runs on mount (after init effect) and on satellite toggle.
+  // Swaps the base layer between OSM/CartoDB street view and Esri aerial imagery.
+  useEffect(()=>{
+    const map=leafletRef.current;if(!map)return;
+    if(tileLayerRef.current){tileLayerRef.current.remove();tileLayerRef.current=null;}
+    const url=satellite?TILE_SAT:theme==='dark'?TILE_CARTO:TILE_OSM;
+    const attr=satellite?ATTR_SAT:ATTR_OSM;
+    tileLayerRef.current=L.tileLayer(url,{attribution:attr,maxZoom:19}).addTo(map);
+  },[satellite]);
 
   useEffect(()=>{
     const map=leafletRef.current;if(!map)return;
@@ -1829,6 +1972,10 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
       <button onClick={flyToUser} style={{width:44,height:44,borderRadius:12,background:t.surface,boxShadow:'0 2px 10px rgba(0,0,0,0.18)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>
         {Ico.crosshair(t.f700,20)}
       </button>
+      {/* Satellite toggle — switches between OSM street view and Esri aerial */}
+      <button onClick={()=>setSatellite(v=>!v)} title={satellite?'Switch to street map':'Switch to satellite'} style={{width:44,height:44,borderRadius:12,background:satellite?t.f700:t.surface,boxShadow:'0 2px 10px rgba(0,0,0,0.18)',border:satellite?'none':`1px solid ${t.div}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>
+        {Ico.layers(satellite?'#fff':t.f700,20)}
+      </button>
       <div style={{height:4}}/>
       {/* Offline maps button */}
       {dlState!=='unsupported'&&(
@@ -1850,7 +1997,7 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
           <button onClick={()=>setShowOffSheet(false)} style={{fontSize:20,color:t.mid,lineHeight:1,width:24,height:24,display:'flex',alignItems:'center',justifyContent:'center'}}>×</button>
         </div>
         {dlState==='idle'&&<>
-          <div style={{fontSize:13,color:t.mid,lineHeight:1.5,marginBottom:12}}>Download the Macdonald Valley map for use without internet. Covers St Albans and surroundings at all zoom levels.</div>
+          <div style={{fontSize:13,color:t.mid,lineHeight:1.5,marginBottom:12}}>Download the operational area map for offline use. Covers Macdonald Valley, Webbs Creek, Colo, Wrights Creek, Fernances Creek, and Wisemans Ferry.</div>
           <div style={{display:'flex',gap:10,marginBottom:14,padding:'10px 12px',background:t.soft,borderRadius:10}}>
             <div style={{flex:1,textAlign:'center'}}>
               <div style={{fontSize:17,fontWeight:700,color:t.ink}}>{OFFLINE_TILES.length.toLocaleString()}</div>
@@ -1936,11 +2083,14 @@ const selStyle=(t)=>({flex:1,height:38,borderRadius:19,background:t.surface,boxS
    WombatList:    searchable list of all wombats.
    WombatProfile: detail view — health, treatments, sightings, photos.
 ════════════════════════════════════════════════════════════════ */
-function WombatList({data,nav,onFAB,openProfile}){
+function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile}){
   const t=useTheme();
+  const isAdmin=authProfile?.role==='admin';
   const [search,setSearch]=useState('');
   const [filterStatus,setFilterStatus]=useState('all');
   const [sortBy,setSortBy]=useState('date_added');
+  const [pendingDelete,setPendingDelete]=useState(null); // wombat awaiting confirm
+  const [editingWombat,setEditingWombat]=useState(null); // wombat being edited
   const filtered=data.wombats.filter(w=>{
     const ms=filterStatus==='all'||w.status===filterStatus;
     const mq=!search||w.name.toLowerCase().includes(search.toLowerCase());
@@ -1952,9 +2102,11 @@ function WombatList({data,nav,onFAB,openProfile}){
       const bt=data.treatments.filter(x=>x.wombatId===b.id).sort((p,q)=>new Date(q.at)-new Date(p.at))[0]?.at||'';
       return bt.localeCompare(at);
     }
-    // date_added: newest first by firstSeen
     return new Date(b.firstSeen||0)-new Date(a.firstSeen||0);
   });
+  // canAct: admins can act on any record; volunteers can act on their own records
+  // or on unowned records (created offline before auth was set up).
+  const canAct=w=>isAdmin||!w._createdBy||w._createdBy===authUser?.id;
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
     <Header title="All Wombats" subtitle={`Monitoring ${data.wombats.length} wombats in your area`} showAvatar onAvatarClick={openProfile}>
       <SearchInHeader value={search} onChange={setSearch} placeholder="Search wombats…"/>
@@ -1978,32 +2130,49 @@ function WombatList({data,nav,onFAB,openProfile}){
     <div style={{padding:'0 28px',display:'flex',flexDirection:'column',gap:10}}>
       {filtered.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'40px 0',fontSize:14}}>No wombats found.</div>}
       {filtered.map(w=>{
-        const tcount=data.treatments.filter(x=>x.wombatId===w.id).length;
         const lastTreat=data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0];
         const lastSight=data.sightings.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0];
         const lastT=(!lastTreat&&!lastSight)?null:(!lastTreat?lastSight:(!lastSight?lastTreat:(new Date(lastSight.at)>=new Date(lastTreat.at)?lastSight:lastTreat)));
         const profilePhoto=(data.wombatPhotos||[]).find(p=>p.wombatId===w.id&&p.isProfile);
-        return <button key={w.id} onClick={()=>nav('wombat-profile',w.id)} style={{textAlign:'left',background:'none',border:'none',padding:0}}>
-          <Card padding={16} style={{border:`1px solid rgba(45,95,63,0.1)`}}>
-            <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
-              <WAvatar size={72} photoUrl={profilePhoto?.dataUrl}/>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:8}}>
-                  <div>
-                    <div style={{fontSize:17,fontWeight:700,color:t.ink,lineHeight:1.2}}>{w.name}</div>
-                    {w.code&&<div style={{fontSize:11,fontWeight:600,color:t.softInk,fontFamily:'monospace',letterSpacing:0.6,marginTop:1}}>{w.code}</div>}
+        const allowed=canAct(w);
+        return <SwipeActions key={w.id}
+          onEdit={allowed?()=>setEditingWombat(w):null}
+          onDelete={allowed?()=>setPendingDelete(w):null}
+        >
+          <button onClick={()=>nav('wombat-profile',w.id)} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
+            <Card padding={16} style={{border:`1px solid rgba(45,95,63,0.1)`}}>
+              <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
+                <WAvatar size={72} photoUrl={profilePhoto?.dataUrl}/>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:8}}>
+                    <div>
+                      <div style={{fontSize:17,fontWeight:700,color:t.ink,lineHeight:1.2}}>{w.name}</div>
+                      {w.code&&<div style={{fontSize:11,fontWeight:600,color:t.softInk,fontFamily:'monospace',letterSpacing:0.6,marginTop:1}}>{w.code}</div>}
+                    </div>
+                    <Pill tone={statusTone(w.status)} size="sm">{statusLabel(w.status)}</Pill>
                   </div>
-                  <Pill tone={statusTone(w.status)} size="sm">{statusLabel(w.status)}</Pill>
+                  <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12.5,color:t.mid,marginTop:7}}>{Ico.cal(t.mid,13)} Last seen {lastT?fmtDate(lastT.at):'—'}</div>
+                  <div style={{marginTop:9}}><LocPill>{w.location||'Unknown location'}</LocPill></div>
                 </div>
-                <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12.5,color:t.mid,marginTop:7}}>{Ico.cal(t.mid,13)} Last seen {lastT?fmtDate(lastT.at):'—'}</div>
-                <div style={{marginTop:9}}><LocPill>{w.location||'Unknown location'}</LocPill></div>
               </div>
-            </div>
-          </Card>
-        </button>;
+            </Card>
+          </button>
+        </SwipeActions>;
       })}
     </div>
     <AcknowledgementFooter/>
+    {pendingDelete&&<ConfirmModal
+      title={`Delete ${pendingDelete.name}?`}
+      message={`This will permanently delete ${pendingDelete.name} and all their treatments, sightings, and photos. This cannot be undone.`}
+      onConfirm={()=>{dispatch({type:'DELETE_WOMBAT',id:pendingDelete.id});setPendingDelete(null);}}
+      onCancel={()=>setPendingDelete(null)}
+    />}
+    {editingWombat&&<EditWombatModal
+      wombat={editingWombat}
+      burrows={data.burrows}
+      onClose={()=>setEditingWombat(null)}
+      onSave={patch=>{dispatch({type:'UPDATE_WOMBAT',id:editingWombat.id,patch});setEditingWombat(null);}}
+    />}
   </div>;
 }
 
@@ -2019,7 +2188,6 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
   const [showLocPicker,setShowLocPicker]=useState(false);
   const [showLocMapPicker,setShowLocMapPicker]=useState(false);
   const [showLocAddress,setShowLocAddress]=useState(false);
-  const [confirmDelete,setConfirmDelete]=useState(false);
   const [locAddressText,setLocAddressText]=useState('');
   const [showLocBurrow,setShowLocBurrow]=useState(false);
   const [locBurrowSearch,setLocBurrowSearch]=useState('');
@@ -2045,7 +2213,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
   const mapLng=latestGPSTr?.location?.lng||w.lng;
   const mapLabel=latestGPSTr?`Treatment · ${fmtDate(latestGPSTr.at)}`:(w.lat?'Last known location':null);
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
-    <Header showBack onBack={()=>nav('wombats')} title="Wombat Profile" showAvatar={false} rightAction={isAdmin&&<button onClick={()=>setConfirmDelete(true)} style={{width:34,height:34,borderRadius:10,background:t.rose50,border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>{Ico.trash(t.rose700,15)}</button>}/>
+    <Header showBack onBack={()=>nav('wombats')} title="Wombat Profile" showAvatar={false}/>
     {/* 1st section — hero card */}
     <div style={{padding:'20px 28px 0'}}>
       <Card padding={16}>
@@ -2108,8 +2276,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
       </>}
       {activeTab===1&&<>
         <SectionLabel action={<div style={{display:'flex',gap:6}}>
-          <label style={{border:'none',background:t.f700,color:'#fff',padding:'7px 12px',borderRadius:999,fontSize:12,fontWeight:600,display:'inline-flex',alignItems:'center',gap:5,cursor:'pointer'}}>{Ico.camera('#fff',13)} Camera<input type="file" accept="image/*" capture="environment" style={{display:'none'}} onChange={handlePhotoUpload}/></label>
-          <label style={{border:'none',background:t.f700,color:'#fff',padding:'7px 12px',borderRadius:999,fontSize:12,fontWeight:600,display:'inline-flex',alignItems:'center',gap:5,cursor:'pointer'}}>{Ico.layers('#fff',13)} Gallery<input type="file" accept="image/*" style={{display:'none'}} onChange={handlePhotoUpload}/></label>
+          <label style={{border:'none',background:t.f700,color:'#fff',padding:'7px 12px',borderRadius:999,fontSize:12,fontWeight:600,display:'inline-flex',alignItems:'center',gap:5,cursor:'pointer'}}>{Ico.camera('#fff',13)} Add Photo<input type="file" accept="image/*" style={{display:'none'}} onChange={handlePhotoUpload}/></label>
         </div>}>Photos</SectionLabel>
         {photos.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'30px 0',fontSize:14}}>No photos yet.</div>}
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
@@ -2232,12 +2399,6 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
     </div>
     <AcknowledgementFooter/>
     {showAddTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} onClose={()=>setShowAddTreatment(false)} onSave={(tr,photos=[],linkedBurrowId=null,statusChange=null)=>{dispatch({type:'ADD_TREATMENT',treatment:tr});photos.forEach((p,i)=>dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+Date.now()+'_'+i,wombatId:w.id,dataUrl:p.dataUrl,isProfile:false,at:new Date().toISOString()}}));if(linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(statusChange)dispatch({type:'UPDATE_WOMBAT',id:w.id,patch:{status:statusChange}});setShowAddTreatment(false);}}/>}
-    {confirmDelete&&<ConfirmModal
-      title={`Delete ${w.name}?`}
-      message={`This will permanently delete ${w.name} and all their treatments, sightings, and photos. This cannot be undone.`}
-      onConfirm={()=>{dispatch({type:'DELETE_WOMBAT',id:w.id});nav('wombats');}}
-      onCancel={()=>setConfirmDelete(false)}
-    />}
   </div>;
 }
 
@@ -2247,11 +2408,14 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
    BurrowList:    searchable list of all burrows.
    BurrowProfile: detail view — status, logs, linked wombats, photos.
 ════════════════════════════════════════════════════════════════ */
-function BurrowList({data,nav,onFAB,openProfile}){
+function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile}){
   const t=useTheme();
+  const isAdmin=authProfile?.role==='admin';
   const [search,setSearch]=useState('');
   const [filterStatus,setFilterStatus]=useState('all');
   const [sortBy,setSortBy]=useState('date_added');
+  const [pendingDelete,setPendingDelete]=useState(null);
+  const [editingBurrow,setEditingBurrow]=useState(null);
   const filtered=data.burrows.filter(b=>{
     const ms=filterStatus==='all'||b.status===filterStatus;
     const mq=!search||b.name.toLowerCase().includes(search.toLowerCase());
@@ -2263,9 +2427,9 @@ function BurrowList({data,nav,onFAB,openProfile}){
       const bl=data.burrowLogs.filter(x=>x.burrowId===b.id).sort((p,q)=>new Date(q.at)-new Date(p.at))[0]?.at||'';
       return bl.localeCompare(al);
     }
-    // date_added: newest first by lastChecked (set on creation)
     return new Date(b.lastChecked||0)-new Date(a.lastChecked||0);
   });
+  const canAct=b=>isAdmin||!b._createdBy||b._createdBy===authUser?.id;
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
     <Header title="Burrow Tracker" subtitle={`Monitoring ${data.burrows.length} burrows in your area`} showAvatar onAvatarClick={openProfile}>
       <SearchInHeader value={search} onChange={setSearch} placeholder="Search burrows…"/>
@@ -2286,26 +2450,43 @@ function BurrowList({data,nav,onFAB,openProfile}){
         <option value="last_logged">Last Logged</option>
       </select>
     </div>
-    <div style={{padding:'0 28px',display:'flex',flexDirection:'column',gap:14}}>
+    <div style={{padding:'0 28px',display:'flex',flexDirection:'column',gap:10}}>
       {filtered.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'40px 0',fontSize:14}}>No burrows found.</div>}
       {filtered.map(b=>{
-        const lastLog=data.burrowLogs.filter(x=>x.burrowId===b.id).sort((a,c)=>new Date(c.at)-new Date(a.at))[0];
-        return <button key={b.id} onClick={()=>nav('burrow-profile',b.id)} style={{textAlign:'left',background:'none',border:'none',padding:0}}>
-          <Card padding={16} style={{border:`1px solid rgba(45,95,63,0.1)`}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:8}}>
-              <div>
-                <div style={{fontSize:16,fontWeight:700,color:t.ink,lineHeight:1.2}}>{b.name}</div>
-                {b.code&&<div style={{fontSize:11,fontWeight:600,color:t.softInk,fontFamily:'monospace',letterSpacing:0.6,marginTop:1}}>{b.code}</div>}
+        const allowed=canAct(b);
+        return <SwipeActions key={b.id}
+          onEdit={allowed?()=>setEditingBurrow(b):null}
+          onDelete={allowed?()=>setPendingDelete(b):null}
+        >
+          <button onClick={()=>nav('burrow-profile',b.id)} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
+            <Card padding={16} style={{border:`1px solid rgba(45,95,63,0.1)`}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:8}}>
+                <div>
+                  <div style={{fontSize:16,fontWeight:700,color:t.ink,lineHeight:1.2}}>{b.name}</div>
+                  {b.code&&<div style={{fontSize:11,fontWeight:600,color:t.softInk,fontFamily:'monospace',letterSpacing:0.6,marginTop:1}}>{b.code}</div>}
+                </div>
+                <Pill tone={burrowTone(b.status)} size="sm">{burrowStatusLabel(b.status)}</Pill>
               </div>
-              <Pill tone={burrowTone(b.status)} size="sm">{burrowStatusLabel(b.status)}</Pill>
-            </div>
-            <div style={{marginTop:6}}><LocPill>{b.location||'Unknown location'}</LocPill></div>
-            <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12.5,color:t.mid,marginTop:6}}>{Ico.cal(t.mid,12)} Last check: {fmtDate(b.lastChecked)}</div>
-          </Card>
-        </button>;
+              <div style={{marginTop:6}}><LocPill>{b.location||'Unknown location'}</LocPill></div>
+              <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12.5,color:t.mid,marginTop:6}}>{Ico.cal(t.mid,12)} Last check: {fmtDate(b.lastChecked)}</div>
+            </Card>
+          </button>
+        </SwipeActions>;
       })}
     </div>
     <AcknowledgementFooter/>
+    {pendingDelete&&<ConfirmModal
+      title={`Delete ${pendingDelete.name}?`}
+      message={`This will permanently delete ${pendingDelete.name} and all its check logs and photos. This cannot be undone.`}
+      onConfirm={()=>{dispatch({type:'DELETE_BURROW',id:pendingDelete.id});setPendingDelete(null);}}
+      onCancel={()=>setPendingDelete(null)}
+    />}
+    {editingBurrow&&<EditBurrowModal
+      burrow={editingBurrow}
+      wombats={data.wombats}
+      onClose={()=>setEditingBurrow(null)}
+      onSave={patch=>{dispatch({type:'UPDATE_BURROW',id:editingBurrow.id,patch});setEditingBurrow(null);}}
+    />}
   </div>;
 }
 
@@ -2318,7 +2499,6 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
   const [expandedLogs,setExpandedLogs]=useState(new Set());
   const [editingBurrowNotes,setEditingBurrowNotes]=useState(false);
   const [burrowNoteDraft,setBurrowNoteDraft]=useState('');
-  const [confirmDelete,setConfirmDelete]=useState(false);
   const b=data.burrows.find(x=>x.id===burrowId);
   if(!b)return <div style={{padding:20,color:t.ink}}>Burrow not found.</div>;
   const logs=data.burrowLogs.filter(x=>x.burrowId===b.id).sort((a,c)=>new Date(c.at)-new Date(a.at));
@@ -2334,7 +2514,7 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
     });
   };
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
-    <Header showBack onBack={()=>nav('burrows')} title="Burrow Profile" showAvatar={false} rightAction={isAdmin&&<button onClick={()=>setConfirmDelete(true)} style={{width:34,height:34,borderRadius:10,background:t.rose50,border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>{Ico.trash(t.rose700,15)}</button>}/>
+    <Header showBack onBack={()=>nav('burrows')} title="Burrow Profile" showAvatar={false}/>
     <div style={{padding:'20px 28px 0'}}>
       <Card padding={16}>
         <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
@@ -2444,8 +2624,7 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
       </>}
       {activeTab===2&&<>
         <SectionLabel action={<div style={{display:'flex',gap:6}}>
-          <label style={{border:'none',background:t.f700,color:'#fff',padding:'7px 12px',borderRadius:999,fontSize:12,fontWeight:600,display:'inline-flex',alignItems:'center',gap:5,cursor:'pointer'}}>{Ico.camera('#fff',13)} Camera<input type="file" accept="image/*" capture="environment" style={{display:'none'}} onChange={handleBurrowPhotoUpload}/></label>
-          <label style={{border:'none',background:t.f700,color:'#fff',padding:'7px 12px',borderRadius:999,fontSize:12,fontWeight:600,display:'inline-flex',alignItems:'center',gap:5,cursor:'pointer'}}>{Ico.layers('#fff',13)} Gallery<input type="file" accept="image/*" style={{display:'none'}} onChange={handleBurrowPhotoUpload}/></label>
+          <label style={{border:'none',background:t.f700,color:'#fff',padding:'7px 12px',borderRadius:999,fontSize:12,fontWeight:600,display:'inline-flex',alignItems:'center',gap:5,cursor:'pointer'}}>{Ico.camera('#fff',13)} Add Photo<input type="file" accept="image/*" style={{display:'none'}} onChange={handleBurrowPhotoUpload}/></label>
         </div>}>Photos</SectionLabel>
         {bPhotos.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'30px 0',fontSize:14}}>No photos yet.</div>}
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
@@ -2470,12 +2649,6 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
     </div>
     <AcknowledgementFooter/>
     {showLogStatus&&<LogStatusModal burrowId={b.id} burrowName={b.name} wombats={data.wombats} onClose={()=>setShowLogStatus(false)} onSave={log=>{dispatch({type:'ADD_BURROW_LOG',log});setShowLogStatus(false);}}/>}
-    {confirmDelete&&<ConfirmModal
-      title={`Delete ${b.name}?`}
-      message={`This will permanently delete ${b.name} and all its check logs and photos. This cannot be undone.`}
-      onConfirm={()=>{dispatch({type:'DELETE_BURROW',id:b.id});nav('burrows');}}
-      onCancel={()=>setConfirmDelete(false)}
-    />}
   </div>;
 }
 
@@ -2988,10 +3161,48 @@ function FABSheet({onClose,onSelect}){
 function GeoSearch({onSelect,onCancel}){
   const t=useTheme();
   const [q,setQ]=useState('');
+  // results: array of normalised {lat,lng,main,sub,addr,locality} objects
   const [results,setResults]=useState([]);
   const [loading,setLoading]=useState(false);
   const [notFound,setNotFound]=useState(false);
   const timerRef=useRef(null);
+
+  // ── Normalise a Photon GeoJSON feature ────────────────────────
+  const fromPhoton=r=>{
+    const p=r.properties;
+    const[lng,lat]=r.geometry.coordinates;
+    const num=p.housenumber,street=p.street,name=p.name;
+    const suburb=p.suburb||p.quarter||p.district;
+    const city=p.city||p.town||p.village||p.county;
+    const state=p.state;
+    let main='';
+    if(num&&street)main=`${num} ${street}`;
+    else if(name&&street&&name!==street)main=name;
+    else if(street)main=street;
+    else main=name||'Unknown';
+    const sub=[suburb||city,state].filter(Boolean).join(', ');
+    const addr=[num&&street?`${num} ${street}`:name||street,suburb||city,state].filter(Boolean).join(', ');
+    const locality=suburb||city||state||addr;
+    return{lat,lng,main,sub,addr,locality,_src:'photon'};
+  };
+
+  // ── Normalise a Nominatim JSON result ─────────────────────────
+  const fromNominatim=r=>{
+    const lat=parseFloat(r.lat),lng=parseFloat(r.lon);
+    const a=r.address||{};
+    const num=a.house_number,street=a.road;
+    const suburb=a.suburb||a.village||a.hamlet;
+    const city=a.town||a.city||a.county;
+    const state=a.state;
+    let main='';
+    if(num&&street)main=`${num} ${street}`;
+    else if(street)main=street;
+    else main=(r.display_name||'').split(',')[0];
+    const sub=[suburb||city,state].filter(Boolean).join(', ');
+    const addr=[num&&street?`${num} ${street}`:street,suburb||city,state].filter(Boolean).join(', ');
+    const locality=suburb||city||state||addr;
+    return{lat,lng,main,sub,addr,locality,_src:'nominatim'};
+  };
 
   const search=val=>{
     clearTimeout(timerRef.current);
@@ -3000,43 +3211,31 @@ function GeoSearch({onSelect,onCancel}){
     setLoading(true);
     timerRef.current=setTimeout(async()=>{
       try{
-        // Photon (by Komoot) — OSM-based, free, no key required.
-        // Better house-number coverage than Nominatim for Australia.
-        // bbox biases to Australia without hard-restricting it.
-        const res=await fetch(
-          `https://photon.komoot.io/api/?q=${encodeURIComponent(val)}&limit=7&lang=en&bbox=112,-44,154,-10`,
-          {headers:{'Accept':'application/json'}}
-        );
-        const data=await res.json();
-        const features=(data.features||[]);
-        setResults(features);
-        setNotFound(features.length===0);
+        // Run both Photon and Nominatim in parallel for best coverage.
+        // Photon (Komoot) — fast, good house-number data.
+        //   location_bias centred on the operational area (Macdonald Valley,
+        //   Webbs Creek, Colo, Wrights Creek, Fernances, Wisemans Ferry).
+        // Nominatim — OSM + GNAF data; better rural NSW property coverage.
+        //   viewbox matches the offline tile area; bounded=0 allows wider hits.
+        const photonUrl=`https://photon.komoot.io/api/?q=${encodeURIComponent(val)}&limit=7&lang=en&lon=150.87&lat=-33.22&location_bias_scale=0.6`;
+        const nominatimUrl=`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(val)}&format=json&limit=6&countrycodes=au&viewbox=150.52,-33.58,151.18,-32.88&bounded=0&addressdetails=1`;
+        const[photonRes,nominatimRes]=await Promise.allSettled([
+          fetch(photonUrl,{headers:{'Accept':'application/json'}}).then(r=>r.json()),
+          fetch(nominatimUrl,{headers:{'Accept':'application/json','Accept-Language':'en'}}).then(r=>r.json()),
+        ]);
+        const photonItems=(photonRes.status==='fulfilled'?(photonRes.value.features||[]):[]).map(fromPhoton);
+        const nominatimItems=(nominatimRes.status==='fulfilled'?(nominatimRes.value||[]):[]).map(fromNominatim);
+        // Merge: Photon first, then any Nominatim result not within 100 m of an existing hit
+        const merged=[...photonItems];
+        nominatimItems.forEach(ni=>{
+          const dup=merged.some(pi=>Math.abs(pi.lat-ni.lat)<0.001&&Math.abs(pi.lng-ni.lng)<0.001);
+          if(!dup)merged.push(ni);
+        });
+        setResults(merged.slice(0,10));
+        setNotFound(merged.length===0);
       }catch{setResults([]);setNotFound(true);}
       finally{setLoading(false);}
     },400);
-  };
-
-  // Build human-readable lines from Photon's GeoJSON properties
-  const fmt=p=>{
-    const num=p.housenumber;
-    const street=p.street;
-    const name=p.name;
-    const suburb=p.suburb||p.quarter||p.district;
-    const city=p.city||p.town||p.village||p.county;
-    const state=p.state;
-    // Main line: house-number + street, or named place, or street alone
-    let main='';
-    if(num&&street) main=`${num} ${street}`;
-    else if(name&&street&&name!==street) main=name;
-    else if(street) main=street;
-    else main=name||'Unknown';
-    // Sub line: suburb/city + state
-    const sub=[suburb||city,state].filter(Boolean).join(', ');
-    // Full address for display in form chip
-    const addr=[num&&street?`${num} ${street}`:name||street,suburb||city,state].filter(Boolean).join(', ');
-    // Locality = the suburb/town label stored on the wombat/burrow record
-    const locality=suburb||city||state||addr;
-    return{main,sub,addr,locality};
   };
 
   const spinner=<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={t.mid} strokeWidth="2.5" strokeLinecap="round" style={{animation:'spin 0.8s linear infinite',flexShrink:0}}><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>;
@@ -3061,22 +3260,17 @@ function GeoSearch({onSelect,onCancel}){
       {/* Results */}
       {results.length>0&&
         <div style={{maxHeight:210,overflowY:'auto'}}>
-          {results.map((r,i)=>{
-            const p=r.properties;
-            const[lng,lat]=r.geometry.coordinates;
-            const{main,sub,addr,locality}=fmt(p);
-            return(
-              <button key={`${p.osm_id||i}`}
-                onClick={()=>onSelect({lat,lng,address:addr,locality})}
-                style={{display:'flex',alignItems:'flex-start',gap:10,width:'100%',padding:'11px 14px',background:'none',border:'none',borderBottom:`1px solid ${t.div}`,textAlign:'left',cursor:'pointer'}}>
-                <div style={{marginTop:2,flexShrink:0}}>{Ico.pin(t.lav500,11)}</div>
-                <div style={{flex:1,minWidth:0}}>
-                  <div style={{fontSize:13.5,fontWeight:600,color:t.ink,lineHeight:1.3}}>{main}</div>
-                  {sub&&<div style={{fontSize:11.5,color:t.mid,marginTop:2}}>{sub}</div>}
-                </div>
-              </button>
-            );
-          })}
+          {results.map((r,i)=>(
+            <button key={i}
+              onClick={()=>onSelect({lat:r.lat,lng:r.lng,address:r.addr,locality:r.locality})}
+              style={{display:'flex',alignItems:'flex-start',gap:10,width:'100%',padding:'11px 14px',background:'none',border:'none',borderBottom:`1px solid ${t.div}`,textAlign:'left',cursor:'pointer'}}>
+              <div style={{marginTop:2,flexShrink:0}}>{Ico.pin(t.lav500,11)}</div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:13.5,fontWeight:600,color:t.ink,lineHeight:1.3}}>{r.main}</div>
+                {r.sub&&<div style={{fontSize:11.5,color:t.mid,marginTop:2}}>{r.sub}</div>}
+              </div>
+            </button>
+          ))}
         </div>
       }
       {notFound&&q.length>=3&&!loading&&
@@ -3112,15 +3306,17 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
   const t=useTheme();
   const mapRef=useRef(null);
   const leafRef=useRef(null);
+  const tileLayerRef=useRef(null);
   const markerRef=useRef(null);
   const [picked,setPicked]=useState(initialLat?{lat:initialLat,lng:initialLng}:null);
+  const [satellite,setSatellite]=useState(false);
+
+  // Map init — create the Leaflet instance once. Tile layer is handled by a separate effect below.
   useEffect(()=>{
     if(!mapRef.current||leafRef.current)return;
-    // If we have an initial location, use it. Otherwise try GPS, fall back to Macdonald Valley.
     const initMap=(lat,lng,zoom)=>{
-      if(leafRef.current)return; // guard against double-init if GPS came back late
+      if(leafRef.current)return; // guard against double-init if GPS comes back late
       const map=L.map(mapRef.current,{zoomControl:true}).setView([lat,lng],zoom);
-      L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap',maxZoom:19}).addTo(map);
       if(initialLat){markerRef.current=L.marker([initialLat,initialLng]).addTo(map);}
       map.on('click',e=>{
         const{lat,lng}=e.latlng;
@@ -3133,18 +3329,26 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
     if(initialLat){
       initMap(initialLat,initialLng,14);
     }else if(navigator.geolocation){
-      // Start at a rough view immediately, then snap to GPS if it arrives quickly
-      initMap(-33.166,150.983,12); // Macdonald Valley default
+      initMap(-33.22,150.87,11); // operational area default
       navigator.geolocation.getCurrentPosition(
         pos=>{ if(leafRef.current)leafRef.current.setView([pos.coords.latitude,pos.coords.longitude],14); },
-        ()=>{}, // silent fallback — already showing default view
-        {timeout:4000,maximumAge:30000}
+        ()=>{},{timeout:4000,maximumAge:30000}
       );
     }else{
-      initMap(-33.166,150.983,12);
+      initMap(-33.22,150.87,11);
     }
     return()=>{if(leafRef.current){leafRef.current.remove();leafRef.current=null;}};
   },[]);
+
+  // Tile layer — runs after init effect on mount, and again whenever satellite toggles
+  useEffect(()=>{
+    const map=leafRef.current;if(!map)return;
+    if(tileLayerRef.current){tileLayerRef.current.remove();tileLayerRef.current=null;}
+    tileLayerRef.current=L.tileLayer(
+      satellite?TILE_SAT:TILE_OSM,
+      {attribution:satellite?ATTR_SAT:ATTR_OSM,maxZoom:19}
+    ).addTo(map);
+  },[satellite]);
   return(
     // Backdrop — tap to cancel
     <div onClick={onClose} style={{position:'fixed',inset:0,zIndex:1100,display:'flex',flexDirection:'column',justifyContent:'flex-end',alignItems:'center',background:'rgba(0,0,0,0.55)',paddingTop:'calc(var(--sat) + 48px)'}}>
@@ -3158,25 +3362,34 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
         </div>
         <div style={{flex:1,position:'relative'}}>
           <div ref={mapRef} style={{width:'100%',height:'100%'}}/>
-          {/* GPS button overlay */}
-          <button
-            onClick={()=>{
-              if(!navigator.geolocation)return;
-              navigator.geolocation.getCurrentPosition(pos=>{
-                const{latitude:lat,longitude:lng}=pos.coords;
-                if(leafRef.current){
-                  leafRef.current.setView([lat,lng],16);
-                  // Place a pin at the GPS position
-                  if(markerRef.current)markerRef.current.remove();
-                  markerRef.current=L.marker([lat,lng]).addTo(leafRef.current);
-                  setPicked({lat,lng});
-                }
-              },()=>alert('Could not get your location. Check permissions.'),{timeout:8000,maximumAge:10000});
-            }}
-            style={{position:'absolute',bottom:16,right:16,zIndex:500,width:44,height:44,borderRadius:12,background:t.surface,boxShadow:'0 2px 10px rgba(0,0,0,0.2)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}
-          >
-            {Ico.crosshair(t.f700,20)}
-          </button>
+          {/* Map control buttons: GPS snap + satellite toggle */}
+          <div style={{position:'absolute',bottom:16,right:16,zIndex:500,display:'flex',flexDirection:'column',gap:8}}>
+            <button
+              onClick={()=>{
+                if(!navigator.geolocation)return;
+                navigator.geolocation.getCurrentPosition(pos=>{
+                  const{latitude:lat,longitude:lng}=pos.coords;
+                  if(leafRef.current){
+                    leafRef.current.setView([lat,lng],16);
+                    if(markerRef.current)markerRef.current.remove();
+                    markerRef.current=L.marker([lat,lng]).addTo(leafRef.current);
+                    setPicked({lat,lng});
+                  }
+                },()=>alert('Could not get your location. Check permissions.'),{timeout:8000,maximumAge:10000});
+              }}
+              style={{width:44,height:44,borderRadius:12,background:t.surface,boxShadow:'0 2px 10px rgba(0,0,0,0.2)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}
+            >
+              {Ico.crosshair(t.f700,20)}
+            </button>
+            {/* Satellite toggle */}
+            <button
+              onClick={()=>setSatellite(v=>!v)}
+              title={satellite?'Street map':'Satellite'}
+              style={{width:44,height:44,borderRadius:12,background:satellite?t.f700:t.surface,boxShadow:'0 2px 10px rgba(0,0,0,0.2)',border:satellite?'none':`1px solid ${t.div}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}
+            >
+              {Ico.layers(satellite?'#fff':t.f700,20)}
+            </button>
+          </div>
         </div>
         <div style={{padding:'12px 20px calc(var(--sab)+16px)',background:t.surface,borderTop:`1px solid ${t.div}`,flexShrink:0}}>
           {picked
@@ -3671,16 +3884,10 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
             <img src={photoDataUrl} alt="Wombat" style={{width:'100%',maxWidth:240,height:160,objectFit:'cover',borderRadius:14,display:'block'}}/>
             <button onClick={()=>setPhotoDataUrl(null)} style={{position:'absolute',top:6,right:6,width:26,height:26,borderRadius:13,background:'rgba(0,0,0,0.55)',border:'none',color:'#fff',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{Ico.close('#fff',12)}</button>
           </div>
-        : <div style={{display:'flex',gap:8}}>
-            <label style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.ink}}>
-              {Ico.camera(t.f700,15)} Camera
-              <input type="file" accept="image/*" capture="environment" style={{display:'none'}} onChange={e=>{const f=e.target.files?.[0];if(!f)return;e.target.value='';compressImage(f).then(d=>setPhotoDataUrl(d));}}/>
-            </label>
-            <label style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.ink}}>
-              {Ico.layers(t.f700,15)} Gallery
-              <input type="file" accept="image/*" style={{display:'none'}} onChange={e=>{const f=e.target.files?.[0];if(!f)return;e.target.value='';compressImage(f).then(d=>setPhotoDataUrl(d));}}/>
-            </label>
-          </div>
+        : <label style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.ink}}>
+            {Ico.camera(t.f700,15)} Add Photo
+            <input type="file" accept="image/*" style={{display:'none'}} onChange={e=>{const f=e.target.files?.[0];if(!f)return;e.target.value='';compressImage(f).then(d=>setPhotoDataUrl(d));}}/>
+          </label>
       }
     </FormField>
     <FormField label="Notes"><FTextarea value={form.notes} onChange={v=>set('notes',v)} placeholder="Field observations…"/></FormField>
@@ -3727,7 +3934,7 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
     const{substrate,vegetation,notes,trailCamera,orientation,entranceHeightCm,entranceWidthCm,...rest}=form;
     const bId=uid();
     const photo=photoDataUrl?{id:'ph_'+Date.now(),burrowId:bId,dataUrl:photoDataUrl,isProfile:true,at:new Date().toISOString()}:null;
-    onSave({id:bId,code:nextCode,...rest,orientation:orientation||undefined,entranceHeightCm:entranceHeightCm?Number(entranceHeightCm):undefined,entranceWidthCm:entranceWidthCm?Number(entranceWidthCm):undefined,lat:location.lat??null,lng:location.lng??null,location:location.locality||location.address||null,habitat:{substrate,vegetation,notes,trailCamera},wombatIds:[],_sync:true},photo);
+    onSave({id:bId,code:nextCode,...rest,orientation:orientation||undefined,entranceHeightCm:entranceHeightCm?Number(entranceHeightCm):undefined,entranceWidthCm:entranceWidthCm?Number(entranceWidthCm):undefined,lat:location.lat??null,lng:location.lng??null,location:location.locality||location.address||null,habitat:{substrate,vegetation,notes,trailCamera},wombatIds:form.wombatIds||[],_sync:true},photo);
   }}>
     <FormField label="Name" required><FInput value={form.name} onChange={v=>set('name',v)} placeholder="e.g. Burrow Zeta"/></FormField>
     <FormField label="Status" required>
@@ -3774,16 +3981,10 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
             <img src={photoDataUrl} alt="Burrow" style={{width:'100%',maxWidth:240,height:160,objectFit:'cover',borderRadius:14,display:'block'}}/>
             <button onClick={()=>setPhotoDataUrl(null)} style={{position:'absolute',top:6,right:6,width:26,height:26,borderRadius:13,background:'rgba(0,0,0,0.55)',border:'none',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{Ico.close('#fff',12)}</button>
           </div>
-        : <div style={{display:'flex',gap:8}}>
-            <label style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.ink}}>
-              {Ico.camera(t.f700,15)} Camera
-              <input type="file" accept="image/*" capture="environment" style={{display:'none'}} onChange={e=>{const f=e.target.files?.[0];if(!f)return;e.target.value='';compressImage(f).then(d=>setPhotoDataUrl(d));}}/>
-            </label>
-            <label style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.ink}}>
-              {Ico.layers(t.f700,15)} Gallery
-              <input type="file" accept="image/*" style={{display:'none'}} onChange={e=>{const f=e.target.files?.[0];if(!f)return;e.target.value='';compressImage(f).then(d=>setPhotoDataUrl(d));}}/>
-            </label>
-          </div>
+        : <label style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.ink}}>
+            {Ico.camera(t.f700,15)} Add Photo
+            <input type="file" accept="image/*" style={{display:'none'}} onChange={e=>{const f=e.target.files?.[0];if(!f)return;e.target.value='';compressImage(f).then(d=>setPhotoDataUrl(d));}}/>
+          </label>
       }
     </FormField>
     {(()=>{
@@ -3951,8 +4152,8 @@ function reducer(state,action){
       // Merges IDB blobs back into in-memory state so photos render.
       // Does NOT write to localStorage — blobs belong in IDB only.
       const m=action.map; // { [photoId]: dataUrl }
-      const wombatPhotos=state.wombatPhotos.map(p=>m[p.id]?{...p,dataUrl:m[p.id]}:p);
-      const burrowPhotos=state.burrowPhotos.map(p=>m[p.id]?{...p,dataUrl:m[p.id]}:p);
+      const wombatPhotos=(state.wombatPhotos||[]).map(p=>m[p.id]?{...p,dataUrl:m[p.id]}:p);
+      const burrowPhotos=(state.burrowPhotos||[]).map(p=>m[p.id]?{...p,dataUrl:m[p.id]}:p);
       return{...state,wombatPhotos,burrowPhotos};
     }
 
@@ -4012,6 +4213,213 @@ function reducer(state,action){
 
     default:return state;
   }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   EDIT MODALS
+   EditWombatModal: pre-populated form for updating a wombat record.
+   EditBurrowModal: pre-populated form for updating a burrow record.
+   Both are opened from the swipe-actions on the list tiles and save
+   via UPDATE_WOMBAT / UPDATE_BURROW dispatch.
+════════════════════════════════════════════════════════════════ */
+
+/* ── EDIT WOMBAT MODAL ── */
+function EditWombatModal({wombat,onClose,onSave}){
+  const t=useTheme();
+  const [form,setForm]=useState({
+    name:wombat.name||'',
+    sex:wombat.sex||'unknown',
+    ageClass:wombat.ageClass||'adult',
+    status:wombat.status||'',
+    firstSeen:wombat.firstSeen||today(),
+    notes:wombat.notes||'',
+  });
+  // Represent the existing lat/lng as a location object so the picker can show it
+  const [location,setLocation]=useState(
+    wombat.lat?{lat:wombat.lat,lng:wombat.lng,address:wombat.location}:null
+  );
+  const [showMapPicker,setShowMapPicker]=useState(false);
+  const [showGeoSearch,setShowGeoSearch]=useState(false);
+  const set=(k,v)=>setForm(f=>({...f,[k]:v}));
+  return <ModalWrap title="Edit Wombat" onClose={onClose} saveLabel="Save Changes" onSave={()=>{
+    if(!form.name.trim())return alert('Please enter a name.');
+    if(!form.status)return alert('Please select a health status.');
+    onSave({
+      ...form,
+      lat:location?.lat??wombat.lat,
+      lng:location?.lng??wombat.lng,
+      location:location?.locality||location?.address||wombat.location,
+    });
+  }}>
+    <FormField label="Name" required><FInput value={form.name} onChange={v=>set('name',v)} placeholder="e.g. Walter"/></FormField>
+    <FormField label="Sex">
+      <ChipPicker value={form.sex} onChange={v=>set('sex',v)} options={[{value:'M',label:'Male'},{value:'F',label:'Female'},{value:'unknown',label:'Unknown'}]}/>
+    </FormField>
+    <FormField label="Age Class">
+      <ChipPicker value={form.ageClass} onChange={v=>set('ageClass',v)} options={[{value:'joey',label:'Joey'},{value:'sub-adult',label:'Sub-adult'},{value:'adult',label:'Adult'}]}/>
+    </FormField>
+    <FormField label="Health Status" required>
+      <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Under Treatment'},{value:'mange',label:'Mange'}]}/>
+    </FormField>
+    <FormField label="First Seen Date"><FInput type="date" value={form.firstSeen} onChange={v=>set('firstSeen',v)}/></FormField>
+    <FormField label="Location">
+      {location
+        ? <div style={{background:t.soft,borderRadius:12,padding:'10px 14px',display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}}>
+            <div style={{flex:1,minWidth:0}}>
+              {location.address&&<div style={{fontSize:13,fontWeight:600,color:t.ink,marginBottom:2}}>{location.address}</div>}
+              {location.lat&&<div style={{fontSize:12,color:t.mid,fontFamily:'monospace'}}>{location.lat.toFixed(5)}, {location.lng.toFixed(5)}</div>}
+            </div>
+            <button onClick={()=>{setLocation(null);setShowGeoSearch(false);}} style={{fontSize:12,color:t.mid,background:'none',border:'none',fontWeight:600,cursor:'pointer',flexShrink:0}}>Clear</button>
+          </div>
+        : <div style={{display:'flex',flexDirection:'column',gap:8}}>
+            {showGeoSearch
+              ? <GeoSearch onSelect={r=>{setLocation(r);setShowGeoSearch(false);}} onCancel={()=>setShowGeoSearch(false)}/>
+              : <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+                  <button onClick={()=>{if(!navigator.geolocation)return;navigator.geolocation.getCurrentPosition(async pos=>{const lat=pos.coords.latitude,lng=pos.coords.longitude;const loc=await reverseGeocode(lat,lng);setLocation({lat,lng,address:loc||''});},()=>alert('Location unavailable.'));}} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
+                    {Ico.location(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Current GPS</span>
+                  </button>
+                  <button onClick={()=>setShowMapPicker(true)} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
+                    {Ico.map(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Map</span>
+                  </button>
+                  <button onClick={()=>setShowGeoSearch(true)} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',gridColumn:'1/-1'}}>
+                    {Ico.search(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Address</span>
+                  </button>
+                </div>
+            }
+          </div>
+      }
+      {showMapPicker&&<MapPickerModal initialLat={location?.lat} initialLng={location?.lng} onClose={()=>setShowMapPicker(false)} onConfirm={async pos=>{setLocation(pos);setShowMapPicker(false);const loc=await reverseGeocode(pos.lat,pos.lng);if(loc)setLocation({...pos,address:loc});}}/>}
+    </FormField>
+    <FormField label="Notes"><FTextarea value={form.notes} onChange={v=>set('notes',v)} placeholder="Field observations…"/></FormField>
+  </ModalWrap>;
+}
+
+/* ── EDIT BURROW MODAL ── */
+function EditBurrowModal({burrow,wombats=[],onClose,onSave}){
+  const t=useTheme();
+  const [form,setForm]=useState({
+    name:burrow.name||'',
+    status:burrow.status||'',
+    lastChecked:burrow.lastChecked||today(),
+    orientation:burrow.orientation||'',
+    entranceHeightCm:burrow.entranceHeightCm||'',
+    entranceWidthCm:burrow.entranceWidthCm||'',
+    substrate:burrow.habitat?.substrate||'',
+    vegetation:burrow.habitat?.vegetation||'',
+    habitatNotes:burrow.habitat?.notes||'',
+    trailCamera:burrow.habitat?.trailCamera||false,
+    wombatIds:burrow.wombatIds||[],
+  });
+  const [location,setLocation]=useState(
+    burrow.lat?{lat:burrow.lat,lng:burrow.lng,address:burrow.location}:null
+  );
+  const [showMapPicker,setShowMapPicker]=useState(false);
+  const [showGeoSearch,setShowGeoSearch]=useState(false);
+  const [showMore,setShowMore]=useState(false);
+  const [wSearch,setWSearch]=useState('');
+  const filteredW=wombats.filter(w=>w.name.toLowerCase().includes(wSearch.toLowerCase()));
+  const toggleWombat=id=>setForm(f=>({...f,wombatIds:f.wombatIds.includes(id)?f.wombatIds.filter(x=>x!==id):[...f.wombatIds,id]}));
+  const set=(k,v)=>setForm(f=>({...f,[k]:v}));
+  return <ModalWrap title="Edit Burrow" onClose={onClose} saveLabel="Save Changes" onSave={()=>{
+    if(!form.name.trim())return alert('Please enter a name.');
+    if(!form.status)return alert('Please select a status.');
+    const{substrate,vegetation,habitatNotes,trailCamera,...rest}=form;
+    onSave({
+      ...rest,
+      entranceHeightCm:form.entranceHeightCm?Number(form.entranceHeightCm):undefined,
+      entranceWidthCm:form.entranceWidthCm?Number(form.entranceWidthCm):undefined,
+      lat:location?.lat??burrow.lat,
+      lng:location?.lng??burrow.lng,
+      location:location?.locality||location?.address||burrow.location,
+      habitat:{substrate,vegetation,notes:habitatNotes,trailCamera},
+    });
+  }}>
+    <FormField label="Name" required><FInput value={form.name} onChange={v=>set('name',v)} placeholder="e.g. Burrow Zeta"/></FormField>
+    <FormField label="Status" required>
+      <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'active',label:'Active'},{value:'inactive',label:'Inactive'},{value:'damaged',label:'Damaged'}]}/>
+    </FormField>
+    <FormField label="Date Observed"><FInput type="date" value={form.lastChecked} onChange={v=>set('lastChecked',v)}/></FormField>
+    <FormField label="Location">
+      {location
+        ? <div style={{background:t.soft,borderRadius:12,padding:'10px 14px',display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}}>
+            <div style={{flex:1,minWidth:0}}>
+              {location.address&&<div style={{fontSize:13,fontWeight:600,color:t.ink,marginBottom:2}}>{location.address}</div>}
+              {location.lat&&<div style={{fontSize:12,color:t.mid,fontFamily:'monospace'}}>{location.lat.toFixed(5)}, {location.lng.toFixed(5)}</div>}
+            </div>
+            <button onClick={()=>{setLocation(null);setShowGeoSearch(false);}} style={{fontSize:12,color:t.mid,background:'none',border:'none',fontWeight:600,cursor:'pointer',flexShrink:0}}>Clear</button>
+          </div>
+        : <div style={{display:'flex',flexDirection:'column',gap:8}}>
+            {showGeoSearch
+              ? <GeoSearch onSelect={r=>{setLocation(r);setShowGeoSearch(false);}} onCancel={()=>setShowGeoSearch(false)}/>
+              : <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+                  <button onClick={()=>{if(!navigator.geolocation)return;navigator.geolocation.getCurrentPosition(async pos=>{const lat=pos.coords.latitude,lng=pos.coords.longitude;const loc=await reverseGeocode(lat,lng);setLocation({lat,lng,address:loc||''});},()=>alert('Location unavailable.'));}} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
+                    {Ico.location(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Current GPS</span>
+                  </button>
+                  <button onClick={()=>setShowMapPicker(true)} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
+                    {Ico.map(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Map</span>
+                  </button>
+                  <button onClick={()=>setShowGeoSearch(true)} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',gridColumn:'1/-1'}}>
+                    {Ico.search(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Address</span>
+                  </button>
+                </div>
+            }
+          </div>
+      }
+      {showMapPicker&&<MapPickerModal initialLat={location?.lat} initialLng={location?.lng} onClose={()=>setShowMapPicker(false)} onConfirm={async pos=>{setLocation(pos);setShowMapPicker(false);const loc=await reverseGeocode(pos.lat,pos.lng);if(loc)setLocation({...pos,address:loc});}}/>}
+    </FormField>
+    <FormField label="Entrance Orientation">
+      <CompassField value={form.orientation} onChange={v=>set('orientation',v)}/>
+    </FormField>
+    {/* More options toggle */}
+    {(()=>{
+      const extras=(form.wombatIds.length>0?1:0)+(form.entranceHeightCm||form.entranceWidthCm?1:0)+(form.substrate?1:0)+(form.vegetation?1:0)+(form.habitatNotes?1:0)+(form.trailCamera?1:0);
+      return <button onClick={()=>setShowMore(s=>!s)} style={{display:'flex',alignItems:'center',gap:8,background:'none',border:'none',cursor:'pointer',padding:'2px 0',width:'100%'}}>
+        <div style={{flex:1,height:1,background:t.div}}/>
+        <span style={{fontSize:12,fontWeight:500,color:t.faint,whiteSpace:'nowrap',userSelect:'none'}}>
+          {showMore?'Hide options':`More options${extras>0?` · ${extras} set`:''}`}
+        </span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={t.faint} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{transform:showMore?'rotate(180deg)':'none',transition:'transform 0.18s',flexShrink:0}}><path d="M6 9l6 6 6-6"/></svg>
+        <div style={{flex:1,height:1,background:t.div}}/>
+      </button>;
+    })()}
+    {showMore&&<>
+      <FormField label="Associated Wombats">
+        {form.wombatIds.length>0&&<div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:8}}>
+          {form.wombatIds.map(id=>{const wx=wombats.find(x=>x.id===id);return wx?<button key={id} onClick={()=>toggleWombat(id)} style={{display:'inline-flex',alignItems:'center',gap:5,background:t.sage50,color:t.sage700,borderRadius:999,padding:'4px 10px',fontSize:12.5,fontWeight:600,border:'none',cursor:'pointer'}}>{wx.name} ×</button>:null;})}
+        </div>}
+        <div style={{border:`1px solid ${t.div}`,borderRadius:14,overflow:'hidden'}}>
+          <div style={{display:'flex',alignItems:'center',gap:8,padding:'8px 12px'}}>
+            {Ico.search(t.mid,14)}
+            <input value={wSearch} onChange={e=>setWSearch(e.target.value)} placeholder="Search wombats…" style={{flex:1,fontSize:14,color:t.ink,background:'none',border:'none',outline:'none'}}/>
+          </div>
+          <div style={{maxHeight:160,overflowY:'auto',borderTop:`1px solid ${t.div}`}}>
+            {filteredW.length===0&&<div style={{padding:'10px 14px',fontSize:13,color:t.mid,textAlign:'center'}}>No wombats found</div>}
+            {filteredW.map(wx=>{const sel=form.wombatIds.includes(wx.id);return <button key={wx.id} onClick={()=>toggleWombat(wx.id)} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'10px 12px',background:sel?t.sage50:'transparent',border:'none',borderBottom:`1px solid ${t.div}`,textAlign:'left',cursor:'pointer'}}>
+              <div style={{width:20,height:20,borderRadius:6,border:`2px solid ${sel?t.sage700:t.faint}`,background:sel?t.sage700:'none',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>
+                {sel&&Ico.check('#fff',10)}
+              </div>
+              <div style={{flex:1}}>
+                <div style={{fontSize:13,fontWeight:600,color:t.ink}}>{wx.name}</div>
+                {wx.location&&<div style={{fontSize:11,color:t.mid}}>{wx.location}</div>}
+              </div>
+            </button>;})}
+          </div>
+        </div>
+      </FormField>
+      <FormField label="Entrance Size (cm)">
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+          <FInput type="number" value={form.entranceHeightCm} onChange={v=>set('entranceHeightCm',v)} placeholder="Height"/>
+          <FInput type="number" value={form.entranceWidthCm} onChange={v=>set('entranceWidthCm',v)} placeholder="Width"/>
+        </div>
+      </FormField>
+      <FormField label="Substrate"><FInput value={form.substrate} onChange={v=>set('substrate',v)} placeholder="e.g. Sandy loam"/></FormField>
+      <FormField label="Vegetation"><FInput value={form.vegetation} onChange={v=>set('vegetation',v)} placeholder="e.g. River she-oak woodland"/></FormField>
+      <FormField label="Habitat Notes"><FTextarea value={form.habitatNotes} onChange={v=>set('habitatNotes',v)} placeholder="Notes on habitat…"/></FormField>
+      <FormField label="Trail Camera">
+        <ChipPicker value={form.trailCamera?'yes':'no'} onChange={v=>set('trailCamera',v==='yes')} options={[{value:'yes',label:'Yes'},{value:'no',label:'No'}]}/>
+      </FormField>
+    </>}
+  </ModalWrap>;
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -4109,7 +4517,7 @@ function App(){
   const init=load();
   const [data,dispatch]=React.useReducer(reducer,{
     wombats:init.wombats,burrows:init.burrows,treatments:init.treatments,
-    sightings:init.sightings,burrowLogs:init.burrowLogs,wombatPhotos:init.wombatPhotos,burrowPhotos:init.burrowPhotos,
+    sightings:init.sightings||[],burrowLogs:init.burrowLogs||[],wombatPhotos:init.wombatPhotos||[],burrowPhotos:init.burrowPhotos||[],
   });
   // ── Photo IDB hydration (runs once on mount) ─────────────────
   // 1. Migrates any existing base64 dataUrls still in localStorage → IDB
@@ -4150,17 +4558,25 @@ function App(){
   const t=theme==='dark'?T.D:T.L;
 
   // ── Auth ─────────────────────────────────────────────────────
-  const [authUser,setAuthUser]=useState(null);
-  const [authProfile,setAuthProfile]=useState(null);
-  const [syncing,setSyncing]=useState(false);
-  const [authChecked,setAuthChecked]=useState(false);
-  const explicitSignOut=React.useRef(false);
-  const signedIn=!!authUser;
-
+  // Cache helpers must be defined before the useState calls that reference them
   const AUTH_CACHE='ww_auth_cache';
   const cacheUser=u=>{try{localStorage.setItem(AUTH_CACHE,JSON.stringify({id:u.id,email:u.email,user_metadata:u.user_metadata||{}}));}catch{}};
   const clearUserCache=()=>{try{localStorage.removeItem(AUTH_CACHE);}catch{}};
   const getCachedUser=()=>{try{return JSON.parse(localStorage.getItem(AUTH_CACHE)||'null');}catch{return null;}};
+
+  // Profile cache — mirrors AUTH_CACHE but for the profiles row (role, display_name, etc.)
+  // Persisted so delete buttons and admin controls stay visible when the app is offline.
+  const PROFILE_CACHE='ww_profile_cache';
+  const cacheProfile=p=>{try{localStorage.setItem(PROFILE_CACHE,JSON.stringify(p));}catch{}};
+  const clearProfileCache=()=>{try{localStorage.removeItem(PROFILE_CACHE);}catch{}};
+  const getCachedProfile=()=>{try{return JSON.parse(localStorage.getItem(PROFILE_CACHE)||'null');}catch{return null;}};
+
+  const [authUser,setAuthUser]=useState(null);
+  const [authProfile,setAuthProfile]=useState(()=>getCachedProfile());
+  const [syncing,setSyncing]=useState(false);
+  const [authChecked,setAuthChecked]=useState(false);
+  const explicitSignOut=React.useRef(false);
+  const signedIn=!!authUser;
 
   // Wire the global auth-error hook so supaUpsert/supaDelete can force a sign-out
   // when they receive a 401 (e.g. account revoked while the volunteer was in the field).
@@ -4169,6 +4585,7 @@ function App(){
     onAuthError=()=>{
       console.warn('[Auth] 401 received — clearing session');
       clearUserCache();
+      clearProfileCache();
       setAuthUser(null);
       setAuthProfile(null);
       setAuthChecked(true);
@@ -4209,9 +4626,16 @@ function App(){
       setAuthUser(user);
       if(user){
         cacheUser(user);
-        // Load role / display name from profiles table
+        // Load role / display name from profiles table.
+        // On success the fresh row is cached so it's available next time offline.
+        // On failure (offline / RLS error) we fall back to the cached profile so
+        // admin controls (delete buttons etc.) remain visible in the field.
         supa.from('profiles').select('*').eq('id',user.id).single()
-          .then(({data:p})=>setAuthProfile(p));
+          .then(({data:p,error})=>{
+            if(p&&!error){cacheProfile(p);setAuthProfile(p);}
+            else{const c=getCachedProfile();if(c)setAuthProfile(c);}
+          })
+          .catch(()=>{const c=getCachedProfile();if(c)setAuthProfile(c);});
         // Show the sync bar briefly, then hide it — sync continues in background
         setSyncing(true);
         setTimeout(()=>setSyncing(false),2000);
@@ -4228,9 +4652,11 @@ function App(){
             // Patch renumbered records back to Supabase so everyone stays consistent
             changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).catch(()=>{}));
             changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).catch(()=>{}));
-          }else{
+          }else if(merged===null){
+            // confirmed new user — no data on the server yet, clear any seed data
             dispatch({type:'REPLACE_ALL',data:{wombats:[],burrows:[],treatments:[],sightings:[],burrowLogs:[],wombatPhotos:[],burrowPhotos:[]}});
           }
+          // merged===undefined means all queries failed (offline) — local state untouched
           flushQueue(user.id).catch(()=>{});
         }).catch(e=>console.warn('[Supa] full sync error',e));
       }else{
@@ -4243,8 +4669,26 @@ function App(){
 
   // ── Online/offline + queue flush ─────────────────────────────
   useEffect(()=>{
-    const on=()=>{setOnline(true);if(authUser)flushQueue(authUser.id).catch(()=>{}).finally(refreshQueue);};
-
+    const on=async()=>{
+      setOnline(true);
+      if(!authUser)return;
+      // Pull the latest server state before flushing so that:
+      //  (a) any data added on other devices appears immediately, and
+      //  (b) offline-added photo metadata is in state before flushQueue
+      //      tries to upload the corresponding blobs.
+      try{
+        const merged=await supaFullSync();
+        if(merged){
+          const{records:wombats,changed:changedW}=deduplicateCodes(merged.wombats,'W');
+          const{records:burrows,changed:changedB}=deduplicateCodes(merged.burrows,'B');
+          dispatch({type:'REPLACE_ALL',data:{...merged,wombats,burrows}});
+          idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
+          changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).catch(()=>{}));
+          changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).catch(()=>{}));
+        }
+      }catch(e){console.warn('[Sync] reconnect sync failed',e);}
+      flushQueue(authUser.id).catch(()=>{}).finally(refreshQueue);
+    };
     const off=()=>setOnline(false);
     window.addEventListener('online',on);window.addEventListener('offline',off);
     return()=>{window.removeEventListener('online',on);window.removeEventListener('offline',off);};
@@ -4314,6 +4758,7 @@ function App(){
     if(signedIn){
       explicitSignOut.current=true;
       clearUserCache();
+      clearProfileCache();
       await supa.auth.signOut();
       setAuthUser(null);setAuthProfile(null);
     }else{
@@ -4349,9 +4794,9 @@ function App(){
         {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} pending={queueLen>0} openProfile={openProfile} streak={streak}/></div>}
         {screen==='activity'&&<div className="scroll noscroll"><ActivityScreen data={data} nav={nav}/></div>}
         {screen==='map'&&<MapScreen data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} theme={theme} onAddAt={onAddAt}/>}
-        {screen==='wombats'&&<div className="scroll noscroll"><WombatList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile}/></div>}
+        {screen==='wombats'&&<div className="scroll noscroll"><WombatList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile}/></div>}
         {screen==='wombat-profile'&&<div className="scroll noscroll"><WombatProfile wombatId={selectedId} data={data} nav={nav} dispatch={syncDispatch} openProfile={openProfile} authProfile={authProfile}/></div>}
-        {screen==='burrows'&&<div className="scroll noscroll"><BurrowList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile}/></div>}
+        {screen==='burrows'&&<div className="scroll noscroll"><BurrowList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile}/></div>}
         {screen==='burrow-profile'&&<div className="scroll noscroll"><BurrowProfile burrowId={selectedId} data={data} nav={nav} dispatch={syncDispatch} openProfile={openProfile} authProfile={authProfile}/></div>}
       </div>
       {/* ── single tab bar, pinned below content, never overlapping ── */}
@@ -4373,7 +4818,11 @@ function App(){
   </ThemeCtx.Provider>;
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+try {
+  ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+} catch(e) {
+  document.getElementById('root').innerHTML = '<div style="padding:24px;font-family:monospace;font-size:13px;color:#c00;background:#fff;position:fixed;inset:0;overflow:auto;z-index:99999"><h2 style="margin:0 0 12px">⚠️ WombatWatch render error</h2><pre style="white-space:pre-wrap">' + (e && e.stack ? e.stack : String(e)) + '</pre></div>';
+}
 </script>
 <script>
   /* Register service worker for offline support and home screen install */

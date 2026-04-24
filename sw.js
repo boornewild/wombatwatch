@@ -10,7 +10,7 @@
  * are cleared automatically on the next launch.
  */
 
-const CACHE_VERSION = 'v4';
+const CACHE_VERSION = 'v6';
 const SHELL_CACHE   = `wombatwatch-shell-${CACHE_VERSION}`;
 const TILE_CACHE    = `wombatwatch-tiles-${CACHE_VERSION}`;
 
@@ -36,6 +36,7 @@ const TILE_HOSTS = [
   'b.tile.openstreetmap.org',
   'c.tile.openstreetmap.org',
   'basemaps.cartocdn.com',
+  'server.arcgisonline.com', // Esri World Imagery — satellite overlay
 ];
 
 // ── Install: pre-cache the app shell ────────────────────────────────────────
