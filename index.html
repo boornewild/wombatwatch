@@ -20,7 +20,7 @@
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
 html{height:100%;height:-webkit-fill-available;}
-body{height:100%;min-height:-webkit-fill-available;overflow:hidden;background:#fff;font-family:-apple-system,"SF Pro Text","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;}
+body{height:100%;min-height:-webkit-fill-available;overflow:hidden;background:var(--bg);font-family:-apple-system,"SF Pro Text","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;}
 #root{height:100%;display:flex;justify-content:center;align-items:flex-start;}
 .app{width:100%;max-width:480px;height:100%;height:100svh;min-height:-webkit-fill-available;display:flex;flex-direction:column;overflow:hidden;background:var(--bg);}
 /* Tab bar: fixed to the true screen bottom so it's never left floating in PWA standalone mode.
@@ -218,7 +218,7 @@ const fmtDate=s=>{if(!s)return'—';const d=new Date(s);return`${String(d.getDat
 const timeAgo=s=>{if(!s)return'';const h=Math.floor((Date.now()-new Date(s))/36e5);if(h<1)return'Just now';if(h<24)return`${h}h ago`;const d=Math.floor(h/24);return d===1?'Yesterday':`${d}d ago`;};
 const today=()=>new Date().toISOString().slice(0,10);
 const statusTone=s=>({healthy:'sage',under_treatment:'amber',missing:'pearl',deceased:'rose'}[s]||'pearl');
-const statusLabel=s=>({healthy:'Healthy',under_treatment:'Under Treatment',missing:'Missing',deceased:'Deceased'}[s]||(s?s.charAt(0).toUpperCase()+s.slice(1):s));
+const statusLabel=s=>({healthy:'Healthy',under_treatment:'Treatment',missing:'Missing',deceased:'Deceased'}[s]||(s?s.charAt(0).toUpperCase()+s.slice(1):s));
 const isInactive=w=>w.status==='deceased'||w.status==='missing';
 const burrowTone=s=>({active:'sage',inactive:'amber',damaged:'rose'}[s]||'pearl');
 const burrowStatusLabel=s=>({active:'Active',inactive:'Inactive',damaged:'Damaged'}[s]||(s?s.charAt(0).toUpperCase()+s.slice(1):s));
@@ -3655,7 +3655,7 @@ function MarkActiveModal({wombat,onClose,onSave}){
     onSave({status,inactiveAt:null,inactiveCause:null,inactiveNotes:null});
   }} saveLabel="Mark Active">
     <FormField label="New Status" required>
-      <ChipPicker value={status} onChange={setStatus} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Under Treatment'}]}/>
+      <ChipPicker value={status} onChange={setStatus} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Treatment'}]}/>
     </FormField>
   </ModalWrap>;
 }
@@ -3729,7 +3729,7 @@ function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',o
       const activeColor=isHealthy?'#A26B1E':'#3A6A42';
       const activeBg=isHealthy?'rgba(162,107,30,0.10)':'rgba(42,76,53,0.12)';
       const label=isHealthy?'Mange detected again':'Mark as recovered';
-      const sub=isHealthy?"Wombat's status will be set back to Under Treatment":"Wombat's status will be set to Healthy";
+      const sub=isHealthy?"Wombat's status will be set back to Treatment":"Wombat's status will be set to Healthy";
       return <button onClick={()=>setMarkRecovered(r=>!r)} style={{display:'flex',alignItems:'center',gap:12,width:'100%',padding:'12px 14px',borderRadius:14,background:markRecovered?activeBg:'none',border:`1.5px solid ${markRecovered?activeColor:'var(--div)'}`,cursor:'pointer',textAlign:'left',transition:'background 0.15s,border-color 0.15s'}}>
         <div style={{width:22,height:22,borderRadius:6,border:`2px solid ${markRecovered?activeColor:'var(--faint)'}`,background:markRecovered?activeColor:'none',flexShrink:0,display:'flex',alignItems:'center',justifyContent:'center',transition:'background 0.15s,border-color 0.15s'}}>
           {markRecovered&&<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>}
@@ -4027,7 +4027,7 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
       <ChipPicker value={form.ageClass} onChange={v=>set('ageClass',v)} options={[{value:'joey',label:'Joey'},{value:'sub-adult',label:'Sub-adult'},{value:'adult',label:'Adult'}]}/>
     </FormField>
     <FormField label="Health Status" required>
-      <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Under Treatment'}]}/>
+      <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Treatment'}]}/>
     </FormField>
     <FormField label="First Seen Date" required><FInput type="date" value={form.firstSeen} onChange={v=>set('firstSeen',v)}/></FormField>
     <FormField label="Location" required>
@@ -4494,7 +4494,7 @@ function EditWombatModal({wombat,onClose,onSave}){
       <ChipPicker value={form.ageClass} onChange={v=>set('ageClass',v)} options={[{value:'joey',label:'Joey'},{value:'sub-adult',label:'Sub-adult'},{value:'adult',label:'Adult'}]}/>
     </FormField>
     <FormField label="Health Status" required>
-      <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Under Treatment'}]}/>
+      <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Treatment'}]}/>
     </FormField>
     <FormField label="First Seen Date"><FInput type="date" value={form.firstSeen} onChange={v=>set('firstSeen',v)}/></FormField>
     <FormField label="Location">
@@ -5174,6 +5174,8 @@ function App(){
 
   const nav=(s,id=null)=>{setScreen(s);setSelectedId(id);setModal(null);};
   const toggleTheme=()=>{const nt=theme==='dark'?'light':'dark';setTheme(nt);localStorage.setItem(SK.theme,nt);};
+  // Keep <html> data-theme in sync so CSS variables (including body background) work outside .app
+  useEffect(()=>{document.documentElement.setAttribute('data-theme',theme);},[theme]);
   const toggleSignIn=async()=>{
     if(signedIn){
       explicitSignOut.current=true;
