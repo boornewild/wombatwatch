@@ -217,8 +217,9 @@ const uid=()=>{
 const fmtDate=s=>{if(!s)return'—';const d=new Date(s);return`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;};
 const timeAgo=s=>{if(!s)return'';const h=Math.floor((Date.now()-new Date(s))/36e5);if(h<1)return'Just now';if(h<24)return`${h}h ago`;const d=Math.floor(h/24);return d===1?'Yesterday':`${d}d ago`;};
 const today=()=>new Date().toISOString().slice(0,10);
-const statusTone=s=>({healthy:'sage',under_treatment:'amber',mange:'rose'}[s]||'pearl');
-const statusLabel=s=>({healthy:'Healthy',under_treatment:'Under Treatment',mange:'Mange'}[s]||s);
+const statusTone=s=>({healthy:'sage',under_treatment:'amber',missing:'pearl',deceased:'rose'}[s]||'pearl');
+const statusLabel=s=>({healthy:'Healthy',under_treatment:'Under Treatment',missing:'Missing',deceased:'Deceased'}[s]||(s?s.charAt(0).toUpperCase()+s.slice(1):s));
+const isInactive=w=>w.status==='deceased'||w.status==='missing';
 const burrowTone=s=>({active:'sage',inactive:'amber',damaged:'rose'}[s]||'pearl');
 const burrowStatusLabel=s=>({active:'Active',inactive:'Inactive',damaged:'Damaged'}[s]||(s?s.charAt(0).toUpperCase()+s.slice(1):s));
 const nextWombatCode=wombats=>{const nums=wombats.map(w=>parseInt((w.code||'').slice(1)||'0')).filter(n=>n>0);const n=nums.length?Math.max(...nums)+1:1;return'W'+String(n).padStart(4,'0');};
@@ -404,12 +405,12 @@ const SD={
   wombats:[
     {id:'w1',name:'Maggie',sex:'F',ageClass:'adult',status:'healthy',severity:{},burrowIds:['b1','b2'],firstSeen:'2026-02-14',location:'St Albans',lat:-33.127,lng:150.975,notes:'Resident near the Settlers Arms Inn paddocks. Healthy weight and coat. Regular at both burrows.',_sync:true},
     {id:'w2',name:'Bruce',sex:'M',ageClass:'adult',status:'under_treatment',severity:{back:3,shoulders:2},burrowIds:['b3'],firstSeen:'2026-01-28',location:'Lower Macdonald',lat:-33.358,lng:150.968,notes:'Moderate mange on back and shoulders. Responding well to fortnightly cydectin flap treatments.',_sync:true},
-    {id:'w3',name:'Rosie',sex:'F',ageClass:'sub-adult',status:'mange',severity:{back:4,head:3,rump:2},burrowIds:['b5'],firstSeen:'2026-03-10',location:'Central Macdonald',lat:-33.072,lng:150.972,notes:'Severe mange. Spotted near Macdonald River rd. Urgent treatment program initiated.',_sync:true},
+    {id:'w3',name:'Rosie',sex:'F',ageClass:'sub-adult',status:'under_treatment',severity:{back:4,head:3,rump:2},burrowIds:['b5'],firstSeen:'2026-03-10',location:'Central Macdonald',lat:-33.072,lng:150.972,notes:'Severe mange. Spotted near Macdonald River rd. Urgent treatment program initiated.',_sync:true},
     {id:'w4',name:'Digger',sex:'M',ageClass:'adult',status:'under_treatment',severity:{rump:2,legs:1},burrowIds:['b1','b7'],firstSeen:'2026-02-05',location:'St Albans',lat:-33.141,lng:150.962,notes:'Mild mange on rump and hind legs. Second treatment applied. Good prognosis.',_sync:true},
     {id:'w5',name:'Matilda',sex:'F',ageClass:'adult',status:'healthy',severity:{},burrowIds:['b8'],firstSeen:'2026-01-19',location:'Webbs Creek',lat:-33.198,lng:151.009,notes:'Healthy female near Webbs Creek Rd. Observed with a joey in pouch March–April.',_sync:true},
     {id:'w6',name:'Stumpy',sex:'M',ageClass:'senior',status:'under_treatment',severity:{back:2,legs:2},burrowIds:['b9'],firstSeen:'2025-11-03',location:'Pomeroy',lat:-33.052,lng:150.956,notes:'Old male with recurring mild mange. On maintenance treatment schedule. Missing tip of left ear.',_sync:true},
     {id:'w7',name:'Bella',sex:'F',ageClass:'adult',status:'healthy',severity:{},burrowIds:['b10','b11'],firstSeen:'2026-03-22',location:'Higher Macdonald',lat:-32.972,lng:150.937,notes:'Northern population individual. No mange. Observed at two burrows on the ridge above Higher Macdonald Rd.',_sync:true},
-    {id:'w8',name:'Rocky',sex:'M',ageClass:'adult',status:'mange',severity:{back:4,legs:3,rump:3},burrowIds:['b12'],firstSeen:'2026-04-01',location:'Lower Macdonald',lat:-33.273,lng:150.989,notes:'Advanced mange across back, legs and rump. Located near river flats south of Fernances Crossing. Treatment access difficult.',_sync:true},
+    {id:'w8',name:'Rocky',sex:'M',ageClass:'adult',status:'under_treatment',severity:{back:4,legs:3,rump:3},burrowIds:['b12'],firstSeen:'2026-04-01',location:'Lower Macdonald',lat:-33.273,lng:150.989,notes:'Advanced mange across back, legs and rump. Located near river flats south of Fernances Crossing. Treatment access difficult.',_sync:true},
   ],
   burrows:[
     {id:'b1',name:'Settlers Flat #1',status:'active',location:'St Albans',lat:-33.125,lng:150.977,habitat:{substrate:'Clay loam',vegetation:'Riparian woodland',notes:'Below old orchard, 40m from riverbank'},wombatIds:['w1','w4'],lastChecked:'2026-04-18',nextCheck:'2026-05-02',entranceHeightCm:32,entranceWidthCm:41,orientation:'NE (48°)',_sync:true},
@@ -619,12 +620,12 @@ const SUPA_ANON='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsIn
 const supa=window.supabase.createClient(SUPA_URL,SUPA_ANON);
 
 // ── camelCase ↔ snake_case mappings ──────────────────────────
-const wombatToDb=(w,uid)=>({id:w.id,created_by:uid||null,name:w.name,sex:w.sex||null,age_class:w.ageClass||null,status:w.status||null,severity:w.severity||{},burrow_ids:w.burrowIds||[],first_seen:w.firstSeen||null,location:w.location||null,lat:w.lat||null,lng:w.lng||null,notes:w.notes||null,code:w.code||null,location_label:w.locationLabel||null});
-const dbToWombat=r=>({id:r.id,name:r.name,sex:r.sex,ageClass:r.age_class,status:r.status,severity:r.severity||{},burrowIds:r.burrow_ids||[],firstSeen:r.first_seen,location:r.location,lat:r.lat,lng:r.lng,notes:r.notes,code:r.code,locationLabel:r.location_label||null,_createdBy:r.created_by,_sync:true});
+const wombatToDb=(w,uid)=>({id:w.id,created_by:uid||null,name:w.name,sex:w.sex||null,age_class:w.ageClass||null,status:w.status||null,severity:w.severity||{},burrow_ids:w.burrowIds||[],first_seen:w.firstSeen||null,location:w.location||null,lat:w.lat||null,lng:w.lng||null,notes:w.notes||null,code:w.code||null,location_label:w.locationLabel||null,inactive_at:w.inactiveAt||null,inactive_cause:w.inactiveCause||null,inactive_notes:w.inactiveNotes||null});
+const dbToWombat=r=>({id:r.id,name:r.name,sex:r.sex,ageClass:r.age_class,status:r.status==='mange'?'under_treatment':r.status,severity:r.severity||{},burrowIds:r.burrow_ids||[],firstSeen:r.first_seen,location:r.location,lat:r.lat,lng:r.lng,notes:r.notes,code:r.code,locationLabel:r.location_label||null,inactiveAt:r.inactive_at||null,inactiveCause:r.inactive_cause||null,inactiveNotes:r.inactive_notes||null,_createdBy:r.created_by,_sync:true});
 const burrowToDb=(b,uid)=>({id:b.id,created_by:uid||null,name:b.name,status:b.status||null,location:b.location||null,lat:b.lat||null,lng:b.lng||null,habitat:b.habitat||{},wombat_ids:b.wombatIds||[],last_checked:b.lastChecked||null,next_check:b.nextCheck||null,entrance_height_cm:b.entranceHeightCm||null,entrance_width_cm:b.entranceWidthCm||null,orientation:b.orientation||null,code:b.code||null});
 const dbToBurrow=r=>({id:r.id,name:r.name,status:r.status,location:r.location,lat:r.lat,lng:r.lng,habitat:r.habitat||{},wombatIds:r.wombat_ids||[],lastChecked:r.last_checked,nextCheck:r.next_check,entranceHeightCm:r.entrance_height_cm,entranceWidthCm:r.entrance_width_cm,orientation:r.orientation,code:r.code,_createdBy:r.created_by,_sync:true});
-const treatmentToDb=(t,uid)=>({id:t.id,wombat_id:t.wombatId,created_by:uid||null,at:t.at,by_name:t.by||null,product:t.product||null,dose:t.dose||null,method:t.method||null,severity:t.severity||null,regions:t.regions||{},note:t.note||null,linked_burrow_id:t.linkedBurrowId||null});
-const dbToTreatment=r=>({id:r.id,wombatId:r.wombat_id,at:r.at,by:r.by_name,product:r.product,dose:r.dose,method:r.method,severity:r.severity,regions:r.regions||{},note:r.note,linkedBurrowId:r.linked_burrow_id||null,_createdBy:r.created_by,_sync:true});
+const treatmentToDb=(t,uid)=>({id:t.id,wombat_id:t.wombatId,created_by:uid||null,at:t.at,by_name:t.by||null,product:t.product||null,dose:t.dose||null,method:t.method||null,severity:t.severity||null,regions:t.regions||{},note:t.note||null,linked_burrow_id:t.linkedBurrowId||null,marked_recovered:t.markedRecovered||false});
+const dbToTreatment=r=>({id:r.id,wombatId:r.wombat_id,at:r.at,by:r.by_name,product:r.product,dose:r.dose,method:r.method,severity:r.severity,regions:r.regions||{},note:r.note,linkedBurrowId:r.linked_burrow_id||null,markedRecovered:r.marked_recovered||false,_createdBy:r.created_by,_sync:true});
 const sightingToDb=(s,uid)=>({id:s.id,wombat_id:s.wombatId,created_by:uid||null,at:s.at,lat:s.lat||null,lng:s.lng||null,note:s.note||null});
 const dbToSighting=r=>({id:r.id,wombatId:r.wombat_id,at:r.at,lat:r.lat,lng:r.lng,note:r.note,_createdBy:r.created_by,_sync:true});
 const burrowLogToDb=(l,uid)=>({id:l.id,burrow_id:l.burrowId,created_by:uid||null,at:l.at,status:l.status||null,condition:l.condition||null,occupants:l.occupants||null,height_cm:l.heightCm||null,width_cm:l.widthCm||null,orientation:l.orientation||null,substrate:l.substrate||null,vegetation:l.vegetation||null,note:l.note||null,by_name:l.by||null});
@@ -780,7 +781,9 @@ async function syncAction(action,userId){
   try{
     switch(action.type){
       case'ADD_WOMBAT':     await push('wombats',    wombatToDb(action.wombat,userId)); break;
-      case'UPDATE_WOMBAT':  {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb(w,userId));break;}
+      case'UPDATE_WOMBAT':       {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb(w,userId));break;}
+      case'MARK_WOMBAT_INACTIVE':{const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb(w,userId));break;}
+      case'MARK_WOMBAT_ACTIVE':  {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb(w,userId));break;}
       case'IMPORT_WOMBATS': for(const w of action.wombats)await push('wombats',wombatToDb(w,userId)); break;
       case'DELETE_WOMBAT':  await del('wombats',action.id); break; // ON DELETE CASCADE handles child records
       case'ADD_BURROW':     await push('burrows',    burrowToDb(action.burrow,userId)); break;
@@ -1279,7 +1282,7 @@ function SwipeActions({children,onEdit,onDelete}){
     </div>
   </div>;
 }
-function ModalWrap({title,subtitle,onClose,onSave,saveLabel='Save',children}){
+function ModalWrap({title,subtitle,onClose,onSave,saveLabel='Save',saveStyle={},children}){
   const t=useTheme();
   React.useEffect(()=>{
     const prev=document.body.style.overflow;
@@ -1299,7 +1302,7 @@ function ModalWrap({title,subtitle,onClose,onSave,saveLabel='Save',children}){
         <div style={{display:'flex',flexDirection:'column',gap:14}}>{children}</div>
         <div style={{display:'flex',gap:10,marginTop:18}}>
           <button onClick={onClose} style={{flex:1,height:44,borderRadius:12,border:`1.5px solid ${t.div}`,background:t.surface,color:t.ink,fontSize:15,fontWeight:700}}>Cancel</button>
-          <button onClick={onSave} style={{flex:1.2,height:44,borderRadius:12,border:'none',background:t.f700,color:'#fff',fontSize:15,fontWeight:700}}>{saveLabel}</button>
+          <button onClick={onSave} style={{flex:1.2,height:44,borderRadius:12,border:'none',background:t.f700,color:'#fff',fontSize:15,fontWeight:700,...saveStyle}}>{saveLabel}</button>
         </div>
       </div>
     </div>,
@@ -1478,14 +1481,10 @@ function ActivityScreen({data,nav}){
   const burrows=data.burrows;
   const allActivity=[
     ...data.treatments.map(x=>({...x,type:'treatment',at:x.at})),
-    ...data.sightings.map(x=>({...x,type:'sighting',at:x.at})),
     ...data.burrowLogs.map(x=>({...x,type:'burrowlog',at:x.at})),
     ...wombats.filter(x=>x.firstSeen).map(x=>({...x,type:'wombat_added',at:x.firstSeen})),
     ...burrows.filter(x=>x.lastChecked).map(x=>({...x,type:'burrow_added',at:x.lastChecked})),
-    // Photos — only include entries that have a timestamp so they sort correctly
-    ...(data.wombatPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'wombat_photo',at:x.at})),
-    ...(data.burrowPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'burrow_photo',at:x.at})),
-  ].sort((a,b)=>new Date(b.at)-new Date(a.at));
+  ].sort((a,b)=>new Date(b.at)-new Date(a.at)).slice(0,100);
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
     <Header showBack onBack={()=>nav('dashboard')} title="All Activity" showAvatar={false}/>
     <div style={{padding:'20px var(--sp) 0',display:'flex',flexDirection:'column',gap:14}}>
@@ -1500,17 +1499,6 @@ function ActivityScreen({data,nav}){
               <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{w?.name||'Unknown Wombat'}</div>
               <div style={{fontSize:12,color:t.mid,marginTop:2,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>Treatment applied · {fmtDate(a.at)}</div>
               {ab&&<button onClick={()=>nav('burrow-profile',ab.id)} style={{display:'inline-flex',alignItems:'center',gap:5,marginTop:5,padding:'3px 8px',borderRadius:8,background:t.soft,border:'none',cursor:'pointer'}}>{Ico.burrow(t.f700,12)}<span style={{fontSize:12,fontWeight:600,color:t.f700}}>{ab.name}</span></button>}
-            </div>
-            <Pill tone={statusTone(w?.status||'healthy')} size="sm">{statusLabel(w?.status||'healthy')}</Pill>
-          </Card>;
-        }
-        if(a.type==='sighting'){
-          const w=wombats.find(x=>x.id===a.wombatId);
-          return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
-            <WAvatar size={44}/>
-            <div style={{flex:1,minWidth:0}}>
-              <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{w?.name||'Unknown Wombat'}</div>
-              <div style={{fontSize:12,color:t.mid,marginTop:2}}>Sighted · {fmtDate(a.at)}</div>
             </div>
             <Pill tone={statusTone(w?.status||'healthy')} size="sm">{statusLabel(w?.status||'healthy')}</Pill>
           </Card>;
@@ -1546,28 +1534,6 @@ function ActivityScreen({data,nav}){
             <Pill tone={burrowTone(a.status)} size="sm">{(a.status||'').charAt(0).toUpperCase()+(a.status||'').slice(1)}</Pill>
           </Card>;
         }
-        if(a.type==='wombat_photo'){
-          const w=wombats.find(x=>x.id===a.wombatId);
-          return <Card key={i} padding={12} onClick={()=>w&&nav('wombat-profile',w.id)} style={{display:'flex',alignItems:'center',gap:12,cursor:w?'pointer':'default'}}>
-            <WAvatar size={44} photoUrl={a.dataUrl}/>
-            <div style={{flex:1,minWidth:0}}>
-              <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{w?.name||'Unknown Wombat'}</div>
-              <div style={{fontSize:12,color:t.mid,marginTop:2}}>Photo added · {fmtDate(a.at)}</div>
-            </div>
-            {w&&<Pill tone={statusTone(w.status||'healthy')} size="sm">{statusLabel(w.status||'healthy')}</Pill>}
-          </Card>;
-        }
-        if(a.type==='burrow_photo'){
-          const b=burrows.find(x=>x.id===a.burrowId);
-          return <Card key={i} padding={12} onClick={()=>b&&nav('burrow-profile',b.id)} style={{display:'flex',alignItems:'center',gap:12,cursor:b?'pointer':'default'}}>
-            <BAvatar size={44} photoUrl={a.dataUrl}/>
-            <div style={{flex:1,minWidth:0}}>
-              <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{b?.name||'Unknown Burrow'}</div>
-              <div style={{fontSize:12,color:t.mid,marginTop:2}}>Photo added · {fmtDate(a.at)}</div>
-            </div>
-            {b&&<Pill tone={burrowTone(b.status)} size="sm">{(b.status||'').charAt(0).toUpperCase()+(b.status||'').slice(1)}</Pill>}
-          </Card>;
-        }
       })}
     </div>
     <AcknowledgementFooter/>
@@ -1576,9 +1542,9 @@ function ActivityScreen({data,nav}){
 
 /* ── DASHBOARD ── */
 /* ── RECOVERY MODAL ──────────────────────────────────────────────────────────
-   Shown when a wombat's status is changed from mange/under_treatment → healthy.
+   Shown when a wombat's status is changed from under_treatment → healthy.
    Full-screen celebration overlay with dismiss button.                         */
-function RecoveryModal({name,onClose}){
+function RecoveryModal({name,photoUrl,onClose}){
   const t=useTheme();
   // Scattered confetti dots at fixed positions
   const dots=[{c:'#E07B39',x:12,y:22,r:5},{c:'#7A6AB8',x:82,y:16,r:7},{c:'#4A7C52',x:55,y:8,r:5},{c:'#3B8FAA',x:88,y:52,r:5},{c:'#E07B39',x:8,y:62,r:7},{c:'#D4A84B',x:70,y:6,r:5},{c:'#C0506A',x:92,y:30,r:5},{c:'#7A6AB8',x:22,y:10,r:7}];
@@ -1588,22 +1554,21 @@ function RecoveryModal({name,onClose}){
       <div style={{background:`linear-gradient(150deg,${t.f600} 0%,${t.f800} 80%,${t.f900} 100%)`,padding:'32px 24px 28px',textAlign:'center',position:'relative',overflow:'hidden'}}>
         {/* Confetti dots inside banner */}
         {dots.map((d,i)=><div key={i} style={{position:'absolute',width:d.r*2,height:d.r*2,borderRadius:'50%',background:d.c,left:`${d.x}%`,top:`${d.y}%`,opacity:0.55,pointerEvents:'none'}}/>)}
-        {/* Wombat avatar */}
-        <div style={{width:80,height:80,borderRadius:20,background:'rgba(255,255,255,0.14)',display:'inline-flex',alignItems:'center',justifyContent:'center',marginBottom:14}}>
-          {Ico.wombat('rgba(255,255,255,0.92)',46)}
+        {/* Wombat avatar — profile photo if available, else default avatar */}
+        <div style={{display:'inline-block',marginBottom:14,boxShadow:'0 4px 18px rgba(0,0,0,0.3)',borderRadius:20}}>
+          <WAvatar size={80} photoUrl={photoUrl||null}/>
         </div>
-        <div style={{fontSize:22,fontWeight:800,color:'#fff',letterSpacing:-0.3,lineHeight:1.1}}>Wombat recovered!</div>
+        <div style={{fontSize:22,fontWeight:800,color:'#fff',letterSpacing:-0.3,lineHeight:1.1}}>Wombat recovered</div>
         <div style={{fontSize:13,color:'rgba(255,255,255,0.65)',marginTop:5,fontWeight:500}}>Milestone reached</div>
       </div>
       {/* Body */}
       <div style={{padding:'22px 24px 24px',textAlign:'center'}}>
         <div style={{fontSize:15,color:t.mid,lineHeight:1.6,marginBottom:20}}>
           <span style={{fontWeight:700,color:t.ink}}>{name}</span> has been marked healthy.{' '}
-          Great work getting this wombat back on their feet! 🐾
+          Great work on helping this wombat recover from mange.
         </div>
-        <Pill tone="sage">✓ Status set to Healthy</Pill>
         <button onClick={onClose} style={{display:'block',width:'100%',marginTop:18,padding:'13px 0',borderRadius:14,background:`linear-gradient(135deg,${t.f700} 0%,${t.f600} 100%)`,color:'#fff',fontSize:15,fontWeight:700,letterSpacing:0.2,border:'none',cursor:'pointer'}}>
-          Celebrate 🎉
+          🎉 Celebrate
         </button>
       </div>
     </div>
@@ -1613,7 +1578,8 @@ function RecoveryModal({name,onClose}){
 /* ── DASHBOARD ── */
 function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
   const t=useTheme();
-  const wombats=data.wombats;
+  const wombats=data.wombats.filter(w=>!isInactive(w)); // active only for stats
+  const inactiveWombats=data.wombats.filter(isInactive);
   const burrows=data.burrows;
   const treatments=data.treatments;
   const year=new Date().getFullYear();
@@ -1628,11 +1594,12 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
     });
   },[]);
   const lav=t.lav500;
+  const allWombats=data.wombats; // all wombats (incl. inactive) for activity lookups
   const allActivity=[
     ...treatments.map(x=>({...x,type:'treatment',at:x.at})),
     ...data.sightings.map(x=>({...x,type:'sighting',at:x.at})),
     ...data.burrowLogs.map(x=>({...x,type:'burrowlog',at:x.at})),
-    ...wombats.filter(x=>x.firstSeen).map(x=>({...x,type:'wombat_added',at:x.firstSeen})),
+    ...data.wombats.filter(x=>x.firstSeen).map(x=>({...x,type:'wombat_added',at:x.firstSeen})),
     ...burrows.filter(x=>x.lastChecked).map(x=>({...x,type:'burrow_added',at:x.lastChecked})),
     ...(data.wombatPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'wombat_photo',at:x.at})),
     ...(data.burrowPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'burrow_photo',at:x.at})),
@@ -1650,7 +1617,7 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
     <div style={{padding:'20px var(--sp) 0'}}>
       <SectionLabel>At a Glance</SectionLabel>
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>
-        <GlanceTile wide icon={Ico.wombat(lav,22)} value={wombats.length} label="Wombats Tracked"/>
+        <GlanceTile wide icon={Ico.wombat(lav,22)} value={wombats.length} label="Active Wombats"/>
         <GlanceTile wide icon={Ico.burrow(lav,20)} value={burrows.length} label="Burrows Mapped"/>
       </div>
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:14,marginTop:14}}>
@@ -1665,7 +1632,7 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
         {allActivity.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'20px 0',fontSize:14}}>No activity yet. Use the + button to log sightings or treatments.</div>}
         {allActivity.map((a,i)=>{
           if(a.type==='treatment'){
-            const w=wombats.find(x=>x.id===a.wombatId);
+            const w=allWombats.find(x=>x.id===a.wombatId);
             const ab=a.linkedBurrowId?burrows.find(b=>b.id===a.linkedBurrowId):null;
             return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
               <WAvatar size={44}/>
@@ -1678,7 +1645,7 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
             </Card>;
           }
           if(a.type==='sighting'){
-            const w=wombats.find(x=>x.id===a.wombatId);
+            const w=allWombats.find(x=>x.id===a.wombatId);
             return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
               <WAvatar size={44}/>
               <div style={{flex:1,minWidth:0}}>
@@ -1720,7 +1687,7 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
             </Card>;
           }
           if(a.type==='wombat_photo'){
-            const w=wombats.find(x=>x.id===a.wombatId);
+            const w=allWombats.find(x=>x.id===a.wombatId);
             return <Card key={i} padding={12} onClick={()=>w&&nav('wombat-profile',w.id)} style={{display:'flex',alignItems:'center',gap:12,cursor:w?'pointer':'default'}}>
               <WAvatar size={44} photoUrl={a.dataUrl}/>
               <div style={{flex:1,minWidth:0}}>
@@ -1794,7 +1761,7 @@ const ATTR_SAT   = '© Esri World Imagery';
    Full-screen Leaflet map. Long-press to add a wombat or burrow
    at a chosen location. Offline tile download managed here.
 ════════════════════════════════════════════════════════════════ */
-function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
+function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWombatFilters,burrowFilters,setBurrowFilters,cameraFilter,setCameraFilter}){
   const t=useTheme();
   const mapRef=useRef(null);
   const leafletRef=useRef(null);
@@ -1809,9 +1776,6 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
     if(longPressMarkerRef.current){longPressMarkerRef.current.remove();longPressMarkerRef.current=null;}
     setLongPressMenu(null);
   };
-  const [wombatFilters,setWombatFilters]=useState(new Set());
-  const [burrowFilters,setBurrowFilters]=useState(new Set());
-  const [cameraFilter,setCameraFilter]=useState(false);
   const [searchQuery,setSearchQuery]=useState('');
 
   // ── Offline map state ─────────────────────────────────────────────
@@ -1879,7 +1843,7 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
     setShowOffSheet(false);
   };
 
-  const wColors={'healthy':'#4A7C52','under_treatment':'#D89039','mange':'#B95C4A'};
+  const wColors={'healthy':'#4A7C52','under_treatment':'#D89039','missing':'#7A887E','deceased':'#9C4A3B'};
   const bColors={'active':'#4A7C52','inactive':'#D89039','damaged':'#B95C4A'};
 
   const flyToUser=()=>{
@@ -1953,9 +1917,17 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
       html:`<div style="position:relative;width:12px;height:12px;border-radius:3px;background:${color};border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.35)">${hasCamera?`<div style="position:absolute;top:-6px;right:-7px;width:12px;height:12px;border-radius:50%;background:#3B5B7A;border:1.5px solid #fff;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 4px rgba(0,0,0,0.35)"><svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="18" height="13" rx="2.5"/><circle cx="12" cy="13.5" r="3.5"/><path d="${CPATH}"/></svg></div>`:''}</div>`,
       iconSize:[12,12],iconAnchor:[6,6],
     });
+    const q=searchQuery.trim().toLowerCase();
+    const matchW=w=>!q||(w.name||'').toLowerCase().includes(q)||(w.location||'').toLowerCase().includes(q);
+    const matchB=b=>!q||(b.name||'').toLowerCase().includes(q)||(b.location||'').toLowerCase().includes(q);
     // Wombats (null = hidden, empty set = show all, non-empty = filtered)
     if(wombatFilters!==null){
-      data.wombats.filter(w=>wombatFilters.size===0||wombatFilters.has(w.status)).forEach(w=>{
+      // by default show active only; inactive (missing/deceased) only shown when explicitly filtered
+      data.wombats.filter(w=>{
+        if(!matchW(w))return false;
+        if(wombatFilters.size===0)return!isInactive(w);
+        return wombatFilters.has(w.status);
+      }).forEach(w=>{
         if(!w.lat||!w.lng)return;
         const m=L.marker([w.lat,w.lng],{icon:makeWombatIcon(wColors[w.status]||'#4A7C52')}).addTo(map);
         m.on('click',()=>setSelected({...w,_type:'wombat'}));
@@ -1965,7 +1937,7 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
     // Burrows
     if(burrowFilters!==null){
       data.burrows
-        .filter(b=>cameraFilter ? !!b.habitat?.trailCamera : (burrowFilters.size===0||burrowFilters.has(b.status)))
+        .filter(b=>matchB(b)&&(cameraFilter ? !!b.habitat?.trailCamera : (burrowFilters.size===0||burrowFilters.has(b.status))))
         .forEach(b=>{
           if(!b.lat||!b.lng)return;
           const hasCamera=!!b.habitat?.trailCamera;
@@ -1974,7 +1946,7 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
           markersRef.current.push(m);
         });
     }
-  },[data.wombats,data.burrows,wombatFilters,burrowFilters,cameraFilter]);
+  },[data.wombats,data.burrows,wombatFilters,burrowFilters,cameraFilter,searchQuery]);
 
   const toggleWombat=k=>{
     if(k==='all'){setWombatFilters(prev=>prev===null?new Set():null);return;}
@@ -1984,21 +1956,25 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt}){
     if(k==='all'){setBurrowFilters(prev=>prev===null?new Set():null);return;}
     setBurrowFilters(prev=>{const n=new Set(prev||[]);n.has(k)?n.delete(k):n.add(k);return n.size===0?new Set():n;});
   };
+  const activeMapWombats=data.wombats.filter(w=>!isInactive(w));
+  const missingWombats=data.wombats.filter(w=>w.status==='missing');
+  const deceasedWombats=data.wombats.filter(w=>w.status==='deceased');
   const wombatChips=[
-    {k:'all',label:'All wombats',count:data.wombats.length,dot:'#4A7C52'},
-    {k:'healthy',label:'Healthy',count:data.wombats.filter(w=>w.status==='healthy').length,dot:'#4A7C52'},
-    {k:'under_treatment',label:'Treatment',count:data.wombats.filter(w=>w.status==='under_treatment').length,dot:'#D89039'},
-    {k:'mange',label:'Mange',count:data.wombats.filter(w=>w.status==='mange').length,dot:'#B95C4A'},
+    {k:'all',label:'All active',count:activeMapWombats.length,dot:null},
+    {k:'healthy',label:'Healthy',count:activeMapWombats.filter(w=>w.status==='healthy').length,dot:'#4A7C52'},
+    {k:'under_treatment',label:'Treatment',count:activeMapWombats.filter(w=>w.status==='under_treatment').length,dot:'#D89039'},
+    {k:'deceased',label:'Deceased',count:deceasedWombats.length,dot:'#9C4A3B'},
+    {k:'missing',label:'Missing',count:missingWombats.length,dot:'#7A887E'},
   ];
   const burrowChips=[
-    {k:'all',label:'All burrows',count:data.burrows.length,dot:'#4A7C52'},
+    {k:'all',label:'All burrows',count:data.burrows.length,dot:null},
     {k:'active',label:'Active',count:data.burrows.filter(b=>b.status==='active').length,dot:'#4A7C52'},
     {k:'inactive',label:'Inactive',count:data.burrows.filter(b=>b.status==='inactive').length,dot:'#D89039'},
     {k:'damaged',label:'Damaged',count:data.burrows.filter(b=>b.status==='damaged').length,dot:'#B95C4A'},
   ];
   const chipBtn=(label,count,dot,active,onClick)=>(
-    <button onClick={onClick} style={{display:'inline-flex',alignItems:'center',gap:5,padding:'6px 11px',borderRadius:999,background:active?dot:t===T.D?'rgba(35,45,47,0.95)':'rgba(255,255,255,0.92)',color:active?'#fff':t.ink,fontSize:12,fontWeight:600,boxShadow:'0 2px 8px rgba(0,0,0,0.12)',border:t===T.D&&!active?`1px solid rgba(255,255,255,0.1)`:'none',whiteSpace:'nowrap',flexShrink:0}}>
-      <div style={{width:7,height:7,borderRadius:4,background:active?'rgba(255,255,255,0.7)':dot,flexShrink:0}}/>
+    <button onClick={onClick} style={{display:'inline-flex',alignItems:'center',gap:5,padding:'6px 11px',borderRadius:999,background:active?(dot||'#4A7C52'):t===T.D?'rgba(35,45,47,0.95)':'rgba(255,255,255,0.92)',color:active?'#fff':t.ink,fontSize:12,fontWeight:600,boxShadow:'0 2px 8px rgba(0,0,0,0.12)',border:t===T.D&&!active?`1px solid rgba(255,255,255,0.1)`:'none',whiteSpace:'nowrap',flexShrink:0}}>
+      {dot&&<div style={{width:7,height:7,borderRadius:4,background:active?'rgba(255,255,255,0.7)':dot,flexShrink:0}}/>}
       {label} <span style={{opacity:0.72}}>· {count}</span>
     </button>
   );
@@ -2148,18 +2124,21 @@ const selStyle=(t)=>({flex:1,height:38,borderRadius:19,background:t.surface,boxS
    WombatList:    searchable list of all wombats.
    WombatProfile: detail view — health, treatments, sightings, photos.
 ════════════════════════════════════════════════════════════════ */
-function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile}){
+function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,filterStatus,setFilterStatus,sortBy,setSortBy}){
   const t=useTheme();
   const isAdmin=authProfile?.role==='admin';
   const [search,setSearch]=useState('');
-  const [filterStatus,setFilterStatus]=useState('all');
-  const [sortBy,setSortBy]=useState('date_added');
   const [pendingDelete,setPendingDelete]=useState(null); // wombat awaiting confirm
   const [editingWombat,setEditingWombat]=useState(null); // wombat being edited
+  const activeWombats=data.wombats.filter(w=>!isInactive(w));
+  const inactiveWombats=data.wombats.filter(isInactive);
   const filtered=data.wombats.filter(w=>{
-    const ms=filterStatus==='all'||w.status===filterStatus;
+    const active=!isInactive(w);
+    if(filterStatus==='inactive') return !active;
+    if(filterStatus!=='active'&&w.status!==filterStatus) return false;
+    if(!active) return false; // default active-only views exclude inactive
     const mq=!search||w.name.toLowerCase().includes(search.toLowerCase());
-    return ms&&mq;
+    return mq;
   }).slice().sort((a,b)=>{
     if(sortBy==='location') return (a.location||'').localeCompare(b.location||'');
     if(sortBy==='last_treated'){
@@ -2173,18 +2152,18 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile}){
   // or on unowned records (created offline before auth was set up).
   const canAct=w=>isAdmin||!w._createdBy||w._createdBy===authUser?.id;
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
-    <Header title="All Wombats" subtitle={`Monitoring ${data.wombats.length} wombats in your area`} showAvatar onAvatarClick={openProfile}>
+    <Header title="All Wombats" subtitle={`Monitoring ${activeWombats.length} active wombat${activeWombats.length!==1?'s':''}`} showAvatar onAvatarClick={openProfile}>
       <SearchInHeader value={search} onChange={setSearch} placeholder="Search wombats…"/>
     </Header>
     <div style={{padding:'16px var(--sp) 0'}}>
       <div style={{display:'flex',gap:8}}>
-        <StatChip count={data.wombats.filter(w=>w.status==='healthy').length} label="Healthy" tone="sage" active={filterStatus==='healthy'} onClick={()=>setFilterStatus('healthy')}/>
-        <StatChip count={data.wombats.filter(w=>w.status==='under_treatment').length} label="Treatment" tone="amber" active={filterStatus==='under_treatment'} onClick={()=>setFilterStatus('under_treatment')}/>
-        <StatChip count={data.wombats.filter(w=>w.status==='mange').length} label="Mange" tone="rose" active={filterStatus==='mange'} onClick={()=>setFilterStatus('mange')}/>
-        <StatChip count={data.wombats.length} label="Total" tone="pearl" active={filterStatus==='all'} onClick={()=>setFilterStatus('all')}/>
+        <StatChip count={activeWombats.filter(w=>w.status==='healthy').length} label="Healthy" tone="sage" active={filterStatus==='healthy'} onClick={()=>setFilterStatus('healthy')}/>
+        <StatChip count={activeWombats.filter(w=>w.status==='under_treatment').length} label="Treatment" tone="amber" active={filterStatus==='under_treatment'} onClick={()=>setFilterStatus('under_treatment')}/>
+        <StatChip count={inactiveWombats.length} label="Inactive" tone="rose" active={filterStatus==='inactive'} onClick={()=>setFilterStatus('inactive')}/>
+        <StatChip count={activeWombats.length} label="All Active" tone="pearl" active={filterStatus==='active'} onClick={()=>setFilterStatus('active')}/>
       </div>
     </div>
-    <div style={{padding:'12px 28px 10px',display:'flex',alignItems:'center',gap:8}}>
+    <div style={{padding:'12px var(--sp) 10px',display:'flex',alignItems:'center',gap:8}}>
       {Ico.sort(t.mid,17)}
       <select value={sortBy} onChange={e=>setSortBy(e.target.value)} style={selStyle(t)}>
         <option value="date_added">Date Added</option>
@@ -2194,7 +2173,8 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile}){
     </div>
     <div style={{padding:'0 var(--sp)',display:'flex',flexDirection:'column',gap:10}}>
       {filtered.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'40px 0',fontSize:14}}>No wombats found.</div>}
-      {filtered.map(w=>{
+      {/* Active wombats */}
+      {filtered.filter(w=>!isInactive(w)).map(w=>{
         const lastTreat=data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0];
         const lastSight=data.sightings.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0];
         const lastT=(!lastTreat&&!lastSight)?null:(!lastTreat?lastSight:(!lastSight?lastTreat:(new Date(lastSight.at)>=new Date(lastTreat.at)?lastSight:lastTreat)));
@@ -2223,6 +2203,29 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile}){
             </Card>
           </button>
         </SwipeActions>;
+      })}
+      {/* Inactive wombats — shown in Inactive filter view */}
+      {filterStatus==='inactive'&&filtered.filter(isInactive).map(w=>{
+        const profilePhoto=(data.wombatPhotos||[]).find(p=>p.wombatId===w.id&&p.isProfile);
+        const isMissing=w.status==='missing';
+        return <button key={w.id} onClick={()=>nav('wombat-profile',w.id)} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
+          <Card padding={16} style={{border:`1px solid rgba(45,95,63,0.1)`}}>
+            <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
+              <WAvatar size={72} photoUrl={profilePhoto?.dataUrl}/>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:8}}>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:17,fontWeight:700,color:t.ink,lineHeight:1.2,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{w.name}</div>
+                    {w.code&&<div style={{fontSize:11,fontWeight:600,color:t.softInk,fontFamily:'monospace',letterSpacing:0.6,marginTop:1}}>{w.code}</div>}
+                  </div>
+                  <Pill tone={statusTone(w.status)} size="sm">{statusLabel(w.status)}</Pill>
+                </div>
+                <div style={{marginTop:7}}><LocPill>{w.locationLabel||(isCodeLike(w.location)?null:w.location)||data.burrows.find(b=>w.burrowIds?.includes(b.id)&&b.location)?.location||'Unknown location'}</LocPill></div>
+                <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12.5,color:t.mid,marginTop:7}}>{Ico.cal(t.mid,13)} {isMissing?'Last seen':'Deceased'}: {fmtDate(w.inactiveAt)||'—'}</div>
+              </div>
+            </div>
+          </Card>
+        </button>;
       })}
     </div>
     <AcknowledgementFooter/>
@@ -2258,6 +2261,10 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
   const [locBurrowSearch,setLocBurrowSearch]=useState('');
   const [editingLocLabel,setEditingLocLabel]=useState(false);
   const [locLabelDraft,setLocLabelDraft]=useState('');
+  const [showMenu,setShowMenu]=useState(false);
+  const [showMarkDeceased,setShowMarkDeceased]=useState(false);
+  const [showMarkMissing,setShowMarkMissing]=useState(false);
+  const [showMarkActive,setShowMarkActive]=useState(false);
   const w=data.wombats.find(x=>x.id===wombatId);
   if(!w)return <div style={{padding:20,color:t.ink}}>Wombat not found.</div>;
   const treatments=data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at));
@@ -2279,11 +2286,43 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
   const mapLat=latestGPSTr?.location?.lat||w.lat;
   const mapLng=latestGPSTr?.location?.lng||w.lng;
   const mapLabel=latestGPSTr?`Treatment · ${fmtDate(latestGPSTr.at)}`:(w.lat?'Last known location':null);
+  const inactive=isInactive(w);
+  const CAUSE_LABELS={vehicle_strike:'Vehicle strike',mange_complications:'Mange complications',natural_causes:'Natural causes',predation:'Predation',unknown:'Unknown'};
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
-    <Header showBack onBack={()=>nav('wombats')} title="Wombat Profile" showAvatar={false}/>
+    <Header showBack onBack={()=>nav('wombats')} title="Wombat Profile" showAvatar={false} rightAction={isAdmin&&<div style={{position:'relative'}}>
+      <button onClick={()=>setShowMenu(m=>!m)} style={{width:36,height:36,borderRadius:18,background:'rgba(255,255,255,0.14)',display:'flex',alignItems:'center',justifyContent:'center',border:'none',cursor:'pointer'}}>
+        <svg width={18} height={18} viewBox="0 0 24 24" fill="#fff"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
+      </button>
+      {showMenu&&<>
+        <div onClick={()=>setShowMenu(false)} style={{position:'fixed',inset:0,zIndex:1100}}/>
+        <div style={{position:'absolute',top:42,right:0,zIndex:1200,background:t.surface,borderRadius:14,boxShadow:'0 4px 24px rgba(0,0,0,0.18)',padding:'6px 0',minWidth:180}}>
+          {w.status!=='missing'&&w.status!=='deceased'&&<button onClick={()=>{setShowMenu(false);setShowMarkMissing(true);}} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'11px 16px',background:'none',border:'none',textAlign:'left',cursor:'pointer'}}>
+              <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke={t.mid} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+              <span style={{fontSize:14,fontWeight:600,color:t.mid}}>Mark as Missing</span>
+            </button>}
+          {w.status!=='deceased'&&<button onClick={()=>{setShowMenu(false);setShowMarkDeceased(true);}} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'11px 16px',background:'none',border:'none',textAlign:'left',cursor:'pointer'}}>
+              <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke={t.rose700} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+              <span style={{fontSize:14,fontWeight:600,color:t.rose700}}>Mark as Deceased</span>
+            </button>}
+          {inactive&&<button onClick={()=>{setShowMenu(false);setShowMarkActive(true);}} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'11px 16px',background:'none',border:'none',textAlign:'left',cursor:'pointer'}}>
+              <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke={t.f700} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 13l4 4L19 7"/></svg>
+              <span style={{fontSize:14,fontWeight:600,color:t.f700}}>Mark as Active</span>
+            </button>}
+        </div>
+      </>}
+    </div>}/>
+    {/* Inactive banner */}
+    {inactive&&<div style={{margin:'14px var(--sp) 0',borderRadius:16,padding:'14px 16px',background:w.status==='deceased'?t.rose50:t.soft,border:`1px solid ${w.status==='deceased'?t.rose700+'44':t.div}`}}>
+      <div style={{fontSize:13.5,fontWeight:700,color:w.status==='deceased'?t.rose700:t.mid,marginBottom:4}}>
+        {w.status==='deceased'?'Deceased':'Missing'}
+        {w.inactiveAt&&<span style={{fontWeight:400,marginLeft:6}}>· {fmtDate(w.inactiveAt)}</span>}
+      </div>
+      {w.inactiveCause&&w.status==='deceased'&&<div style={{fontSize:13,color:t.mid,marginBottom:w.inactiveNotes?4:0}}>Cause: {CAUSE_LABELS[w.inactiveCause]||w.inactiveCause}</div>}
+      {w.inactiveNotes&&<div style={{fontSize:13,color:t.mid,lineHeight:1.5}}>{w.inactiveNotes}</div>}
+    </div>}
     {/* 1st section — hero card */}
-    <div style={{padding:'20px var(--sp) 0'}}>
-      <Card padding={16}>
+    <div style={{padding:'14px var(--sp) 0'}}>
+      <Card padding={16} style={inactive?{opacity:0.82}:{}}>
         <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
           <WAvatar size={88} photoUrl={profilePhoto?.dataUrl}/>
           <div style={{flex:1,minWidth:0}}>
@@ -2307,7 +2346,8 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
     <div style={{padding:'16px 12px 0'}}><TabPills tabs={['Treatments','Photos','Notes','Location']} active={activeTab} onChange={setActiveTab}/></div>
     <div style={{padding:'20px var(--sp) 0'}}>
       {activeTab===0&&<>
-        <SectionLabel action={<button onClick={()=>setShowAddTreatment(true)} style={{border:'none',background:t.f700,color:'#fff',padding:'8px 14px',borderRadius:999,fontSize:12.5,fontWeight:600,display:'inline-flex',alignItems:'center',gap:6}}>{Ico.plus('#fff',14)} Add Treatment</button>}>Treatment History</SectionLabel>
+        <SectionLabel action={!inactive&&<button onClick={()=>setShowAddTreatment(true)} style={{border:'none',background:t.f700,color:'#fff',padding:'8px 14px',borderRadius:999,fontSize:12.5,fontWeight:600,display:'inline-flex',alignItems:'center',gap:6}}>{Ico.plus('#fff',14)} Add Treatment</button>}>Treatment History</SectionLabel>
+        {inactive&&<div style={{background:t.soft,borderRadius:12,padding:'12px 14px',marginBottom:14,fontSize:13,color:t.mid}}>Treatment logging is disabled for inactive wombats.</div>}
         {treatments.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'30px 0',fontSize:14}}>No treatments logged yet.</div>}
         <div style={{display:'flex',flexDirection:'column',gap:14}}>
           {treatments.map((tr,i)=>{
@@ -2318,7 +2358,13 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
             return <SwipeToDelete key={i} onDelete={()=>dispatch({type:'DELETE_TREATMENT',treatmentId:tr.id})}>
               <Card padding={16}>
                 <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:10}}>
-                  <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{productLabels[tr.product]||tr.product} Application</div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{productLabels[tr.product]||tr.product} Application</div>
+                    {tr.markedRecovered&&<div style={{display:'inline-flex',alignItems:'center',gap:5,marginTop:5,background:t.sage50,borderRadius:999,padding:'3px 10px'}}>
+                      <svg width={11} height={11} viewBox="0 0 24 24" fill="none" stroke={t.sage700} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                      <span style={{fontSize:11.5,fontWeight:700,color:t.sage700}}>Marked recovered</span>
+                    </div>}
+                  </div>
                   <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12,color:t.mid,flexShrink:0}}>{Ico.cal(t.mid,12)} {fmtDate(tr.at)}</div>
                 </div>
                 {trBurrow&&<button onClick={()=>nav('burrow-profile',trBurrow.id)} style={{display:'inline-flex',alignItems:'center',gap:5,marginTop:6,marginBottom:2,padding:'3px 8px',borderRadius:8,background:t.soft,border:'none',cursor:'pointer'}}>{Ico.burrow(t.f700,12)}<span style={{fontSize:12,fontWeight:600,color:t.f700}}>{trBurrow.name}</span></button>}
@@ -2480,7 +2526,10 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
       </>}
     </div>
     <AcknowledgementFooter/>
-    {showAddTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} onClose={()=>setShowAddTreatment(false)} onSave={(tr,photos=[],linkedBurrowId=null,statusChange=null)=>{dispatch({type:'ADD_TREATMENT',treatment:tr});photos.forEach((p,i)=>dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+Date.now()+'_'+i,wombatId:w.id,dataUrl:p.dataUrl,isProfile:false,at:new Date().toISOString()}}));if(linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(statusChange)dispatch({type:'UPDATE_WOMBAT',id:w.id,patch:{status:statusChange}});setShowAddTreatment(false);}}/>}
+    {showAddTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} onClose={()=>setShowAddTreatment(false)} onSave={(tr,photos=[],linkedBurrowId=null,statusChange=null)=>{dispatch({type:'ADD_TREATMENT',treatment:{...tr,markedRecovered:statusChange==='healthy'}});photos.forEach((p,i)=>dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+Date.now()+'_'+i,wombatId:w.id,dataUrl:p.dataUrl,isProfile:false,at:new Date().toISOString()}}));if(linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(statusChange)dispatch({type:'UPDATE_WOMBAT',id:w.id,patch:{status:statusChange}});setShowAddTreatment(false);}}/>}
+    {showMarkDeceased&&<MarkDeceasedModal wombat={w} onClose={()=>setShowMarkDeceased(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_INACTIVE',id:w.id,...patch});setShowMarkDeceased(false);}}/>}
+    {showMarkMissing&&<MarkMissingModal wombat={w} lastTreatmentAt={data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0]?.at||null} onClose={()=>setShowMarkMissing(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_INACTIVE',id:w.id,...patch});setShowMarkMissing(false);}}/>}
+    {showMarkActive&&<MarkActiveModal wombat={w} onClose={()=>setShowMarkActive(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_ACTIVE',id:w.id,...patch});setShowMarkActive(false);}}/>}
   </div>;
 }
 
@@ -2490,12 +2539,10 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
    BurrowList:    searchable list of all burrows.
    BurrowProfile: detail view — status, logs, linked wombats, photos.
 ════════════════════════════════════════════════════════════════ */
-function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile}){
+function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,filterStatus,setFilterStatus,sortBy,setSortBy}){
   const t=useTheme();
   const isAdmin=authProfile?.role==='admin';
   const [search,setSearch]=useState('');
-  const [filterStatus,setFilterStatus]=useState('all');
-  const [sortBy,setSortBy]=useState('date_added');
   const [pendingDelete,setPendingDelete]=useState(null);
   const [editingBurrow,setEditingBurrow]=useState(null);
   const filtered=data.burrows.filter(b=>{
@@ -2928,7 +2975,7 @@ function ExportSheet({data,onClose}){
   const exportWOMSATWombats=()=>{
     const headers=['WombatID','WombatName','ObservationDate','Latitude','Longitude','Locality','MangeScore','MangeStatus','TreatmentApplied','TreatmentProduct','Dose','Method','Sex','AgeClass','RecordedBy','Notes'];
     const rows=wombatRows().map(({w,tr,lat,lng,loc})=>{
-      const score=tr?.severity??({mange:3,under_treatment:2,healthy:1}[w.status]??1);
+      const score=tr?.severity??({under_treatment:2,missing:0,deceased:0,healthy:1}[w.status]??1);
       return[w.code||w.id,w.name,tr?.at?.slice(0,10)||w.firstSeen||ds,lat,lng,loc,score,statusLabel(w.status),tr&&tr.product!=='observation'?'Yes':'No',tr?.product||'',tr?.dose||'',tr?.method||'',w.sex==='M'?'Male':w.sex==='F'?'Female':'Unknown',w.ageClass||'',tr?.by||'',tr?.note||w.notes||''];
     });
     dlCSV(`wombatwatch-womsat-wombats-${ds}.csv`,headers,rows);
@@ -2992,7 +3039,7 @@ function CSVImportModal({onClose,onImportWombats,onImportBurrows}){
   const WOMBAT_FIELDS=[
     {key:'name',label:'Name',required:true},
     {key:'code',label:'ID / Code',required:false},
-    {key:'status',label:'Health Status',required:false,hint:'healthy / mange / under_treatment'},
+    {key:'status',label:'Health Status',required:false,hint:'healthy / under_treatment'},
     {key:'sex',label:'Sex',required:false,hint:'M / F / unknown'},
     {key:'ageClass',label:'Age Class',required:false,hint:'joey / sub-adult / adult'},
     {key:'lat',label:'Latitude',required:false},
@@ -3019,8 +3066,7 @@ function CSVImportModal({onClose,onImportWombats,onImportBurrows}){
     if(!v)return type==='wombats'?'healthy':'active';
     const lv=v.toLowerCase().trim();
     if(type==='wombats'){
-      if(lv.includes('mange'))return'mange';
-      if(lv.includes('treat'))return'under_treatment';
+      if(lv.includes('mange')||lv.includes('treat'))return'under_treatment';
       return'healthy';
     }else{
       if(lv.includes('inact')||lv.includes('unused'))return'inactive';
@@ -3563,8 +3609,57 @@ function MiniMap({lat,lng,label,height=200,onOpen}){
    AddWombatModal:    create a new wombat record with optional photo.
    AddBurrowModal:    create a new burrow record with optional photo.
    AddSightingModal:  log a wombat sighting with optional GPS coords.
+   MarkDeceasedModal: record a wombat as deceased (date, cause, notes).
+   MarkMissingModal:  record a wombat as missing (date last seen, notes).
+   MarkActiveModal:   restore an inactive wombat to an active status.
 ════════════════════════════════════════════════════════════════ */
-function AddTreatmentModal({wombatId,wombatName,wombatStatus='mange',onClose,onSave,burrows=[]}){
+function MarkDeceasedModal({wombat,onClose,onSave}){
+  const t=useTheme();
+  const CAUSES=[{value:'vehicle_strike',label:'Vehicle strike'},{value:'mange_complications',label:'Mange complications'},{value:'natural_causes',label:'Natural causes'},{value:'predation',label:'Predation'},{value:'unknown',label:'Unknown'}];
+  const [form,setForm]=useState({inactiveAt:today(),inactiveCause:'unknown',inactiveNotes:''});
+  const set=(k,v)=>setForm(p=>({...p,[k]:v}));
+  return <ModalWrap title={`Mark ${wombat.name} as Deceased`} onClose={onClose} onSave={()=>{
+    if(!form.inactiveAt)return alert('Please enter a date of death.');
+    onSave({status:'deceased',inactiveAt:form.inactiveAt,inactiveCause:form.inactiveCause,inactiveNotes:form.inactiveNotes.trim()||null});
+  }} saveLabel="Mark Deceased" saveStyle={{background:'#9C4A3B'}}>
+    <div style={{background:t.rose50,borderRadius:14,padding:'12px 14px',marginBottom:4}}>
+      <div style={{fontSize:13,color:t.rose700,fontWeight:600,lineHeight:1.4}}>This will move {wombat.name} to the inactive list. This can be reversed from their profile if needed.</div>
+    </div>
+    <FormField label="Date of Death" required><FInput type="date" value={form.inactiveAt} onChange={v=>set('inactiveAt',v)}/></FormField>
+    <FormField label="Cause">
+      <FSelect value={form.inactiveCause} onChange={v=>set('inactiveCause',v)}>
+        {CAUSES.map(c=><option key={c.value} value={c.value}>{c.label}</option>)}
+      </FSelect>
+    </FormField>
+    <FormField label="Notes"><FTextarea value={form.inactiveNotes} onChange={v=>set('inactiveNotes',v)} placeholder="Any additional details…" rows={3}/></FormField>
+  </ModalWrap>;
+}
+function MarkMissingModal({wombat,lastTreatmentAt,onClose,onSave}){
+  const t=useTheme();
+  const [form,setForm]=useState({inactiveAt:lastTreatmentAt||today(),inactiveNotes:''});
+  const set=(k,v)=>setForm(p=>({...p,[k]:v}));
+  return <ModalWrap title={`Mark ${wombat.name} as Missing`} onClose={onClose} onSave={()=>{
+    if(!form.inactiveAt)return alert('Please enter the date last seen.');
+    onSave({status:'missing',inactiveAt:form.inactiveAt,inactiveCause:null,inactiveNotes:form.inactiveNotes.trim()||null});
+  }} saveLabel="Mark Missing" saveStyle={{background:'#7A887E'}}>
+    <div style={{background:t.soft,borderRadius:14,padding:'12px 14px',marginBottom:4}}>
+      <div style={{fontSize:13,color:t.mid,fontWeight:600,lineHeight:1.4}}>{wombat.name} will be moved to inactive and flagged as missing. Keep an eye out!</div>
+    </div>
+    <FormField label="Date Last Seen" required><FInput type="date" value={form.inactiveAt} onChange={v=>set('inactiveAt',v)}/></FormField>
+    <FormField label="Notes"><FTextarea value={form.inactiveNotes} onChange={v=>set('inactiveNotes',v)} placeholder="Where last seen, any relevant details…" rows={3}/></FormField>
+  </ModalWrap>;
+}
+function MarkActiveModal({wombat,onClose,onSave}){
+  const [status,setStatus]=useState('healthy');
+  return <ModalWrap title={`Restore ${wombat.name}`} onClose={onClose} onSave={()=>{
+    onSave({status,inactiveAt:null,inactiveCause:null,inactiveNotes:null});
+  }} saveLabel="Mark Active">
+    <FormField label="New Status" required>
+      <ChipPicker value={status} onChange={setStatus} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Under Treatment'}]}/>
+    </FormField>
+  </ModalWrap>;
+}
+function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',onClose,onSave,burrows=[]}){
   const t=useTheme();
   const savedUser=typeof localStorage!=='undefined'?localStorage.getItem(SK.userName)||'':'';
   const [form,setForm]=useState({at:today(),product:'cydectin',dose:'',method:'',severity:null,regions:{},by:savedUser,note:''});
@@ -3615,7 +3710,7 @@ function AddTreatmentModal({wombatId,wombatName,wombatStatus='mange',onClose,onS
     if(!form.dose.trim())return alert('Please enter the dose or amount.');
     if(!form.by.trim())return alert('Please enter who applied the treatment.');
     localStorage.setItem(SK.userName,form.by.trim());
-    const statusChange=markRecovered?(wombatStatus==='healthy'?'mange':'healthy'):null;
+    const statusChange=markRecovered?(wombatStatus==='healthy'?'under_treatment':'healthy'):null;
     onSave({id:uid(),wombatId,...form,location:location||null,linkedBurrowId:linkedBurrow?.id||null,_sync:false},attachedPhotos,linkedBurrow?.id||null,statusChange);
   }}>
     <FormField label="Date" required><FInput type="date" value={form.at} onChange={v=>set('at',v)}/></FormField>
@@ -3631,10 +3726,10 @@ function AddTreatmentModal({wombatId,wombatName,wombatStatus='mange',onClose,onS
     {/* Status toggle — flips meaning based on current wombat health */}
     {(()=>{
       const isHealthy=wombatStatus==='healthy';
-      const activeColor=isHealthy?'#9C4A3B':'#3A6A42';
-      const activeBg=isHealthy?'rgba(156,74,59,0.10)':'rgba(42,76,53,0.12)';
+      const activeColor=isHealthy?'#A26B1E':'#3A6A42';
+      const activeBg=isHealthy?'rgba(162,107,30,0.10)':'rgba(42,76,53,0.12)';
       const label=isHealthy?'Mange detected again':'Mark as recovered';
-      const sub=isHealthy?"Wombat's status will be set back to Mange":"Wombat's status will be set to Healthy";
+      const sub=isHealthy?"Wombat's status will be set back to Under Treatment":"Wombat's status will be set to Healthy";
       return <button onClick={()=>setMarkRecovered(r=>!r)} style={{display:'flex',alignItems:'center',gap:12,width:'100%',padding:'12px 14px',borderRadius:14,background:markRecovered?activeBg:'none',border:`1.5px solid ${markRecovered?activeColor:'var(--div)'}`,cursor:'pointer',textAlign:'left',transition:'background 0.15s,border-color 0.15s'}}>
         <div style={{width:22,height:22,borderRadius:6,border:`2px solid ${markRecovered?activeColor:'var(--faint)'}`,background:markRecovered?activeColor:'none',flexShrink:0,display:'flex',alignItems:'center',justifyContent:'center',transition:'background 0.15s,border-color 0.15s'}}>
           {markRecovered&&<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>}
@@ -3932,7 +4027,7 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
       <ChipPicker value={form.ageClass} onChange={v=>set('ageClass',v)} options={[{value:'joey',label:'Joey'},{value:'sub-adult',label:'Sub-adult'},{value:'adult',label:'Adult'}]}/>
     </FormField>
     <FormField label="Health Status" required>
-      <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Under Treatment'},{value:'mange',label:'Mange'}]}/>
+      <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Under Treatment'}]}/>
     </FormField>
     <FormField label="First Seen Date" required><FInput type="date" value={form.firstSeen} onChange={v=>set('firstSeen',v)}/></FormField>
     <FormField label="Location" required>
@@ -4223,6 +4318,16 @@ function reducer(state,action){
     case 'UPDATE_WOMBAT':{const wombats=state.wombats.map(w=>w.id===action.id?{...w,...action.patch,_sync:false}:w);save('w',wombats);return{...state,wombats};}
     // _sync:false ensures local version wins on next supaFullSync merge even if the
     // page is refreshed before the async Supabase push completes (edit never gets lost).
+    case 'MARK_WOMBAT_INACTIVE':{
+      // Sets status to 'deceased' or 'missing' and records the inactiveAt/inactiveCause/inactiveNotes fields.
+      const wombats=state.wombats.map(w=>w.id===action.id?{...w,status:action.status,inactiveAt:action.inactiveAt,inactiveCause:action.inactiveCause||null,inactiveNotes:action.inactiveNotes||null,_sync:false}:w);
+      save('w',wombats);return{...state,wombats};
+    }
+    case 'MARK_WOMBAT_ACTIVE':{
+      // Restores an inactive wombat to an active status, clearing inactive fields.
+      const wombats=state.wombats.map(w=>w.id===action.id?{...w,status:action.status,inactiveAt:null,inactiveCause:null,inactiveNotes:null,_sync:false}:w);
+      save('w',wombats);return{...state,wombats};
+    }
     case 'IMPORT_WOMBATS':{const wombats=[...state.wombats,...action.wombats];save('w',wombats);return{...state,wombats};}
     case 'DELETE_WOMBAT':{
       // Cascade: remove all child records (treatments, sightings, photos)
@@ -4389,7 +4494,7 @@ function EditWombatModal({wombat,onClose,onSave}){
       <ChipPicker value={form.ageClass} onChange={v=>set('ageClass',v)} options={[{value:'joey',label:'Joey'},{value:'sub-adult',label:'Sub-adult'},{value:'adult',label:'Adult'}]}/>
     </FormField>
     <FormField label="Health Status" required>
-      <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Under Treatment'},{value:'mange',label:'Mange'}]}/>
+      <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Under Treatment'}]}/>
     </FormField>
     <FormField label="First Seen Date"><FInput type="date" value={form.firstSeen} onChange={v=>set('firstSeen',v)}/></FormField>
     <FormField label="Location">
@@ -4778,6 +4883,16 @@ function App(){
   const [theme,setTheme]=useState(init.theme);
   const [modal,setModal]=useState(null);
   const [online,setOnline]=useState(navigator.onLine);
+  // Map filter state lifted here so it survives tab switches (resets on page reload)
+  const [mapWombatFilters,setMapWombatFilters]=useState(new Set());
+  const [mapBurrowFilters,setMapBurrowFilters]=useState(new Set());
+  const [mapCameraFilter,setMapCameraFilter]=useState(false);
+  // Wombat list filter/sort state — survives tab switches, resets on page reload
+  const [wombatFilterStatus,setWombatFilterStatus]=useState('active');
+  const [wombatSortBy,setWombatSortBy]=useState('date_added');
+  // Burrow list filter/sort state — survives tab switches, resets on page reload
+  const [burrowFilterStatus,setBurrowFilterStatus]=useState('all');
+  const [burrowSortBy,setBurrowSortBy]=useState('date_added');
   const [queueLen,setQueueLen]=useState(()=>{try{return JSON.parse(localStorage.getItem(SQ_KEY)||'[]').length;}catch{return 0;}});
   const refreshQueue=()=>{try{setQueueLen(JSON.parse(localStorage.getItem(SQ_KEY)||'[]').length);}catch{}};
   const t=theme==='dark'?T.D:T.L;
@@ -4968,6 +5083,36 @@ function App(){
     };
   },[authUser]);
 
+  // ── Tab visibility re-sync ────────────────────────────────────
+  // When the user switches back to this tab (e.g. after editing on their phone),
+  // pull the latest from Supabase so changes made on other devices appear immediately.
+  // Only fires if the tab was hidden for at least 30 seconds to avoid thrashing on
+  // quick alt-tabs. No spinner — runs silently in the background.
+  useEffect(()=>{
+    let hiddenAt=null;
+    const onVisibility=()=>{
+      if(document.visibilityState==='hidden'){
+        hiddenAt=Date.now();
+      }else if(document.visibilityState==='visible'){
+        const hiddenMs=hiddenAt?Date.now()-hiddenAt:Infinity;
+        hiddenAt=null;
+        if(hiddenMs<30000)return; // too brief — skip
+        if(!authUser||!navigator.onLine)return;
+        supaFullSync().then(merged=>{
+          if(merged){
+            const fresh=resolveWithCurrentQueue(merged);
+            const{records:wombats}=deduplicateCodes(fresh.wombats,'W');
+            const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
+            dispatch({type:'REPLACE_ALL',data:{...fresh,wombats,burrows}});
+            idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
+          }
+        }).catch(()=>{});
+      }
+    };
+    document.addEventListener('visibilitychange',onVisibility);
+    return()=>document.removeEventListener('visibilitychange',onVisibility);
+  },[authUser]);
+
   // ── Background Sync message from service worker ───────────────
   // On Android/Chrome the SW fires a 'sync' event once connectivity is confirmed
   // stable (more reliable than the 'online' event). The SW messages the open tab
@@ -4996,8 +5141,9 @@ function App(){
     // Recovery celebration: catch a wombat being marked healthy from a treated state
     if(action.type==='UPDATE_WOMBAT'&&action.patch?.status==='healthy'){
       const prev=data.wombats.find(w=>w.id===action.id);
-      if(prev&&(prev.status==='mange'||prev.status==='under_treatment')){
-        setRecoveredWombat({name:prev.name});
+      if(prev&&prev.status==='under_treatment'){
+        const profilePhoto=(data.wombatPhotos||[]).find(p=>p.wombatId===prev.id&&p.isProfile);
+        setRecoveredWombat({name:prev.name,photoUrl:profilePhoto?.dataUrl||null});
       }
     }
     // Streak: touch on any logging activity
@@ -5069,10 +5215,10 @@ function App(){
       <div className="content-area">
         {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} pending={queueLen>0} openProfile={openProfile} streak={streak}/></div>}
         {screen==='activity'&&<div className="scroll noscroll"><ActivityScreen data={data} nav={nav}/></div>}
-        {screen==='map'&&<MapScreen data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} theme={theme} onAddAt={onAddAt}/>}
-        {screen==='wombats'&&<div className="scroll noscroll"><WombatList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile}/></div>}
+        {screen==='map'&&<MapScreen data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} theme={theme} onAddAt={onAddAt} wombatFilters={mapWombatFilters} setWombatFilters={setMapWombatFilters} burrowFilters={mapBurrowFilters} setBurrowFilters={setMapBurrowFilters} cameraFilter={mapCameraFilter} setCameraFilter={setMapCameraFilter}/>}
+        {screen==='wombats'&&<div className="scroll noscroll"><WombatList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile} filterStatus={wombatFilterStatus} setFilterStatus={setWombatFilterStatus} sortBy={wombatSortBy} setSortBy={setWombatSortBy}/></div>}
         {screen==='wombat-profile'&&<div className="scroll noscroll"><WombatProfile wombatId={selectedId} data={data} nav={nav} dispatch={syncDispatch} openProfile={openProfile} authProfile={authProfile}/></div>}
-        {screen==='burrows'&&<div className="scroll noscroll"><BurrowList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile}/></div>}
+        {screen==='burrows'&&<div className="scroll noscroll"><BurrowList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile} filterStatus={burrowFilterStatus} setFilterStatus={setBurrowFilterStatus} sortBy={burrowSortBy} setSortBy={setBurrowSortBy}/></div>}
         {screen==='burrow-profile'&&<div className="scroll noscroll"><BurrowProfile burrowId={selectedId} data={data} nav={nav} dispatch={syncDispatch} openProfile={openProfile} authProfile={authProfile}/></div>}
       </div>
       {/* ── single tab bar, pinned below content, never overlapping ── */}
@@ -5089,7 +5235,7 @@ function App(){
       {modal==='add-burrow'&&<AddBurrowModal initialLocation={addAtLoc} nextCode={nextBurrowCode(data.burrows)} wombats={data.wombats} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(b,photo)=>{syncDispatch({type:'ADD_BURROW',burrow:b});(b.wombatIds||[]).forEach(wId=>syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:wId,burrowId:b.id}));if(photo)syncDispatch({type:'ADD_BURROW_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('burrow-profile',b.id);}}/>}
       {modal==='add-sighting'&&<AddSightingModal wombats={data.wombats} onClose={()=>setModal(null)} onSave={s=>{syncDispatch({type:'ADD_SIGHTING',sighting:s});setModal(null);}}/>}
       {modal==='sign-in'&&<SignInModal onClose={()=>setModal(null)}/>}
-      {recoveredWombat&&<RecoveryModal name={recoveredWombat.name} onClose={()=>setRecoveredWombat(null)}/>}
+      {recoveredWombat&&<RecoveryModal name={recoveredWombat.name} photoUrl={recoveredWombat.photoUrl} onClose={()=>setRecoveredWombat(null)}/>}
     </div>
   </ThemeCtx.Provider>;
 }
