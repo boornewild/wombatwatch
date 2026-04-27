@@ -749,7 +749,22 @@ async function flushQueue(userId){
         }
       }catch(e){console.warn('[Queue] op threw:',op.t,op.table||op.id,e);}
       if(skip) continue; // already handled above
-      if(!ok){
+      if(ok){
+        // Mark successfully-pushed records as _sync:true in localStorage so that future
+        // full syncs treat them as server-authoritative. Without this, _sync:false records
+        // permanently win every merge and changes from other devices never land locally.
+        if(op.t==='upsert'&&op.row?.id){
+          const lsKeyMap={wombats:'w',burrows:'b',treatments:'t',sightings:'s',burrow_logs:'bl',wombat_photos:'wp',burrow_photos:'bp'};
+          const lk=lsKeyMap[op.table];
+          if(lk){
+            try{
+              const arr=JSON.parse(localStorage.getItem(SK[lk])||'[]');
+              const patched=arr.map(r=>r.id===op.row.id?{...r,_sync:true}:r);
+              localStorage.setItem(SK[lk],JSON.stringify(patched));
+            }catch(e){}
+          }
+        }
+      }else{
         const retries=(op._retries||0)+1;
         if(retries>=SQ_MAX_RETRIES){
           console.warn('[Queue] Dropping op after',retries,'failures:',op.t,op.table||op.id);
@@ -781,13 +796,15 @@ async function syncAction(action,userId){
   try{
     switch(action.type){
       case'ADD_WOMBAT':     await push('wombats',    wombatToDb(action.wombat,userId)); break;
-      case'UPDATE_WOMBAT':       {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb(w,userId));break;}
-      case'MARK_WOMBAT_INACTIVE':{const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb(w,userId));break;}
-      case'MARK_WOMBAT_ACTIVE':  {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb(w,userId));break;}
+      // Apply patch directly rather than reading from localStorage — the React reducer
+      // may not have committed to localStorage yet by the time syncAction runs.
+      case'UPDATE_WOMBAT':       {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb({...w,...action.patch},userId));break;}
+      case'MARK_WOMBAT_INACTIVE':{const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:action.inactiveAt,inactiveCause:action.inactiveCause||null,inactiveNotes:action.inactiveNotes||null},userId));break;}
+      case'MARK_WOMBAT_ACTIVE':  {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:null,inactiveCause:null,inactiveNotes:null},userId));break;}
       case'IMPORT_WOMBATS': for(const w of action.wombats)await push('wombats',wombatToDb(w,userId)); break;
       case'DELETE_WOMBAT':  await del('wombats',action.id); break; // ON DELETE CASCADE handles child records
       case'ADD_BURROW':     await push('burrows',    burrowToDb(action.burrow,userId)); break;
-      case'UPDATE_BURROW':  {const b=fromLS('b',action.id);if(b)await push('burrows',burrowToDb(b,userId));break;}
+      case'UPDATE_BURROW':  {const b=fromLS('b',action.id);if(b)await push('burrows',burrowToDb({...b,...action.patch},userId));break;}
       case'IMPORT_BURROWS': for(const b of action.burrows)await push('burrows',burrowToDb(b,userId)); break;
       case'DELETE_BURROW':  await del('burrows',action.id); break; // ON DELETE CASCADE handles child records
       case'ADD_TREATMENT':  await push('treatments', treatmentToDb(action.treatment,userId)); break;
@@ -795,10 +812,29 @@ async function syncAction(action,userId){
       case'ADD_SIGHTING':   await push('sightings',  sightingToDb(action.sighting,userId)); break;
       case'ADD_BURROW_LOG': {
         await push('burrow_logs',burrowLogToDb(action.log,userId));
-        const b=fromLS('b',action.log.burrowId);if(b)await push('burrows',burrowToDb(b,userId));
+        // Apply the same logPatch the reducer uses so we don't rely on localStorage timing.
+        const b=fromLS('b',action.log.burrowId);
+        if(b){
+          const lp={status:action.log.status,lastChecked:action.log.at};
+          if(action.log.heightCm!=null&&action.log.heightCm!=='')lp.entranceHeightCm=action.log.heightCm;
+          if(action.log.widthCm!=null&&action.log.widthCm!=='')lp.entranceWidthCm=action.log.widthCm;
+          if(action.log.orientation)lp.orientation=action.log.orientation;
+          const hp={};
+          if(action.log.substrate)hp.substrate=action.log.substrate;
+          if(action.log.vegetation)hp.vegetation=action.log.vegetation;
+          if(action.log.trailCamera!==undefined)hp.trailCamera=action.log.trailCamera;
+          await push('burrows',burrowToDb({...b,...lp,habitat:{...b.habitat,...hp}},userId));
+        }
         break;
       }
-      case'DELETE_BURROW_LOG': await del('burrow_logs',action.logId); break;
+      case'DELETE_BURROW_LOG': {
+        await del('burrow_logs',action.logId);
+        // Also push the burrow back so Supabase reflects the reverted status/lastChecked.
+        // We read from localStorage here; if the reducer hasn't committed yet the value
+        // will be slightly stale, but the next full sync will reconcile it.
+        const bd=fromLS('b',action.burrowId);if(bd)await push('burrows',burrowToDb(bd,userId));
+        break;
+      }
       case'ADD_WOMBAT_PHOTO': {
         // Upload photo data to Supabase Storage; store URL in DB (not base64).
         // Offline: ensure IDB write completes BEFORE queuing with null data_url —
@@ -818,10 +854,11 @@ async function syncAction(action,userId){
         break;
       }
       case'SET_PROFILE_PHOTO': {
+        // Apply isProfile change directly — don't rely on reducer having updated localStorage yet.
         const ps=(JSON.parse(localStorage.getItem(SK.wp)||'[]')).filter(p=>p.wombatId===action.wombatId);
         for(const p of ps){
           const url=navigator.onLine?await resolvePhotoUrl(p.dataUrl,p.id,SK.wp):p.dataUrl;
-          await push('wombat_photos',wombatPhotoToDb({...p,dataUrl:url},userId));
+          await push('wombat_photos',wombatPhotoToDb({...p,isProfile:p.id===action.photoId,dataUrl:url},userId));
         }
         break;
       }
@@ -842,16 +879,20 @@ async function syncAction(action,userId){
         break;
       }
       case'SET_BURROW_PROFILE_PHOTO': {
+        // Apply isProfile change directly — don't rely on reducer having updated localStorage yet.
         const ps=(JSON.parse(localStorage.getItem(SK.bp)||'[]')).filter(p=>p.burrowId===action.burrowId);
         for(const p of ps){
           const url=navigator.onLine?await resolvePhotoUrl(p.dataUrl,p.id,SK.bp):p.dataUrl;
-          await push('burrow_photos',burrowPhotoToDb({...p,dataUrl:url},userId));
+          await push('burrow_photos',burrowPhotoToDb({...p,isProfile:p.id===action.photoId,dataUrl:url},userId));
         }
         break;
       }
       case'LINK_WOMBAT_BURROW': {
-        const w=fromLS('w',action.wombatId);if(w)await push('wombats',wombatToDb(w,userId));
-        const b=fromLS('b',action.burrowId);if(b)await push('burrows',burrowToDb(b,userId));
+        // Apply the bidirectional ID arrays directly — don't rely on reducer having updated localStorage yet.
+        const w=fromLS('w',action.wombatId);
+        if(w)await push('wombats',wombatToDb({...w,burrowIds:[...(w.burrowIds||[]).filter(id=>id!==action.burrowId),action.burrowId]},userId));
+        const b=fromLS('b',action.burrowId);
+        if(b)await push('burrows',burrowToDb({...b,wombatIds:[...(b.wombatIds||[]).filter(id=>id!==action.wombatId),action.wombatId]},userId));
         break;
       }
       default:break;
@@ -884,10 +925,14 @@ async function supaFullSync(){
   // Return undefined (distinct from null) so the caller knows NOT to touch local state.
   const anySucceeded=results.some(r=>r.status==='fulfilled'&&!r.value?.error);
   if(!anySucceeded)return undefined;
-  if(!(w?.length||0)&&!(b?.length||0))return null; // confirmed new user, genuinely empty DB
   // Build sets of IDs from the offline queue so the merge can respect pending operations.
   let _pendingOps=[];
   try{_pendingOps=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');}catch(e){}
+  // Only treat as a confirmed new user (empty DB) if there are also no pending local ops.
+  // If there ARE pending upserts, the user added data offline before their first sync —
+  // returning null here would cause the caller to wipe that unsynchronised data.
+  const hasPendingUpserts=_pendingOps.some(op=>op.t==='upsert');
+  if(!(w?.length||0)&&!(b?.length||0)&&!hasPendingUpserts)return null; // confirmed new user, genuinely empty DB
   // Pending upserts — local version must win over whatever the server returned
   const queuedIds=new Set(
     _pendingOps.filter(op=>op.t==='upsert'&&op.row&&op.row.id).map(op=>op.row.id)
@@ -4368,15 +4413,17 @@ function reducer(state,action){
     // base64 blobs live in IDB; localStorage only holds metadata (dataUrl:null).
     case 'ADD_WOMBAT_PHOTO':{const wombatPhotos=[...state.wombatPhotos,action.photo];save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};}
     case 'SET_PROFILE_PHOTO':{
-      // Mark one photo as the profile image; clear the flag on all others for this wombat
-      const wombatPhotos=state.wombatPhotos.map(p=>p.wombatId===action.wombatId?{...p,isProfile:p.id===action.photoId}:p);
+      // Mark one photo as the profile image; clear the flag on all others for this wombat.
+      // _sync:false on all affected photos so isProfile changes survive any concurrent server pull.
+      const wombatPhotos=state.wombatPhotos.map(p=>p.wombatId===action.wombatId?{...p,isProfile:p.id===action.photoId,_sync:false}:p);
       save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};
     }
     case 'DELETE_WOMBAT_PHOTO':{const wombatPhotos=state.wombatPhotos.filter(p=>p.id!==action.photoId);save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};}
     case 'ADD_BURROW_PHOTO':{const burrowPhotos=[...state.burrowPhotos,action.photo];save('bp',burrowPhotos.map(noB64));return{...state,burrowPhotos};}
     case 'SET_BURROW_PROFILE_PHOTO':{
-      // Mark one photo as the profile image; clear the flag on all others for this burrow
-      const burrowPhotos=state.burrowPhotos.map(p=>p.burrowId===action.burrowId?{...p,isProfile:p.id===action.photoId}:p);
+      // Mark one photo as the profile image; clear the flag on all others for this burrow.
+      // _sync:false on all affected photos so isProfile changes survive any concurrent server pull.
+      const burrowPhotos=state.burrowPhotos.map(p=>p.burrowId===action.burrowId?{...p,isProfile:p.id===action.photoId,_sync:false}:p);
       save('bp',burrowPhotos.map(noB64));return{...state,burrowPhotos};
     }
     case 'DELETE_BURROW_PHOTO':{const burrowPhotos=state.burrowPhotos.filter(p=>p.id!==action.photoId);save('bp',burrowPhotos.map(noB64));return{...state,burrowPhotos};}
@@ -4395,8 +4442,9 @@ function reducer(state,action){
       const bl=state.burrowLogs.filter(l=>l.id!==action.logId);
       // Revert burrow.status and burrow.lastChecked to the most recent remaining log.
       // If no logs remain, leave the existing values in place.
+      // _sync:false ensures the reverted burrow state wins any concurrent server pull.
       const remaining=bl.filter(l=>l.burrowId===action.burrowId).sort((a,b)=>new Date(b.at)-new Date(a.at));
-      const burs=state.burrows.map(b=>b.id===action.burrowId?{...b,status:remaining[0]?.status||b.status,lastChecked:remaining[0]?.at||b.lastChecked}:b);
+      const burs=state.burrows.map(b=>b.id===action.burrowId?{...b,status:remaining[0]?.status||b.status,lastChecked:remaining[0]?.at||b.lastChecked,_sync:false}:b);
       save('bl',bl);save('b',burs);
       return{...state,burrowLogs:bl,burrows:burs};}
     case 'ADD_BURROW_LOG':{
@@ -4404,6 +4452,8 @@ function reducer(state,action){
       // Mirror log data onto the parent burrow: status, lastChecked, entrance
       // measurements, and habitat fields (substrate, vegetation, trailCamera).
       // Only fields present in the log are patched — missing fields are left alone.
+      // _sync:false on the burrow ensures the update isn't overwritten by a server
+      // pull that completes before the async Supabase push finishes.
       const logPatch={status:action.log.status,lastChecked:action.log.at};
       if(action.log.heightCm!=null&&action.log.heightCm!=='') logPatch.entranceHeightCm=action.log.heightCm;
       if(action.log.widthCm!=null&&action.log.widthCm!=='') logPatch.entranceWidthCm=action.log.widthCm;
@@ -4414,7 +4464,7 @@ function reducer(state,action){
         if(action.log.substrate) habitatPatch.substrate=action.log.substrate;
         if(action.log.vegetation) habitatPatch.vegetation=action.log.vegetation;
         if(action.log.trailCamera!==undefined) habitatPatch.trailCamera=action.log.trailCamera;
-        return{...b,...logPatch,habitat:{...b.habitat,...habitatPatch}};
+        return{...b,...logPatch,habitat:{...b.habitat,...habitatPatch},_sync:false};
       });
       save('bl',bl);save('b',burs);
       return{...state,burrowLogs:bl,burrows:burs};
@@ -4425,9 +4475,11 @@ function reducer(state,action){
       // Wombat↔burrow links are bidirectional: wombat.burrowIds and burrow.wombatIds
       // both need updating. Always use this action — never patch either array directly.
       // Deduplicates before adding so dispatching twice is safe.
+      // _sync:false on both records ensures the link isn't dropped if a server pull
+      // completes before the Supabase push finishes.
       const{wombatId,burrowId}=action;
-      const wombats=state.wombats.map(w=>w.id===wombatId?{...w,burrowIds:[...(w.burrowIds||[]).filter(id=>id!==burrowId),burrowId]}:w);
-      const burrows=state.burrows.map(b=>b.id===burrowId?{...b,wombatIds:[...(b.wombatIds||[]).filter(id=>id!==wombatId),wombatId]}:b);
+      const wombats=state.wombats.map(w=>w.id===wombatId?{...w,burrowIds:[...(w.burrowIds||[]).filter(id=>id!==burrowId),burrowId],_sync:false}:w);
+      const burrows=state.burrows.map(b=>b.id===burrowId?{...b,wombatIds:[...(b.wombatIds||[]).filter(id=>id!==wombatId),wombatId],_sync:false}:b);
       save('w',wombats);save('b',burrows);
       return{...state,wombats,burrows};
     }
