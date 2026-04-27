@@ -60,7 +60,7 @@ button{cursor:pointer;font-family:inherit;border:none;background:none;padding:0;
 --lav50:#F2EEFB;--lav100:#E6DEF7;--lav500:#7A6AB8;
 --sage50:#E8EFE6;--sage700:#3D6B3F;
 --amb50:#FBECCF;--amb700:#A26B1E;
---rose50:#F3D9D4;--rose700:#9C4A3B;
+--rose50:#F3D9D4;--rose700:#B95C4A;
 --sky50:#DDE8F1;--sky700:#3B5B7A;
 --shadow:0 1px 2px rgba(28,48,32,0.04),0 4px 18px rgba(28,48,32,0.06);
 --shadow-hdr:0 6px 18px rgba(31,58,42,0.12);
@@ -193,7 +193,7 @@ const T={
      ink:'#1B2A1F',mid:'#4A5C4F',softInk:'#7A897E',faint:'#A9B2AB',
      lav50:'#F2EEFB',lav100:'#E6DEF7',lav500:'#7A6AB8',
      sage50:'#E8EFE6',sage700:'#3D6B3F',amb50:'#FBECCF',amb700:'#A26B1E',
-     rose50:'#F3D9D4',rose700:'#9C4A3B',sky50:'#DDE8F1',sky700:'#3B5B7A',
+     rose50:'#F3D9D4',rose700:'#B95C4A',sky50:'#DDE8F1',sky700:'#3B5B7A',
      shadow:'0 1px 2px rgba(28,48,32,0.04),0 4px 18px rgba(28,48,32,0.06)',
      shadowHdr:'0 6px 18px rgba(31,58,42,0.12)',tabbar:'#fff',tabborder:'rgba(28,48,32,0.08)'},
   D:{bg:'#12181A',surface:'#1C2527',soft:'#232D2F',div:'rgba(255,255,255,0.06)',
@@ -485,15 +485,15 @@ const SK={
   offlineSaved: 'ww_offlineSaved', // boolean — offline-mode intro seen
 };
 const load=()=>{try{return{
-  wombats:JSON.parse(localStorage.getItem(SK.w))||SD.wombats,
-  burrows:JSON.parse(localStorage.getItem(SK.b))||SD.burrows,
-  treatments:JSON.parse(localStorage.getItem(SK.t))||SD.treatments,
-  sightings:JSON.parse(localStorage.getItem(SK.s))||SD.sightings,
-  burrowLogs:JSON.parse(localStorage.getItem(SK.bl))||SD.burrowLogs,
+  wombats:JSON.parse(localStorage.getItem(SK.w))||[],
+  burrows:JSON.parse(localStorage.getItem(SK.b))||[],
+  treatments:JSON.parse(localStorage.getItem(SK.t))||[],
+  sightings:JSON.parse(localStorage.getItem(SK.s))||[],
+  burrowLogs:JSON.parse(localStorage.getItem(SK.bl))||[],
   wombatPhotos:JSON.parse(localStorage.getItem(SK.wp))||[],
   burrowPhotos:JSON.parse(localStorage.getItem(SK.bp))||[],
   theme:localStorage.getItem(SK.theme)||'light',
-};}catch(e){return{...SD,theme:'light'};}};
+};}catch(e){return{wombats:[],burrows:[],treatments:[],sightings:[],burrowLogs:[],wombatPhotos:[],burrowPhotos:[],theme:'light'};}};
 const save=(key,val)=>{
   try{localStorage.setItem(SK[key],JSON.stringify(val));}
   catch(e){
@@ -1843,7 +1843,7 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
     setShowOffSheet(false);
   };
 
-  const wColors={'healthy':'#4A7C52','under_treatment':'#D89039','missing':'#7A887E','deceased':'#9C4A3B'};
+  const wColors={'healthy':'#4A7C52','under_treatment':'#D89039','missing':'#7A887E','deceased':'#B95C4A'};
   const bColors={'active':'#4A7C52','inactive':'#D89039','damaged':'#B95C4A'};
 
   const flyToUser=()=>{
@@ -1963,7 +1963,7 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
     {k:'all',label:'All active',count:activeMapWombats.length,dot:null},
     {k:'healthy',label:'Healthy',count:activeMapWombats.filter(w=>w.status==='healthy').length,dot:'#4A7C52'},
     {k:'under_treatment',label:'Treatment',count:activeMapWombats.filter(w=>w.status==='under_treatment').length,dot:'#D89039'},
-    {k:'deceased',label:'Deceased',count:deceasedWombats.length,dot:'#9C4A3B'},
+    {k:'deceased',label:'Deceased',count:deceasedWombats.length,dot:'#B95C4A'},
     {k:'missing',label:'Missing',count:missingWombats.length,dot:'#7A887E'},
   ];
   const burrowChips=[
@@ -3621,7 +3621,7 @@ function MarkDeceasedModal({wombat,onClose,onSave}){
   return <ModalWrap title={`Mark ${wombat.name} as Deceased`} onClose={onClose} onSave={()=>{
     if(!form.inactiveAt)return alert('Please enter a date of death.');
     onSave({status:'deceased',inactiveAt:form.inactiveAt,inactiveCause:form.inactiveCause,inactiveNotes:form.inactiveNotes.trim()||null});
-  }} saveLabel="Mark Deceased" saveStyle={{background:'#9C4A3B'}}>
+  }} saveLabel="Mark Deceased" saveStyle={{background:'#B95C4A'}}>
     <div style={{background:t.rose50,borderRadius:14,padding:'12px 14px',marginBottom:4}}>
       <div style={{fontSize:13,color:t.rose700,fontWeight:600,lineHeight:1.4}}>This will move {wombat.name} to the inactive list. This can be reversed from their profile if needed.</div>
     </div>
