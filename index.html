@@ -2212,7 +2212,10 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
       const bt=data.treatments.filter(x=>x.wombatId===b.id).sort((p,q)=>new Date(q.at)-new Date(p.at))[0]?.at||'';
       return bt.localeCompare(at);
     }
-    return new Date(b.firstSeen||0)-new Date(a.firstSeen||0);
+    const dd=new Date(b.firstSeen||0)-new Date(a.firstSeen||0);
+    if(dd!==0)return dd;
+    // Tiebreak by code number so same-day additions stay in creation order
+    return parseInt((a.code||'').slice(1)||'0')-parseInt((b.code||'').slice(1)||'0');
   });
   // canAct: admins can act on any record; volunteers can act on their own records
   // or on unowned records (created offline before auth was set up).
@@ -2622,7 +2625,10 @@ function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
       const bl=data.burrowLogs.filter(x=>x.burrowId===b.id).sort((p,q)=>new Date(q.at)-new Date(p.at))[0]?.at||'';
       return bl.localeCompare(al);
     }
-    return new Date(b.lastChecked||0)-new Date(a.lastChecked||0);
+    const dd=new Date(b.lastChecked||0)-new Date(a.lastChecked||0);
+    if(dd!==0)return dd;
+    // Tiebreak by code number so same-day additions stay in creation order
+    return parseInt((a.code||'').slice(1)||'0')-parseInt((b.code||'').slice(1)||'0');
   });
   const canAct=b=>isAdmin||!b._createdBy||b._createdBy===authUser?.id;
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
@@ -5149,10 +5155,26 @@ function App(){
         }catch(e){}
       }
     },30000); // every 30 seconds
+    // Periodic background pull: keeps the app up-to-date on devices that stay
+    // open (e.g. a laptop) while another device (e.g. a phone) pushes new records.
+    // The online/visibility handlers cover reconnect and tab-switch; this covers
+    // the "app sitting open, no interaction" case. Runs every 2 minutes.
+    const bgSyncInterval=setInterval(()=>{
+      if(!navigator.onLine||!authUser)return;
+      supaFullSync().then(merged=>{
+        if(!merged)return;
+        const fresh=resolveWithCurrentQueue(merged);
+        const{records:wombats}=deduplicateCodes(fresh.wombats,'W');
+        const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
+        dispatch({type:'REPLACE_ALL',data:{...fresh,wombats,burrows}});
+        idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
+      }).catch(()=>{});
+    },120000); // every 2 minutes
     return()=>{
       window.removeEventListener('online',on);
       window.removeEventListener('offline',off);
       clearInterval(drainInterval);
+      clearInterval(bgSyncInterval);
     };
   },[authUser]);
 
