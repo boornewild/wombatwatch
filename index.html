@@ -816,6 +816,7 @@ async function flushQueue(userId){
 // ── Sync single action → Supabase ─────────────────────────────
 async function syncAction(action,userId){
   const fromLS=(k,id)=>{try{return(JSON.parse(localStorage.getItem(SK[k]))||[]).find(r=>r.id===id);}catch{return null;}};
+  const lsKeyMap={wombats:'w',burrows:'b',treatments:'t',sightings:'s',burrow_logs:'bl',wombat_photos:'wp',burrow_photos:'bp'};
   const push=async(table,row)=>{
     const r={...row,created_by:row.created_by||userId};
     if(!navigator.onLine){queueOp({t:'upsert',table,row:r});return;}
@@ -824,7 +825,17 @@ async function syncAction(action,userId){
     // the case statement and reaches the outer catch, bypassing the queueOp fallback.
     try{
       const ok=await supaUpsert(table,r);
-      if(!ok)queueOp({t:'upsert',table,row:r});
+      if(!ok){queueOp({t:'upsert',table,row:r});return;}
+      // Mark _sync:true so resolveWithCurrentQueue knows the push was confirmed and
+      // won't permanently block server-side changes from landing on next sync.
+      const lk=lsKeyMap[table];
+      if(lk&&r.id){
+        try{
+          const arr=JSON.parse(localStorage.getItem(SK[lk])||'[]');
+          const patched=arr.map(rec=>rec.id===r.id?{...rec,_sync:true}:rec);
+          localStorage.setItem(SK[lk],JSON.stringify(patched));
+        }catch(e){}
+      }
     }catch(e){
       console.warn('[Supa] push threw, queuing for retry:',table,e);
       queueOp({t:'upsert',table,row:r});
@@ -901,10 +912,13 @@ async function syncAction(action,userId){
         break;
       }
       case'SET_PROFILE_PHOTO': {
-        // Apply isProfile change directly — don't rely on reducer having updated localStorage yet.
         const ps=(JSON.parse(localStorage.getItem(SK.wp)||'[]')).filter(p=>p.wombatId===action.wombatId);
         for(const p of ps){
-          const url=navigator.onLine?await resolvePhotoUrl(p.dataUrl,p.id,SK.wp):p.dataUrl;
+          // dataUrl is null in localStorage if noB64 stripped it (blob lives in IDB).
+          // Fall back to IDB so we don't clobber an existing Storage URL with null.
+          let dataUrl=p.dataUrl;
+          if(!dataUrl)dataUrl=await idbGetPhoto(p.id)||null;
+          const url=navigator.onLine?await resolvePhotoUrl(dataUrl,p.id,SK.wp):dataUrl;
           await push('wombat_photos',wombatPhotoToDb({...p,isProfile:p.id===action.photoId,dataUrl:url},userId));
         }
         break;
@@ -926,10 +940,11 @@ async function syncAction(action,userId){
         break;
       }
       case'SET_BURROW_PROFILE_PHOTO': {
-        // Apply isProfile change directly — don't rely on reducer having updated localStorage yet.
         const ps=(JSON.parse(localStorage.getItem(SK.bp)||'[]')).filter(p=>p.burrowId===action.burrowId);
         for(const p of ps){
-          const url=navigator.onLine?await resolvePhotoUrl(p.dataUrl,p.id,SK.bp):p.dataUrl;
+          let dataUrl=p.dataUrl;
+          if(!dataUrl)dataUrl=await idbGetPhoto(p.id)||null;
+          const url=navigator.onLine?await resolvePhotoUrl(dataUrl,p.id,SK.bp):dataUrl;
           await push('burrow_photos',burrowPhotoToDb({...p,isProfile:p.id===action.photoId,dataUrl:url},userId));
         }
         break;
@@ -1028,9 +1043,14 @@ function resolveWithCurrentQueue(merged){
   const fix=(items,lsKey)=>{
     const local=JSON.parse(localStorage.getItem(SK[lsKey])||'[]');
     const localById=Object.fromEntries(local.map(r=>[r.id,r]));
-    // Swap server version for local wherever there's a pending queue op
-    const out=items.map(r=>qIds.has(r.id)&&localById[r.id]?localById[r.id]:r)
-                   .filter(r=>!dIds.has(r.id));
+    // Use local version when: (a) there's a pending queue op, or (b) record has
+    // unsync'd local changes (_sync:false). The _sync:false flag is set whenever
+    // the reducer applies a local edit; the push helper clears it to true on success.
+    const out=items.map(r=>{
+      const loc=localById[r.id];
+      if(loc&&(qIds.has(r.id)||loc._sync===false))return loc;
+      return r;
+    }).filter(r=>!dIds.has(r.id));
     // Also include new local records created during the fetch (not on server yet)
     const outIds=new Set(out.map(r=>r.id));
     local.filter(r=>(qIds.has(r.id)||!r._sync)&&!outIds.has(r.id)&&!dIds.has(r.id))
@@ -2240,8 +2260,8 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
     }
     const dd=new Date(b.firstSeen||0)-new Date(a.firstSeen||0);
     if(dd!==0)return dd;
-    // Tiebreak by code number so same-day additions stay in creation order
-    return parseInt((a.code||'').slice(1)||'0')-parseInt((b.code||'').slice(1)||'0');
+    // Tiebreak by code number descending so same-day additions show newest first
+    return parseInt((b.code||'').slice(1)||'0')-parseInt((a.code||'').slice(1)||'0');
   });
   // canAct: admins can act on any record; volunteers can act on their own records
   // or on unowned records (created offline before auth was set up).
@@ -2653,8 +2673,8 @@ function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
     }
     const dd=new Date(b.lastChecked||0)-new Date(a.lastChecked||0);
     if(dd!==0)return dd;
-    // Tiebreak by code number so same-day additions stay in creation order
-    return parseInt((a.code||'').slice(1)||'0')-parseInt((b.code||'').slice(1)||'0');
+    // Tiebreak by code number descending so same-day additions show newest first
+    return parseInt((b.code||'').slice(1)||'0')-parseInt((a.code||'').slice(1)||'0');
   });
   const canAct=b=>isAdmin||!b._createdBy||b._createdBy===authUser?.id;
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
