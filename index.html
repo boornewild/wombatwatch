@@ -647,13 +647,21 @@ function checkAuthError(error){
 }
 
 // ── Remote ops ───────────────────────────────────────────────
+let _lastSupaError=''; // captured for the flushQueue dropped-record alert
 async function supaUpsert(table,row){
   try{
     const{error}=await supa.from(table).upsert(row,{onConflict:'id'});
-    if(error){console.warn('[Supa] upsert FAILED',table,row?.id,error.message,error.code);checkAuthError(error);}
-    else console.debug('[Supa] upsert ok',table,row?.id);
+    if(error){
+      _lastSupaError=`${error.message}${error.code?' ('+error.code+')':''}`;
+      console.warn('[Supa] upsert FAILED',table,row?.id,error.message,error.code);
+      checkAuthError(error);
+    }else console.debug('[Supa] upsert ok',table,row?.id);
     return!error;
-  }catch(e){console.warn('[Supa] upsert exception',table,e);return false;}
+  }catch(e){
+    _lastSupaError=String(e);
+    console.warn('[Supa] upsert exception',table,e);
+    return false;
+  }
 }
 async function supaDelete(table,id){
   try{
@@ -769,7 +777,7 @@ async function flushQueue(userId){
         if(retries>=SQ_MAX_RETRIES){
           console.warn('[Queue] Dropping op after',retries,'failures:',op.t,op.table||op.id);
           // Notify the user so data loss doesn't go unnoticed
-          if(typeof alert!=='undefined') alert('⚠️ A record could not be synced after several attempts and has been dropped.\n\nThis may be due to a permissions issue or a schema mismatch. Please check your data and re-enter if needed.');
+          if(typeof alert!=='undefined') alert(`⚠️ A record could not be synced after several attempts and has been dropped.\n\nTable: ${op.table||'unknown'}\nError: ${_lastSupaError||'unknown'}\n\nPlease screenshot this and check your data.`);
         }else{
           remaining.push({...op,_retries:retries});
         }
@@ -785,13 +793,26 @@ async function syncAction(action,userId){
   const push=async(table,row)=>{
     const r={...row,created_by:row.created_by||userId};
     if(!navigator.onLine){queueOp({t:'upsert',table,row:r});return;}
-    const ok=await supaUpsert(table,r);
-    if(!ok)queueOp({t:'upsert',table,row:r});
+    // Catch exceptions as well as false returns — both mean the push failed and the op
+    // must be queued so it isn't silently lost. Without this, a thrown error escapes
+    // the case statement and reaches the outer catch, bypassing the queueOp fallback.
+    try{
+      const ok=await supaUpsert(table,r);
+      if(!ok)queueOp({t:'upsert',table,row:r});
+    }catch(e){
+      console.warn('[Supa] push threw, queuing for retry:',table,e);
+      queueOp({t:'upsert',table,row:r});
+    }
   };
   const del=async(table,id)=>{
     if(!navigator.onLine){queueOp({t:'delete',table,id});return;}
-    const ok=await supaDelete(table,id);
-    if(!ok)queueOp({t:'delete',table,id});
+    try{
+      const ok=await supaDelete(table,id);
+      if(!ok)queueOp({t:'delete',table,id});
+    }catch(e){
+      console.warn('[Supa] del threw, queuing for retry:',table,id,e);
+      queueOp({t:'delete',table,id});
+    }
   };
   try{
     switch(action.type){
