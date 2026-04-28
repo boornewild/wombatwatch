@@ -562,6 +562,32 @@ async function idbDeletePhoto(id){
 // Strip base64 dataUrls before saving to localStorage (they live in IDB instead).
 // Supabase Storage URLs (https://...) are small and safe to keep.
 const noB64=p=>p.dataUrl?.startsWith('data:')?{...p,dataUrl:null}:p;
+// Cache remote (https://) photo URLs into IDB so they render when offline.
+// Called in the background after every full sync. Only fetches photos not
+// already in IDB, so it's cheap after the first run. Dispatches a second
+// HYDRATE_PHOTO_DATA once blobs are cached so the UI updates without reload.
+async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch){
+  try{
+    const existing=await idbGetAllPhotos();
+    const all=[...(wombatPhotos||[]),...(burrowPhotos||[])];
+    const toFetch=all.filter(p=>p.dataUrl&&p.dataUrl.startsWith('https://')&&!existing[p.id]);
+    if(!toFetch.length)return;
+    const newMap={};
+    for(const p of toFetch){
+      try{
+        const res=await fetch(p.dataUrl);
+        if(!res.ok)continue;
+        const blob=await res.blob();
+        const dataUrl=await new Promise(resolve=>{
+          const r=new FileReader();r.onload=()=>resolve(r.result);r.readAsDataURL(blob);
+        });
+        await idbPutPhoto(p.id,dataUrl);
+        newMap[p.id]=dataUrl;
+      }catch(e){/* ignore — won't be offline-cached, but won't break anything */}
+    }
+    if(Object.keys(newMap).length&&dispatch)dispatch({type:'HYDRATE_PHOTO_DATA',map:newMap});
+  }catch(e){}
+}
 /* ── Streak helpers ──────────────────────────────────────────────
    A "week key" is YYYY-WNN. Any logging activity within a calendar
    week counts. Missing a full week resets the streak to 1.        */
@@ -5079,6 +5105,8 @@ function App(){
             dispatch({type:'REPLACE_ALL',data:synced});
             // Re-hydrate IDB photo data after the sync wipes dataUrls from state
             idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
+            // Cache any remote (https://) photos into IDB so they render offline
+            cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
             // Patch renumbered records back to Supabase so everyone stays consistent
             changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
             changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
@@ -5117,6 +5145,7 @@ function App(){
           const synced={...fresh,wombats,burrows};
           dispatch({type:'REPLACE_ALL',data:synced});
           idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
+          cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
           changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
           changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
           geocodeBackfill(synced,dispatch);
@@ -5135,6 +5164,7 @@ function App(){
             const synced={...fresh,wombats,burrows};
             dispatch({type:'REPLACE_ALL',data:synced});
             idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
+            cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
             changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
             changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
             geocodeBackfill(synced,dispatch);
@@ -5166,8 +5196,10 @@ function App(){
         const fresh=resolveWithCurrentQueue(merged);
         const{records:wombats}=deduplicateCodes(fresh.wombats,'W');
         const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
-        dispatch({type:'REPLACE_ALL',data:{...fresh,wombats,burrows}});
+        const synced2={...fresh,wombats,burrows};
+        dispatch({type:'REPLACE_ALL',data:synced2});
         idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
+        cacheRemotePhotosToIdb(synced2.wombatPhotos,synced2.burrowPhotos,dispatch).catch(()=>{});
       }).catch(()=>{});
     },120000); // every 2 minutes
     return()=>{
@@ -5198,8 +5230,10 @@ function App(){
             const fresh=resolveWithCurrentQueue(merged);
             const{records:wombats}=deduplicateCodes(fresh.wombats,'W');
             const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
-            dispatch({type:'REPLACE_ALL',data:{...fresh,wombats,burrows}});
+            const synced3={...fresh,wombats,burrows};
+            dispatch({type:'REPLACE_ALL',data:synced3});
             idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
+            cacheRemotePhotosToIdb(synced3.wombatPhotos,synced3.burrowPhotos,dispatch).catch(()=>{});
           }
         }).catch(()=>{});
       }
