@@ -38,7 +38,6 @@ button{cursor:pointer;font-family:inherit;border:none;background:none;padding:0;
 .leaflet-container{height:100%;width:100%;}
 @keyframes spin{to{transform:rotate(360deg)}}
 @keyframes syncBar{0%{opacity:1;transform:scaleX(0.2) translateX(-200%)}50%{opacity:1;transform:scaleX(0.6) translateX(50%)}100%{opacity:0;transform:scaleX(0.2) translateX(300%)}}
-@keyframes spin{to{transform:rotate(360deg)}}
 .search-input::placeholder{color:rgba(255,255,255,0.45);}
 /* Safe-area custom properties (populated by the browser) */
 :root{
@@ -119,7 +118,7 @@ const {useState,useEffect,useRef}=React;
      data.wombats       Wombat[]
      data.burrows       Burrow[]
      data.treatments    Treatment[]
-     data.sightings     Sighting[]
+     data.sightings     Sighting[]      (retained; not an active UI feature — see note in DATA SCHEMAS)
      data.burrowLogs    BurrowLog[]
      data.wombatPhotos  Photo[]
      data.burrowPhotos  Photo[]
@@ -130,7 +129,7 @@ const {useState,useEffect,useRef}=React;
 
    MODALS  Layered above screens via modal state string:
      'profile' | 'edit-profile' | 'faq' | 'export' | 'csv-import' |
-     'fab' | 'add-wombat' | 'add-burrow' | 'add-sighting'
+     'fab' | 'add-wombat' | 'add-burrow'
 
    THEMING  ThemeCtx provides the active token set (T.L / T.D).
      CSS custom properties mirror these for non-JS contexts.
@@ -150,6 +149,12 @@ const {useState,useEffect,useRef}=React;
    Single source of truth for all magic strings used across data,
    UI, CSV import normalisation, and filter logic.
 ════════════════════════════════════════════════════════════════ */
+
+// Domain constants — these define the valid string values for each field and serve as
+// a reference for anyone reading the code. Most UI components use the raw string
+// literals directly (e.g. 'under_treatment') rather than these constants, which keeps
+// JSX ChipPicker options readable. They ARE the canonical source of truth — if a value
+// ever needs renaming, change it here and update the strings throughout.
 
 // Wombat health statuses
 const WS={
@@ -326,7 +331,8 @@ const Ico={
      notes       string
      code        string      — auto-generated field (W0001, W0002…); reserved for
                               future use / data export; not currently displayed in UI
-     _sync       boolean     — true = pending sync to remote backend
+     _sync       boolean     — true = confirmed by server; false = local changes
+                             not yet pushed (local always wins next merge)
    }
 
    Burrow {
@@ -341,7 +347,7 @@ const Ico={
      lastChecked string      — ISO date; updated automatically by ADD_BURROW_LOG
      nextCheck   string      — ISO date; set manually or on log entry
      code        string      — auto-generated (B0001, B0002…); reserved / not displayed
-     _sync       boolean
+     _sync       boolean     — true = confirmed by server; false = pending push
    }
 
    Treatment {
@@ -357,17 +363,20 @@ const Ico={
                              NOTE: wombat.severity is updated separately to reflect
                              current status; regions here is the historical record
      note        string
-     _sync       boolean
+     _sync       boolean     — true = confirmed by server; false = pending push
    }
 
    Sighting {
+     NOTE: Sightings are retained in the data model and sync correctly, but there is
+     currently no UI to add or view them — sighting entry is not part of the active
+     volunteer workflow. The schema and seed data are kept for potential future use.
      id          string
      wombatId    string
      at          string      — ISO datetime
      lat         number|null
      lng         number|null
      note        string
-     _sync       boolean
+     _sync       boolean     — true = confirmed by server; false = pending push
    }
 
    BurrowLog {
@@ -379,7 +388,7 @@ const Ico={
      occupants   number      — estimated wombats using burrow
      note        string
      by          string      — volunteer name
-     _sync       boolean
+     _sync       boolean     — true = confirmed by server; false = pending push
    }
 
    Photo {
@@ -483,6 +492,7 @@ const SK={
   userName:     'ww_user_name',    // display name string
   signedIn:     'ww_signed_in',    // boolean — was user signed in at last launch
   offlineSaved: 'ww_offlineSaved', // boolean — offline-mode intro seen
+  streak:       'ww_streak',       // { count: number, weekKey: string } — volunteer streak
 };
 const load=()=>{try{return{
   wombats:JSON.parse(localStorage.getItem(SK.w))||[],
@@ -591,7 +601,6 @@ async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch){
 /* ── Streak helpers ──────────────────────────────────────────────
    A "week key" is YYYY-WNN. Any logging activity within a calendar
    week counts. Missing a full week resets the streak to 1.        */
-const STREAK_KEY='ww_streak';
 function getWeekKey(date=new Date()){
   const d=new Date(Date.UTC(date.getFullYear(),date.getMonth(),date.getDate()));
   d.setUTCDate(d.getUTCDate()+4-(d.getUTCDay()||7));
@@ -599,7 +608,7 @@ function getWeekKey(date=new Date()){
   const wk=Math.ceil(((d-new Date(Date.UTC(y,0,1)))/86400000+1)/7);
   return`${y}-W${String(wk).padStart(2,'0')}`;
 }
-function loadStreak(){try{return JSON.parse(localStorage.getItem(STREAK_KEY))||{count:0,weekKey:''};}catch{return{count:0,weekKey:''};}}
+function loadStreak(){try{return JSON.parse(localStorage.getItem(SK.streak))||{count:0,weekKey:''};}catch{return{count:0,weekKey:''};}}
 function touchStreak(){
   const now=getWeekKey();
   const s=loadStreak();
@@ -608,7 +617,7 @@ function touchStreak(){
   const prev=s.weekKey?new Date(s.weekKey.replace(/W(\d+)/,(_,w)=>`01-${String(w).padStart(2,'0')}`)):null;
   const gap=prev?Math.round((new Date(now.replace(/W(\d+)/,(_,w)=>`01-${String(w).padStart(2,'0')}`))-prev)/604800000):99;
   const count=gap<=1&&s.count>0?s.count+1:1;
-  try{localStorage.setItem(STREAK_KEY,JSON.stringify({count,weekKey:now}));}catch{}
+  try{localStorage.setItem(SK.streak,JSON.stringify({count,weekKey:now}));}catch{}
   return count;
 }
 
@@ -641,6 +650,8 @@ function compressImage(file,maxPx=1200,quality=0.75){
      • On each write: push to Supabase if online; queue if offline
      • On reconnect: flush offline queue
 ════════════════════════════════════════════════════════════════ */
+// The anon key is intentionally committed — Supabase anon keys are designed to be
+// public-facing. Row Level Security (RLS) on each table is what limits access.
 const SUPA_URL='https://xzfccubfoavpaqphofht.supabase.co';
 const SUPA_ANON='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh6ZmNjdWJmb2F2cGFxcGhvZmh0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY2Nzg0OTQsImV4cCI6MjA5MjI1NDQ5NH0.Fp9we2Y32s81cTPLWx1m4N7vGArFsHc3BdxxljZ1C8s';
 const supa=window.supabase.createClient(SUPA_URL,SUPA_ANON);
@@ -853,21 +864,57 @@ async function syncAction(action,userId){
   };
   try{
     switch(action.type){
-      case'ADD_WOMBAT':     await push('wombats',    wombatToDb(action.wombat,userId)); break;
+      case'ADD_WOMBAT': {
+        // If a burrow link was specified, skip this push — LINK_WOMBAT_BURROW will push the wombat
+        // immediately after with burrowIds already populated in localStorage. Pushing here first
+        // would race against that push and risk landing a wombat on Supabase with empty burrowIds.
+        if(!action.linkedBurrowId) await push('wombats',wombatToDb(action.wombat,userId));
+        break;
+      }
       // Apply patch directly rather than reading from localStorage — the React reducer
       // may not have committed to localStorage yet by the time syncAction runs.
       case'UPDATE_WOMBAT':       {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb({...w,...action.patch},userId));break;}
       case'MARK_WOMBAT_INACTIVE':{const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:action.inactiveAt,inactiveCause:action.inactiveCause||null,inactiveNotes:action.inactiveNotes||null},userId));break;}
       case'MARK_WOMBAT_ACTIVE':  {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:null,inactiveCause:null,inactiveNotes:null},userId));break;}
       case'IMPORT_WOMBATS': for(const w of action.wombats)await push('wombats',wombatToDb(w,userId)); break;
-      case'DELETE_WOMBAT':  await del('wombats',action.id); break; // ON DELETE CASCADE handles child records
+      case'DELETE_WOMBAT': {
+        await del('wombats',action.id);
+        // Explicitly delete child records — don't rely on CASCADE DELETE being configured in Supabase.
+        // IDs were captured at dispatch time (before the reducer wiped them from localStorage).
+        for(const tId of (action.treatmentIds||[]))     await del('treatments',    tId);
+        for(const pId of (action.wombatPhotoIds||[]))   await del('wombat_photos', pId);
+        // Push each previously-linked burrow so Supabase no longer shows the deleted wombat ID
+        // in their wombat_ids array. The reducer already removed it locally with _sync:false.
+        for(const bId of (action.burrowIds||[])){
+          const b=fromLS('b',bId);
+          if(b)await push('burrows',burrowToDb(b,userId));
+        }
+        break;
+      }
       case'ADD_BURROW':     await push('burrows',    burrowToDb(action.burrow,userId)); break;
       case'UPDATE_BURROW':  {const b=fromLS('b',action.id);if(b)await push('burrows',burrowToDb({...b,...action.patch},userId));break;}
       case'IMPORT_BURROWS': for(const b of action.burrows)await push('burrows',burrowToDb(b,userId)); break;
-      case'DELETE_BURROW':  await del('burrows',action.id); break; // ON DELETE CASCADE handles child records
+      case'DELETE_BURROW': {
+        await del('burrows',action.id);
+        // Explicitly delete child records — don't rely on CASCADE DELETE being configured in Supabase.
+        // IDs were captured at dispatch time (before the reducer wiped them from localStorage).
+        for(const lId of (action.burrowLogIds||[]))     await del('burrow_logs',   lId);
+        for(const pId of (action.burrowPhotoIds||[]))   await del('burrow_photos', pId);
+        // Push each previously-linked wombat so Supabase no longer shows the deleted burrow ID
+        // in their burrow_ids array. The reducer already removed it locally with _sync:false.
+        for(const wId of (action.wombatIds||[])){
+          const w=fromLS('w',wId);
+          if(w)await push('wombats',wombatToDb(w,userId));
+        }
+        break;
+      }
       case'ADD_TREATMENT':  await push('treatments', treatmentToDb(action.treatment,userId)); break;
       case'DELETE_TREATMENT': await del('treatments',action.treatmentId); break;
-      case'ADD_SIGHTING':   await push('sightings',  sightingToDb(action.sighting,userId)); break;
+      // Sightings are not an active UI feature — no volunteer-facing flow creates them.
+      // These cases are kept so existing sighting seed data syncs correctly if it
+      // exists in the DB, and to avoid silent failures if an action somehow fires.
+      case'ADD_SIGHTING':    await push('sightings',  sightingToDb(action.sighting,userId)); break;
+      case'DELETE_SIGHTING': await del('sightings',action.sightingId); break;
       case'ADD_BURROW_LOG': {
         await push('burrow_logs',burrowLogToDb(action.log,userId));
         // Apply the same logPatch the reducer uses so we don't rely on localStorage timing.
@@ -994,7 +1041,12 @@ async function supaFullSync(){
   // If there ARE pending upserts, the user added data offline before their first sync —
   // returning null here would cause the caller to wipe that unsynchronised data.
   const hasPendingUpserts=_pendingOps.some(op=>op.t==='upsert');
-  if(!(w?.length||0)&&!(b?.length||0)&&!hasPendingUpserts)return null; // confirmed new user, genuinely empty DB
+  // Only treat as a new user (return null → wipe local) if local storage is also empty.
+  // If wombats/burrows queries both failed (network hiccup) while another table succeeded,
+  // w and b are null — without this guard we'd mistake a partial failure for a new user
+  // and wipe everything the volunteer entered.
+  const localHasData=(JSON.parse(localStorage.getItem(SK.w)||'[]').length>0)||(JSON.parse(localStorage.getItem(SK.b)||'[]').length>0);
+  if(!(w?.length||0)&&!(b?.length||0)&&!hasPendingUpserts&&!localHasData)return null; // confirmed new user, genuinely empty DB
   // Pending upserts — local version must win over whatever the server returned
   const queuedIds=new Set(
     _pendingOps.filter(op=>op.t==='upsert'&&op.row&&op.row.id).map(op=>op.row.id)
@@ -1046,9 +1098,14 @@ function resolveWithCurrentQueue(merged){
     // Use local version when: (a) there's a pending queue op, or (b) record has
     // unsync'd local changes (_sync:false). The _sync:false flag is set whenever
     // the reducer applies a local edit; the push helper clears it to true on success.
+    // Exception: if local dataUrl is null (noB64 stripped the blob) but the server
+    // has a real Storage URL, keep the server's URL so photos don't go blank.
     const out=items.map(r=>{
       const loc=localById[r.id];
-      if(loc&&(qIds.has(r.id)||loc._sync===false))return loc;
+      if(loc&&(qIds.has(r.id)||loc._sync===false)){
+        if(loc.dataUrl==null&&r.dataUrl)return{...loc,dataUrl:r.dataUrl};
+        return loc;
+      }
       return r;
     }).filter(r=>!dIds.has(r.id));
     // Also include new local records created during the fetch (not on server yet)
@@ -1587,20 +1644,20 @@ function WeatherWidget(){
    RecoveryModal:  celebration shown when a wombat is marked healthy.
    Dashboard:      home screen — summary tiles, quick-add, streaks.
 ════════════════════════════════════════════════════════════════ */
-function ActivityScreen({data,nav}){
+function ActivityScreen({data,nav,dispatch}){
   const t=useTheme();
   const wombats=data.wombats;
   const burrows=data.burrows;
   const allActivity=[
     ...data.treatments.map(x=>({...x,type:'treatment',at:x.at})),
-    ...data.burrowLogs.map(x=>({...x,type:'burrowlog',at:x.at})),
+    ...(data.burrowLogs||[]).map(x=>({...x,type:'burrowlog',at:x.at})),
     ...wombats.filter(x=>x.firstSeen).map(x=>({...x,type:'wombat_added',at:x.firstSeen})),
     ...burrows.filter(x=>x.lastChecked).map(x=>({...x,type:'burrow_added',at:x.lastChecked})),
   ].sort((a,b)=>new Date(b.at)-new Date(a.at)).slice(0,100);
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
     <Header showBack onBack={()=>nav('dashboard')} title="All Activity" showAvatar={false}/>
     <div style={{padding:'20px var(--sp) 0',display:'flex',flexDirection:'column',gap:14}}>
-      {allActivity.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'40px 0',fontSize:14}}>No activity yet. Use the + button to log sightings or treatments.</div>}
+      {allActivity.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'40px 0',fontSize:14}}>No activity yet. Use the + button to add wombats, burrows, or treatments.</div>}
       {allActivity.map((a,i)=>{
         if(a.type==='treatment'){
           const w=wombats.find(x=>x.id===a.wombatId);
@@ -1709,12 +1766,8 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
   const allWombats=data.wombats; // all wombats (incl. inactive) for activity lookups
   const allActivity=[
     ...treatments.map(x=>({...x,type:'treatment',at:x.at})),
-    ...data.sightings.map(x=>({...x,type:'sighting',at:x.at})),
-    ...data.burrowLogs.map(x=>({...x,type:'burrowlog',at:x.at})),
     ...data.wombats.filter(x=>x.firstSeen).map(x=>({...x,type:'wombat_added',at:x.firstSeen})),
     ...burrows.filter(x=>x.lastChecked).map(x=>({...x,type:'burrow_added',at:x.lastChecked})),
-    ...(data.wombatPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'wombat_photo',at:x.at})),
-    ...(data.burrowPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'burrow_photo',at:x.at})),
   ].sort((a,b)=>new Date(b.at)-new Date(a.at)).slice(0,4);
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:20}}>
     <Header overline="WOMBATWATCH" title={<span>{(()=>{const h=new Date().getHours();return h<12?'Good morning':h<17?'Good afternoon':'Good evening';})()},<br/>Ranger! 👋</span>} subtitle="It's time to help some creatures" showAvatar onAvatarClick={openProfile}>
@@ -1741,7 +1794,7 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
     <div style={{padding:'20px var(--sp) 0'}}>
       <SectionLabel action={<button onClick={()=>nav('activity')} style={{fontSize:12.5,color:t.f700,fontWeight:600,background:'none',border:'none'}}>See all</button>}>Recent Activity</SectionLabel>
       <div style={{display:'flex',flexDirection:'column',gap:14}}>
-        {allActivity.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'20px 0',fontSize:14}}>No activity yet. Use the + button to log sightings or treatments.</div>}
+        {allActivity.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'20px 0',fontSize:14}}>No activity yet. Use the + button to add wombats, burrows, or treatments.</div>}
         {allActivity.map((a,i)=>{
           if(a.type==='treatment'){
             const w=allWombats.find(x=>x.id===a.wombatId);
@@ -2347,7 +2400,15 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
     {pendingDelete&&<ConfirmModal
       title={`Delete ${pendingDelete.name}?`}
       message={`This will permanently delete ${pendingDelete.name} and all their treatments, sightings, and photos. This cannot be undone.`}
-      onConfirm={()=>{dispatch({type:'DELETE_WOMBAT',id:pendingDelete.id});setPendingDelete(null);}}
+      onConfirm={()=>{
+        // Capture child IDs NOW — the reducer will wipe them from localStorage before syncAction runs.
+        // syncAction uses these to explicitly delete orphaned child records on the server
+        // (in case Supabase doesn't have CASCADE DELETE configured for these tables).
+        const treatmentIds=data.treatments.filter(tr=>tr.wombatId===pendingDelete.id).map(tr=>tr.id);
+        const wombatPhotoIds=data.wombatPhotos.filter(p=>p.wombatId===pendingDelete.id).map(p=>p.id);
+        dispatch({type:'DELETE_WOMBAT',id:pendingDelete.id,burrowIds:pendingDelete.burrowIds||[],treatmentIds,wombatPhotoIds});
+        setPendingDelete(null);
+      }}
       onCancel={()=>setPendingDelete(null)}
     />}
     {editingWombat&&<EditWombatModal
@@ -2725,7 +2786,13 @@ function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
     {pendingDelete&&<ConfirmModal
       title={`Delete ${pendingDelete.name}?`}
       message={`This will permanently delete ${pendingDelete.name} and all its check logs and photos. This cannot be undone.`}
-      onConfirm={()=>{dispatch({type:'DELETE_BURROW',id:pendingDelete.id});setPendingDelete(null);}}
+      onConfirm={()=>{
+        // Capture child IDs NOW — the reducer will wipe them from localStorage before syncAction runs.
+        const burrowLogIds=data.burrowLogs.filter(l=>l.burrowId===pendingDelete.id).map(l=>l.id);
+        const burrowPhotoIds=data.burrowPhotos.filter(p=>p.burrowId===pendingDelete.id).map(p=>p.id);
+        dispatch({type:'DELETE_BURROW',id:pendingDelete.id,wombatIds:pendingDelete.wombatIds||[],burrowLogIds,burrowPhotoIds});
+        setPendingDelete(null);
+      }}
       onCancel={()=>setPendingDelete(null)}
     />}
     {editingBurrow&&<EditBurrowModal
@@ -4451,11 +4518,13 @@ function reducer(state,action){
       // Cascade: remove all child records (treatments, sightings, photos)
       // and unlink from any burrows that referenced this wombat.
       // ON DELETE CASCADE in Supabase handles the server side; this mirrors it locally.
+      // _sync:false on affected burrows so the server version (still with the ghost wombat ID)
+      // doesn't win the next merge — syncAction will push the corrected burrows to Supabase.
       const wombats=state.wombats.filter(w=>w.id!==action.id);
       const treatments=state.treatments.filter(tr=>tr.wombatId!==action.id);
       const sightings=state.sightings.filter(s=>s.wombatId!==action.id);
       const wombatPhotos=state.wombatPhotos.filter(p=>p.wombatId!==action.id);
-      const burrows=state.burrows.map(b=>b.wombatIds?.includes(action.id)?{...b,wombatIds:b.wombatIds.filter(id=>id!==action.id)}:b);
+      const burrows=state.burrows.map(b=>b.wombatIds?.includes(action.id)?{...b,wombatIds:b.wombatIds.filter(id=>id!==action.id),_sync:false}:b);
       save('w',wombats);save('t',treatments);save('s',sightings);save('wp',wombatPhotos.map(noB64));save('b',burrows);
       return{...state,wombats,treatments,sightings,wombatPhotos,burrows};
     }
@@ -4467,10 +4536,12 @@ function reducer(state,action){
     // _sync:false mirrors the UPDATE_WOMBAT fix: local edit wins merge until server confirms.
     case 'DELETE_BURROW':{
       // Cascade: remove all child records (logs, photos) and unlink from wombats.
+      // _sync:false on affected wombats so the server version (still with the ghost burrow ID)
+      // doesn't win the next merge — syncAction will push the corrected wombats to Supabase.
       const burrows=state.burrows.filter(b=>b.id!==action.id);
       const burrowLogs=state.burrowLogs.filter(l=>l.burrowId!==action.id);
       const burrowPhotos=state.burrowPhotos.filter(p=>p.burrowId!==action.id);
-      const wombats=state.wombats.map(w=>w.burrowIds?.includes(action.id)?{...w,burrowIds:w.burrowIds.filter(id=>id!==action.id)}:w);
+      const wombats=state.wombats.map(w=>w.burrowIds?.includes(action.id)?{...w,burrowIds:w.burrowIds.filter(id=>id!==action.id),_sync:false}:w);
       save('b',burrows);save('bl',burrowLogs);save('bp',burrowPhotos.map(noB64));save('w',wombats);
       return{...state,burrows,burrowLogs,burrowPhotos,wombats};
     }
@@ -4480,7 +4551,10 @@ function reducer(state,action){
     case 'DELETE_TREATMENT':{const treatments=state.treatments.filter(tr=>tr.id!==action.treatmentId);save('t',treatments);return{...state,treatments};}
 
     // ── Sightings ────────────────────────────────────────────────
+    // Sighting cases — not an active UI feature but kept for data model completeness
+    // (seed data includes sightings; these ensure they persist correctly).
     case 'ADD_SIGHTING':{const sightings=[...state.sightings,action.sighting];save('s',sightings);return{...state,sightings};}
+    case 'DELETE_SIGHTING':{const sightings=state.sightings.filter(s=>s.id!==action.sightingId);save('s',sightings);return{...state,sightings};}
 
     // ── Photos ───────────────────────────────────────────────────
     // base64 blobs live in IDB; localStorage only holds metadata (dataUrl:null).
@@ -5284,7 +5358,7 @@ function App(){
   const [streak,setStreak]=useState(()=>loadStreak().count);
   const [recoveredWombat,setRecoveredWombat]=useState(null); // {name} when celebration shows
 
-  const ACTIVITY_ACTIONS=new Set(['ADD_TREATMENT','ADD_SIGHTING','ADD_BURROW_LOG','ADD_WOMBAT','ADD_BURROW']);
+  const ACTIVITY_ACTIONS=new Set(['ADD_TREATMENT','ADD_BURROW_LOG','ADD_WOMBAT','ADD_BURROW']);
 
   const syncDispatch=action=>{
     // Recovery celebration: catch a wombat being marked healthy from a treated state
@@ -5316,6 +5390,10 @@ function App(){
     }
     if(action.type==='DELETE_WOMBAT_PHOTO'&&action.photoId) idbDeletePhoto(action.photoId).catch(()=>{});
     if(action.type==='DELETE_BURROW_PHOTO'&&action.photoId) idbDeletePhoto(action.photoId).catch(()=>{});
+    // When an entire wombat/burrow is deleted, also purge their photos from IDB.
+    // The reducer strips dataUrls from localStorage but the blobs would otherwise linger in IDB.
+    if(action.type==='DELETE_WOMBAT') for(const pId of (action.wombatPhotoIds||[])) idbDeletePhoto(pId).catch(()=>{});
+    if(action.type==='DELETE_BURROW')  for(const pId of (action.burrowPhotoIds||[])) idbDeletePhoto(pId).catch(()=>{});
     dispatch(action);
     if(authUser)syncAction(action,authUser.id).catch(e=>console.warn('[Supa]',e)).finally(refreshQueue);
     else refreshQueue();
@@ -5382,9 +5460,8 @@ function App(){
       {modal==='export'&&authProfile?.role==='admin'&&<ExportSheet data={data} onClose={()=>setModal(null)}/>}
       {modal==='csv-import'&&authProfile?.role==='admin'&&<CSVImportModal onClose={()=>setModal(null)} onImportWombats={wombats=>{syncDispatch({type:'IMPORT_WOMBATS',wombats});nav('wombats');}} onImportBurrows={burrows=>{syncDispatch({type:'IMPORT_BURROWS',burrows});nav('burrows');}}/>}
       {modal==='fab'&&<FABSheet onClose={()=>setModal(null)} onSelect={fabSelect}/>}
-      {modal==='add-wombat'&&<AddWombatModal burrows={data.burrows} initialLocation={addAtLoc} nextCode={nextWombatCode(data.wombats)} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(w,linkedBurrowId,photo)=>{syncDispatch({type:'ADD_WOMBAT',wombat:w});if(linkedBurrowId)syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(photo)syncDispatch({type:'ADD_WOMBAT_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('wombat-profile',w.id);}}/>}
+      {modal==='add-wombat'&&<AddWombatModal burrows={data.burrows} initialLocation={addAtLoc} nextCode={nextWombatCode(data.wombats)} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(w,linkedBurrowId,photo)=>{syncDispatch({type:'ADD_WOMBAT',wombat:w,linkedBurrowId:linkedBurrowId||null});if(linkedBurrowId)syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(photo)syncDispatch({type:'ADD_WOMBAT_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('wombat-profile',w.id);}}/>}
       {modal==='add-burrow'&&<AddBurrowModal initialLocation={addAtLoc} nextCode={nextBurrowCode(data.burrows)} wombats={data.wombats} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(b,photo)=>{syncDispatch({type:'ADD_BURROW',burrow:b});(b.wombatIds||[]).forEach(wId=>syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:wId,burrowId:b.id}));if(photo)syncDispatch({type:'ADD_BURROW_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('burrow-profile',b.id);}}/>}
-      {modal==='add-sighting'&&<AddSightingModal wombats={data.wombats} onClose={()=>setModal(null)} onSave={s=>{syncDispatch({type:'ADD_SIGHTING',sighting:s});setModal(null);}}/>}
       {modal==='sign-in'&&<SignInModal onClose={()=>setModal(null)}/>}
       {recoveredWombat&&<RecoveryModal name={recoveredWombat.name} photoUrl={recoveredWombat.photoUrl} onClose={()=>setRecoveredWombat(null)}/>}
     </div>
