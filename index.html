@@ -613,6 +613,10 @@ async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch){
 // Called once on app mount (after hydratePhotos) and non-destructively — any photo
 // that is NOT blank is left entirely alone.
 async function recoverBlankPhotos(wombatPhotos,burrowPhotos,dispatch){
+  // Attempts to recover photos whose dataUrl is null by checking if Supabase Storage
+  // still has the file. Uses a direct GET (not HEAD — Supabase public buckets may reject
+  // HEAD from the browser) so the blob is fetched in one shot if present.
+  // Safe to call repeatedly; only processes null-dataUrl entries.
   if(!navigator.onLine)return;
   try{
     const all=[
@@ -621,34 +625,33 @@ async function recoverBlankPhotos(wombatPhotos,burrowPhotos,dispatch){
     ];
     const blanks=all.filter(p=>!p.dataUrl);
     if(!blanks.length)return;
+    console.info('[Recovery] Checking Storage for',blanks.length,'blank photo(s)…');
     const recovered={};
     for(const p of blanks){
       try{
         const{data:{publicUrl}}=supa.storage.from('photos').getPublicUrl(`${p.id}.jpg`);
-        // HEAD request to verify the file actually exists — getPublicUrl always
-        // returns a URL regardless of whether the file is present.
-        const head=await fetch(publicUrl,{method:'HEAD'});
-        if(!head.ok)continue;
-        // File confirmed in Storage — fetch the full blob for offline caching
+        // Attempt a GET — if the file doesn't exist Storage will return 400/404
         const res=await fetch(publicUrl);
-        if(!res.ok)continue;
+        if(!res.ok){
+          console.info('[Recovery] Not in Storage:',p.id,'(status',res.status+')');
+          continue;
+        }
         const blob=await res.blob();
         const dataUrl=await new Promise(resolve=>{
           const r=new FileReader();r.onload=()=>resolve(r.result);r.readAsDataURL(blob);
         });
         await idbPutPhoto(p.id,dataUrl);
         recovered[p.id]=dataUrl;
-        // Patch the Supabase table row with the recovered URL so future syncs don't
-        // re-introduce the blank. Use update (not upsert) to avoid touching other columns.
+        // Patch the Supabase table row so future syncs don't re-introduce the blank
         supa.from(p._table).update({data_url:publicUrl}).eq('id',p.id).then(null,()=>{});
-        // Patch localStorage so the merge doesn't overwrite the recovered URL with null
+        // Patch localStorage so the merge keeps the recovered URL
         try{
           const arr=JSON.parse(localStorage.getItem(SK[p._lk])||'[]');
           const patched=arr.map(r=>r.id===p.id?{...r,dataUrl:publicUrl,_sync:true}:r);
           localStorage.setItem(SK[p._lk],JSON.stringify(patched));
         }catch(e){}
-        console.info('[Recovery] Recovered blank photo from Storage:',p.id);
-      }catch(e){/* storage miss or network error — photo is genuinely lost */}
+        console.info('[Recovery] ✓ Recovered from Storage:',p.id);
+      }catch(e){console.info('[Recovery] Error for',p.id,e?.message);}
     }
     if(Object.keys(recovered).length)dispatch({type:'HYDRATE_PHOTO_DATA',map:recovered});
   }catch(e){}
@@ -2633,10 +2636,18 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
           {photos.map(p=><div key={p.id} style={{borderRadius:16,overflow:'hidden',position:'relative',background:t.soft,aspectRatio:'1'}}>
             {p.dataUrl
               ? <img src={p.dataUrl} style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}} alt=""/>
-              : <div style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:6,padding:8}}>
-                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" stroke={t.mid} strokeWidth="1.5"/><circle cx="12" cy="13" r="3" stroke={t.mid} strokeWidth="1.5"/></svg>
-                  <span style={{fontSize:10.5,color:t.mid,textAlign:'center',fontWeight:500,lineHeight:1.3}}>{p._sync===false?'Pending sync':'Unavailable'}</span>
-                </div>
+              : <label style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:7,padding:12,cursor:'pointer',boxSizing:'border-box'}}>
+                  <svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" stroke={t.mid} strokeWidth="1.5"/><circle cx="12" cy="13" r="3" stroke={t.mid} strokeWidth="1.5"/></svg>
+                  <span style={{fontSize:10.5,color:t.mid,textAlign:'center',fontWeight:500,lineHeight:1.4}}>{p._sync===false?'Pending…':'Tap to replace'}</span>
+                  <input type="file" accept="image/*" style={{display:'none'}} onChange={e=>{
+                    const file=e.target.files?.[0];if(!file)return;e.target.value='';
+                    compressImage(file).then(dataUrl=>{
+                      dispatch({type:'DELETE_WOMBAT_PHOTO',photoId:p.id});
+                      const np={id:'ph_'+Date.now(),wombatId:w.id,dataUrl,isProfile:p.isProfile,at:new Date().toISOString()};
+                      dispatch({type:'ADD_WOMBAT_PHOTO',photo:np});
+                    });
+                  }}/>
+                </label>
             }
             <div style={{position:'absolute',bottom:0,left:0,right:0,padding:'8px 8px 7px',background:'linear-gradient(transparent,rgba(0,0,0,0.72))',display:'flex',flexDirection:'column',gap:4}}>
               {p.at&&<div style={{fontSize:10.5,color:'rgba(255,255,255,0.75)',fontWeight:500}}>{fmtDate(p.at.slice(0,10))}</div>}
@@ -3012,10 +3023,18 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
           {bPhotos.map(p=><div key={p.id} style={{borderRadius:16,overflow:'hidden',position:'relative',background:t.soft,aspectRatio:'1'}}>
             {p.dataUrl
               ? <img src={p.dataUrl} style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}} alt=""/>
-              : <div style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:6,padding:8}}>
-                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" stroke={t.mid} strokeWidth="1.5"/><circle cx="12" cy="13" r="3" stroke={t.mid} strokeWidth="1.5"/></svg>
-                  <span style={{fontSize:10.5,color:t.mid,textAlign:'center',fontWeight:500,lineHeight:1.3}}>{p._sync===false?'Pending sync':'Unavailable'}</span>
-                </div>
+              : <label style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:7,padding:12,cursor:'pointer',boxSizing:'border-box'}}>
+                  <svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" stroke={t.mid} strokeWidth="1.5"/><circle cx="12" cy="13" r="3" stroke={t.mid} strokeWidth="1.5"/></svg>
+                  <span style={{fontSize:10.5,color:t.mid,textAlign:'center',fontWeight:500,lineHeight:1.4}}>{p._sync===false?'Pending…':'Tap to replace'}</span>
+                  <input type="file" accept="image/*" style={{display:'none'}} onChange={e=>{
+                    const file=e.target.files?.[0];if(!file)return;e.target.value='';
+                    compressImage(file).then(dataUrl=>{
+                      dispatch({type:'DELETE_BURROW_PHOTO',photoId:p.id});
+                      const np={id:'bph_'+Date.now(),burrowId:b.id,dataUrl,isProfile:p.isProfile,at:new Date().toISOString()};
+                      dispatch({type:'ADD_BURROW_PHOTO',photo:np});
+                    });
+                  }}/>
+                </label>
             }
             <div style={{position:'absolute',bottom:0,left:0,right:0,padding:'8px 8px 7px',background:'linear-gradient(transparent,rgba(0,0,0,0.6))',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
               {p.isProfile
@@ -5281,6 +5300,7 @@ function App(){
             idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
             // Cache any remote (https://) photos into IDB so they render offline
             cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
+            recoverBlankPhotos(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
             // Patch renumbered records back to Supabase so everyone stays consistent
             changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
             changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
@@ -5320,6 +5340,7 @@ function App(){
           dispatch({type:'REPLACE_ALL',data:synced});
           idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
           cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
+            recoverBlankPhotos(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
           changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
           changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
           geocodeBackfill(synced,dispatch);
@@ -5339,6 +5360,7 @@ function App(){
             dispatch({type:'REPLACE_ALL',data:synced});
             idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
             cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
+            recoverBlankPhotos(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
             changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
             changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
             geocodeBackfill(synced,dispatch);
@@ -5374,6 +5396,7 @@ function App(){
         dispatch({type:'REPLACE_ALL',data:synced2});
         idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
         cacheRemotePhotosToIdb(synced2.wombatPhotos,synced2.burrowPhotos,dispatch).catch(()=>{});
+            recoverBlankPhotos(synced2.wombatPhotos,synced2.burrowPhotos,dispatch).catch(()=>{});
       }).catch(()=>{});
     },120000); // every 2 minutes
     return()=>{
@@ -5408,6 +5431,7 @@ function App(){
             dispatch({type:'REPLACE_ALL',data:synced3});
             idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
             cacheRemotePhotosToIdb(synced3.wombatPhotos,synced3.burrowPhotos,dispatch).catch(()=>{});
+            recoverBlankPhotos(synced3.wombatPhotos,synced3.burrowPhotos,dispatch).catch(()=>{});
           }
         }).catch(()=>{});
       }
