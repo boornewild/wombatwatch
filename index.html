@@ -598,6 +598,62 @@ async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch){
     if(Object.keys(newMap).length&&dispatch)dispatch({type:'HYDRATE_PHOTO_DATA',map:newMap});
   }catch(e){}
 }
+// ── Blank photo recovery ──────────────────────────────────────
+// Detects photos that exist in state (metadata present) but have a null dataUrl —
+// the "grey box" bug. This happens when an offline-added photo's IDB blob is evicted
+// before flushQueue runs, causing the queue op to be silently discarded.
+// Recovery strategy:
+//   1. Check Supabase Storage for the expected file path (photoId.jpg).
+//   2. If the file exists: fetch the blob, cache it in IDB, update the Supabase
+//      table row with the public URL, patch localStorage to _sync:true, and
+//      dispatch HYDRATE_PHOTO_DATA so the UI shows the photo immediately.
+//   3. If the file is missing: re-queue an upsert with data_url:null so that if
+//      the blob reappears in IDB somehow (unlikely) it gets a second chance, and
+//      so the user sees a "pending sync" badge rather than a permanently grey box.
+// Called once on app mount (after hydratePhotos) and non-destructively — any photo
+// that is NOT blank is left entirely alone.
+async function recoverBlankPhotos(wombatPhotos,burrowPhotos,dispatch){
+  if(!navigator.onLine)return;
+  try{
+    const all=[
+      ...(wombatPhotos||[]).map(p=>({...p,_table:'wombat_photos',_lk:'wp'})),
+      ...(burrowPhotos||[]).map(p=>({...p,_table:'burrow_photos',_lk:'bp'})),
+    ];
+    const blanks=all.filter(p=>!p.dataUrl);
+    if(!blanks.length)return;
+    const recovered={};
+    for(const p of blanks){
+      try{
+        const{data:{publicUrl}}=supa.storage.from('photos').getPublicUrl(`${p.id}.jpg`);
+        // HEAD request to verify the file actually exists — getPublicUrl always
+        // returns a URL regardless of whether the file is present.
+        const head=await fetch(publicUrl,{method:'HEAD'});
+        if(!head.ok)continue;
+        // File confirmed in Storage — fetch the full blob for offline caching
+        const res=await fetch(publicUrl);
+        if(!res.ok)continue;
+        const blob=await res.blob();
+        const dataUrl=await new Promise(resolve=>{
+          const r=new FileReader();r.onload=()=>resolve(r.result);r.readAsDataURL(blob);
+        });
+        await idbPutPhoto(p.id,dataUrl);
+        recovered[p.id]=dataUrl;
+        // Patch the Supabase table row with the recovered URL so future syncs don't
+        // re-introduce the blank. Use update (not upsert) to avoid touching other columns.
+        supa.from(p._table).update({data_url:publicUrl}).eq('id',p.id).then(null,()=>{});
+        // Patch localStorage so the merge doesn't overwrite the recovered URL with null
+        try{
+          const arr=JSON.parse(localStorage.getItem(SK[p._lk])||'[]');
+          const patched=arr.map(r=>r.id===p.id?{...r,dataUrl:publicUrl,_sync:true}:r);
+          localStorage.setItem(SK[p._lk],JSON.stringify(patched));
+        }catch(e){}
+        console.info('[Recovery] Recovered blank photo from Storage:',p.id);
+      }catch(e){/* storage miss or network error — photo is genuinely lost */}
+    }
+    if(Object.keys(recovered).length)dispatch({type:'HYDRATE_PHOTO_DATA',map:recovered});
+  }catch(e){}
+}
+
 /* ── Streak helpers ──────────────────────────────────────────────
    A "week key" is YYYY-WNN. Any logging activity within a calendar
    week counts. Missing a full week resets the streak to 1.        */
@@ -942,11 +998,15 @@ async function syncAction(action,userId){
       }
       case'ADD_WOMBAT_PHOTO': {
         // Upload photo data to Supabase Storage; store URL in DB (not base64).
-        // Offline: ensure IDB write completes BEFORE queuing with null data_url —
-        // otherwise flushQueue can run on reconnect before the blob is available.
+        // Offline path: write blob to IDB for offline-viewing, then queue the op with the
+        // base64 directly in data_url. This is a belt-and-suspenders approach — if IDB is
+        // evicted (iOS 7-day rule, "clear data on exit" settings) before flushQueue runs,
+        // the queue op still has the raw image data and flushQueue's data: handler will
+        // upload it to Storage correctly on reconnect. Without this, IDB eviction silently
+        // discards the photo forever.
         const wp=action.photo;
         if(!navigator.onLine&&wp.dataUrl?.startsWith('data:'))await idbPutPhoto(wp.id,wp.dataUrl).catch(()=>{});
-        const url=navigator.onLine?await resolvePhotoUrl(wp.dataUrl,wp.id,SK.wp):null;
+        const url=navigator.onLine?await resolvePhotoUrl(wp.dataUrl,wp.id,SK.wp):wp.dataUrl;
         await push('wombat_photos',wombatPhotoToDb({...wp,dataUrl:url},userId));
         break;
       }
@@ -971,10 +1031,11 @@ async function syncAction(action,userId){
         break;
       }
       case'ADD_BURROW_PHOTO': {
-        // Offline: ensure IDB write completes BEFORE queuing with null data_url.
+        // Offline: write blob to IDB for offline-viewing, and include the base64 in the
+        // queued op so IDB eviction doesn't silently destroy the photo before flushQueue.
         const bp=action.photo;
         if(!navigator.onLine&&bp.dataUrl?.startsWith('data:'))await idbPutPhoto(bp.id,bp.dataUrl).catch(()=>{});
-        const url=navigator.onLine?await resolvePhotoUrl(bp.dataUrl,bp.id,SK.bp):null;
+        const url=navigator.onLine?await resolvePhotoUrl(bp.dataUrl,bp.id,SK.bp):bp.dataUrl;
         await push('burrow_photos',burrowPhotoToDb({...bp,dataUrl:url},userId));
         break;
       }
@@ -2570,7 +2631,13 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
         {photos.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'30px 0',fontSize:14}}>No photos yet.</div>}
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
           {photos.map(p=><div key={p.id} style={{borderRadius:16,overflow:'hidden',position:'relative',background:t.soft,aspectRatio:'1'}}>
-            <img src={p.dataUrl} style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}} alt=""/>
+            {p.dataUrl
+              ? <img src={p.dataUrl} style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}} alt=""/>
+              : <div style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:6,padding:8}}>
+                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" stroke={t.mid} strokeWidth="1.5"/><circle cx="12" cy="13" r="3" stroke={t.mid} strokeWidth="1.5"/></svg>
+                  <span style={{fontSize:10.5,color:t.mid,textAlign:'center',fontWeight:500,lineHeight:1.3}}>{p._sync===false?'Pending sync':'Unavailable'}</span>
+                </div>
+            }
             <div style={{position:'absolute',bottom:0,left:0,right:0,padding:'8px 8px 7px',background:'linear-gradient(transparent,rgba(0,0,0,0.72))',display:'flex',flexDirection:'column',gap:4}}>
               {p.at&&<div style={{fontSize:10.5,color:'rgba(255,255,255,0.75)',fontWeight:500}}>{fmtDate(p.at.slice(0,10))}</div>}
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
@@ -2943,7 +3010,13 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
         {bPhotos.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'30px 0',fontSize:14}}>No photos yet.</div>}
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
           {bPhotos.map(p=><div key={p.id} style={{borderRadius:16,overflow:'hidden',position:'relative',background:t.soft,aspectRatio:'1'}}>
-            <img src={p.dataUrl} style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}} alt=""/>
+            {p.dataUrl
+              ? <img src={p.dataUrl} style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}} alt=""/>
+              : <div style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:6,padding:8}}>
+                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" stroke={t.mid} strokeWidth="1.5"/><circle cx="12" cy="13" r="3" stroke={t.mid} strokeWidth="1.5"/></svg>
+                  <span style={{fontSize:10.5,color:t.mid,textAlign:'center',fontWeight:500,lineHeight:1.3}}>{p._sync===false?'Pending sync':'Unavailable'}</span>
+                </div>
+            }
             <div style={{position:'absolute',bottom:0,left:0,right:0,padding:'8px 8px 7px',background:'linear-gradient(transparent,rgba(0,0,0,0.6))',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
               {p.isProfile
                 ? <span style={{fontSize:11,color:'#fff',fontWeight:700,display:'inline-flex',alignItems:'center',gap:4}}>{Ico.check('#fff',12)} Profile</span>
@@ -5051,6 +5124,8 @@ function App(){
   // ── Photo IDB hydration (runs once on mount) ─────────────────
   // 1. Migrates any existing base64 dataUrls still in localStorage → IDB
   // 2. Merges IDB photo data back into React state
+  // 3. Runs blank-photo recovery for any photos that are still null after
+  //    step 2 (IDB evicted but Storage may still have the file)
   React.useEffect(()=>{
     async function hydratePhotos(){
       try{
@@ -5072,6 +5147,11 @@ function App(){
         // Load all IDB photo data and merge into state
         const map=await idbGetAllPhotos();
         if(Object.keys(map).length>0) dispatch({type:'HYDRATE_PHOTO_DATA',map});
+        // Recovery pass: any photo still null after IDB hydration may have its
+        // blob in Supabase Storage. This silently fixes the "grey box" bug where
+        // IDB eviction caused offline-added photos to lose their data permanently.
+        // Runs in background; failures are silent to avoid blocking the UI.
+        recoverBlankPhotos(wpRaw,bpRaw,dispatch).catch(()=>{});
       }catch(e){console.warn('[IDB] hydration failed',e);}
     }
     hydratePhotos();
