@@ -800,6 +800,33 @@ async function resolvePhotoUrl(dataUrl,photoId,localKey){
   return url||dataUrl; // fall back to base64 if storage fails (still functional, just big)
 }
 
+// ── Recently-deleted ID cache ─────────────────────────────────
+// When a delete reaches Supabase successfully, we remove the op from the pending queue.
+// But if supaFullSync was already in flight at that moment, its stale response still
+// contains the deleted record — and since the op is no longer in the queue, deletedIds
+// won't filter it out, causing the record to reappear in the UI ("zombie resurrection").
+// Fix: track successfully-deleted IDs for 5 minutes so the merge can filter them even
+// after the queue op is gone. Entries older than 5 min are pruned automatically.
+const SD_KEY='ww_sync_deleted'; // recently-deleted cache
+const SD_TTL=5*60*1000; // 5 minutes
+function markRecentlyDeleted(id){
+  try{
+    const m=JSON.parse(localStorage.getItem(SD_KEY)||'{}');
+    m[id]=Date.now();
+    // Prune stale entries while we're here
+    const now=Date.now();
+    Object.keys(m).forEach(k=>{if(now-m[k]>SD_TTL)delete m[k];});
+    localStorage.setItem(SD_KEY,JSON.stringify(m));
+  }catch(e){}
+}
+function getRecentlyDeleted(){
+  try{
+    const m=JSON.parse(localStorage.getItem(SD_KEY)||'{}');
+    const now=Date.now();
+    return new Set(Object.keys(m).filter(k=>now-m[k]<SD_TTL));
+  }catch(e){return new Set();}
+}
+
 // ── Offline queue ─────────────────────────────────────────────
 const SQ_KEY='ww_sync_queue';
 const SQ_MAX_RETRIES=5; // drop an op after this many consecutive failures
@@ -863,10 +890,14 @@ async function flushQueue(userId){
           if(lk){
             try{
               const arr=JSON.parse(localStorage.getItem(SK[lk])||'[]');
-              const patched=arr.map(r=>r.id===op.row.id?{...r,_sync:true}:r);
+              const patched=arr.map(r=>r.id===op.row.id?{...r,_sync:true,_pushedAt:Date.now()}:r);
               localStorage.setItem(SK[lk],JSON.stringify(patched));
             }catch(e){}
           }
+        }else if(op.t==='delete'&&op.id){
+          // Mirror syncAction's del(): mark in the recently-deleted cache so in-flight syncs
+          // don't re-introduce this record when the queue op is no longer present.
+          markRecentlyDeleted(op.id);
         }
       }else{
         const retries=(op._retries||0)+1;
@@ -896,13 +927,14 @@ async function syncAction(action,userId){
     try{
       const ok=await supaUpsert(table,r);
       if(!ok){queueOp({t:'upsert',table,row:r});return;}
-      // Mark _sync:true so resolveWithCurrentQueue knows the push was confirmed and
-      // won't permanently block server-side changes from landing on next sync.
+      // Mark _sync:true so resolveWithCurrentQueue knows the push was confirmed, and
+      // record _pushedAt so it can detect pushes that completed while a sync fetch was
+      // already in flight (those pushes should still win over the stale server response).
       const lk=lsKeyMap[table];
       if(lk&&r.id){
         try{
           const arr=JSON.parse(localStorage.getItem(SK[lk])||'[]');
-          const patched=arr.map(rec=>rec.id===r.id?{...rec,_sync:true}:rec);
+          const patched=arr.map(rec=>rec.id===r.id?{...rec,_sync:true,_pushedAt:Date.now()}:rec);
           localStorage.setItem(SK[lk],JSON.stringify(patched));
         }catch(e){}
       }
@@ -915,7 +947,10 @@ async function syncAction(action,userId){
     if(!navigator.onLine){queueOp({t:'delete',table,id});return;}
     try{
       const ok=await supaDelete(table,id);
-      if(!ok)queueOp({t:'delete',table,id});
+      // On success, record the ID in the recently-deleted cache so supaFullSync can
+      // filter it out even if its fetch was already in flight when the delete completed.
+      if(ok)markRecentlyDeleted(id);
+      else queueOp({t:'delete',table,id});
     }catch(e){
       console.warn('[Supa] del threw, queuing for retry:',table,id,e);
       queueOp({t:'delete',table,id});
@@ -1079,6 +1114,9 @@ async function syncAction(action,userId){
 // timeout, etc.) doesn't abort the entire sync — the app just keeps
 // whatever local data it had for that table.
 async function supaFullSync(){
+  // Record when the fetch started so resolveWithCurrentQueue can distinguish pushes
+  // that completed DURING the flight (those pushes should still beat the stale response).
+  const _fetchStart=Date.now();
   const results=await Promise.allSettled([
     supa.from('wombats').select('*'),
     supa.from('burrows').select('*'),
@@ -1121,6 +1159,11 @@ async function supaFullSync(){
   const deletedIds=new Set(
     _pendingOps.filter(op=>op.t==='delete'&&op.id).map(op=>op.id)
   );
+  // Recently-deleted IDs (deletes that already succeeded but whose queue op is now gone).
+  // These are needed to handle the zombie-resurrection race: a delete completes, clears its
+  // queue op, but this fetch was already in flight so the server response still contains
+  // the deleted record. Without this filter it reappears as if never deleted.
+  const recentlyDeleted=getRecentlyDeleted();
   const merge=(remote,localKey,conv)=>{
     const local=JSON.parse(localStorage.getItem(SK[localKey])||'[]');
     // If this table's query failed entirely (permissions error, network blip, etc.),
@@ -1130,10 +1173,11 @@ async function supaFullSync(){
     const map=Object.fromEntries(remote.map(r=>[r.id,conv(r)]));
     // Local record wins if: never synced to server (!_sync), OR has a pending edit in the queue
     local.filter(r=>!r._sync||queuedIds.has(r.id)).forEach(r=>{map[r.id]=r;});
-    // Strip out anything the user deleted offline but hasn't uploaded yet
-    return Object.values(map).filter(r=>!deletedIds.has(r.id));
+    // Strip out anything the user deleted (pending queue op OR recently-completed delete)
+    return Object.values(map).filter(r=>!deletedIds.has(r.id)&&!recentlyDeleted.has(r.id));
   };
   return{
+    _fetchStart,  // consumed by resolveWithCurrentQueue to detect in-flight push races
     wombats:     merge(w, 'w',  dbToWombat),
     burrows:     merge(b, 'b',  dbToBurrow),
     treatments:  merge(t, 't',  dbToTreatment),
@@ -1155,18 +1199,30 @@ function resolveWithCurrentQueue(merged){
   try{q=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');}catch(e){}
   const qIds=new Set(q.filter(op=>op.t==='upsert'&&op.row?.id).map(op=>op.row.id));
   const dIds=new Set(q.filter(op=>op.t==='delete'&&op.id).map(op=>op.id));
-  if(!qIds.size&&!dIds.size)return merged; // fast path: nothing changed during fetch
+  // fetchStart: timestamp recorded at the very start of the supaFullSync fetch.
+  // Any local record whose push completed AFTER fetchStart means the server response
+  // is stale relative to that push — local wins even though _sync is true.
+  const fetchStart=merged._fetchStart||0;
   const fix=(items,lsKey)=>{
     const local=JSON.parse(localStorage.getItem(SK[lsKey])||'[]');
     const localById=Object.fromEntries(local.map(r=>[r.id,r]));
-    // Use local version when: (a) there's a pending queue op, or (b) record has
-    // unsync'd local changes (_sync:false). The _sync:false flag is set whenever
-    // the reducer applies a local edit; the push helper clears it to true on success.
+    // Use local version when ANY of these are true:
+    //   (a) pending queue op exists for this record
+    //   (b) record has unsync'd local changes (_sync:false)
+    //   (c) record was pushed successfully AFTER this fetch started (_pushedAt > fetchStart)
+    //       — the server response is stale relative to the local push
     // Exception: if local dataUrl is null (noB64 stripped the blob) but the server
-    // has a real Storage URL, keep the server's URL so photos don't go blank.
+    // has a real Storage URL, always keep the server's URL so photos don't go blank.
+    const localWins=(loc,r)=>{
+      if(!loc)return false;
+      if(qIds.has(r.id))return true;
+      if(loc._sync===false)return true;
+      if(loc._pushedAt&&fetchStart&&loc._pushedAt>fetchStart)return true;
+      return false;
+    };
     const out=items.map(r=>{
       const loc=localById[r.id];
-      if(loc&&(qIds.has(r.id)||loc._sync===false)){
+      if(localWins(loc,r)){
         if(loc.dataUrl==null&&r.dataUrl)return{...loc,dataUrl:r.dataUrl};
         return loc;
       }
