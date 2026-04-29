@@ -667,15 +667,48 @@ function getWeekKey(date=new Date()){
   const wk=Math.ceil(((d-new Date(Date.UTC(y,0,1)))/86400000+1)/7);
   return`${y}-W${String(wk).padStart(2,'0')}`;
 }
+// Convert an ISO week key (e.g. '2026-W18') to the Monday of that week as a UTC Date.
+// This is the only correct way to calculate week gaps — naive string arithmetic on the
+// week number gives wildly wrong results (e.g. '2026-W18' → '2026-01-18' = January 18,
+// which is nothing to do with week 18). Year-boundary transitions (W52 → W01) are also
+// handled correctly because we anchor to Jan 4 (always in ISO week 1).
+function weekKeyToDate(wk){
+  if(!wk)return null;
+  try{
+    const[ys,ws]=wk.split('-W');
+    const y=Number(ys),w=Number(ws);
+    if(!y||!w)return null;
+    const jan4=new Date(Date.UTC(y,0,4)); // Jan 4 is always in ISO week 1
+    const mon1=new Date(jan4);
+    mon1.setUTCDate(jan4.getUTCDate()-(jan4.getUTCDay()||7)+1); // Monday of week 1
+    return new Date(mon1.getTime()+(w-1)*7*86400000);
+  }catch{return null;}
+}
+function weekGap(wk1,wk2){
+  const d1=weekKeyToDate(wk1),d2=weekKeyToDate(wk2);
+  if(!d1||!d2)return 99;
+  return Math.round(Math.abs(d1.getTime()-d2.getTime())/(7*86400000));
+}
 function loadStreak(){try{return JSON.parse(localStorage.getItem(SK.streak))||{count:0,weekKey:''};}catch{return{count:0,weekKey:''};}}
+// Returns the streak count the UI should display. Shows the streak if:
+//   - The user logged activity this week (weekKey === now), OR
+//   - The user logged last week and hasn't yet this week (streak still alive — show it to
+//     encourage them to act before the week is over).
+// Returns 0 if the streak has expired (gap > 1 week) so the pill correctly disappears.
+function activeStreakCount(){
+  const s=loadStreak();
+  if(!s.count)return 0;
+  const gap=weekGap(getWeekKey(),s.weekKey);
+  return gap<=1?s.count:0; // expired if more than 1 week since last activity
+}
 function touchStreak(){
   const now=getWeekKey();
   const s=loadStreak();
-  if(s.weekKey===now)return s.count; // already active this week
-  // Work out how many weeks gap between last active week and now
-  const prev=s.weekKey?new Date(s.weekKey.replace(/W(\d+)/,(_,w)=>`01-${String(w).padStart(2,'0')}`)):null;
-  const gap=prev?Math.round((new Date(now.replace(/W(\d+)/,(_,w)=>`01-${String(w).padStart(2,'0')}`))-prev)/604800000):99;
-  const count=gap<=1&&s.count>0?s.count+1:1;
+  if(s.weekKey===now)return s.count; // already active this week — no change
+  // Compute gap in whole weeks between last active week and now using proper date math.
+  // gap=1 → consecutive weeks (increment streak); gap>1 → missed week(s) (reset to 1).
+  const gap=weekGap(now,s.weekKey||'');
+  const count=gap===1&&s.count>0?s.count+1:1;
   try{localStorage.setItem(SK.streak,JSON.stringify({count,weekKey:now}));}catch{}
   return count;
 }
@@ -3859,8 +3892,17 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
           <div style={{fontSize:17,fontWeight:700,color:t.ink,flex:1}}>Pick location</div>
           {picked&&<button onClick={()=>onConfirm(picked)} style={{padding:'8px 16px',borderRadius:12,background:t.f700,color:'#fff',fontSize:13,fontWeight:700,border:'none',cursor:'pointer'}}>Confirm</button>}
         </div>
-        <div style={{flex:1,position:'relative'}}>
-          <div ref={mapRef} style={{width:'100%',height:'100%'}}/>
+        {/* touch-action:none tells the browser to give ALL touch input to JS (Leaflet)
+            rather than applying native scroll/pan — this is required for Leaflet panning
+            to work when the map sits inside an overflow:auto ancestor (ModalWrap).
+            stopPropagation on touch events prevents the overflowY:auto ModalWrap panel
+            from seeing the drag and consuming it as a page scroll. */}
+        <div style={{flex:1,position:'relative'}}
+          onTouchStart={e=>e.stopPropagation()}
+          onTouchMove={e=>e.stopPropagation()}
+          onTouchEnd={e=>e.stopPropagation()}
+        >
+          <div ref={mapRef} style={{width:'100%',height:'100%',touchAction:'none'}}/>
           {/* Map control buttons: GPS snap + satellite toggle */}
           <div style={{position:'absolute',bottom:16,right:16,zIndex:500,display:'flex',flexDirection:'column',gap:8}}>
             <button
@@ -5515,7 +5557,9 @@ function App(){
   // Calls the reducer synchronously then pushes the action to Supabase.
   // Offline writes are queued in localStorage and flushed on reconnect.
   // ── Streak ───────────────────────────────────────────────────
-  const [streak,setStreak]=useState(()=>loadStreak().count);
+  // activeStreakCount() validates expiry on mount — if the stored weekKey is more than
+  // 1 week old the streak has lapsed and we return 0 so the pill doesn't show stale data.
+  const [streak,setStreak]=useState(()=>activeStreakCount());
   const [recoveredWombat,setRecoveredWombat]=useState(null); // {name} when celebration shows
 
   const ACTIVITY_ACTIONS=new Set(['ADD_TREATMENT','ADD_BURROW_LOG','ADD_WOMBAT','ADD_BURROW']);
