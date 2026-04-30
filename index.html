@@ -1283,6 +1283,16 @@ async function supaFullSync(){
     // remote is null. We can't safely merge — keep everything local so we don't
     // silently drop records that were previously synced (_sync:true).
     if(remote===null)return local;
+    // CRITICAL: If the server returns an empty array but we have locally-synced records,
+    // something is wrong (expired token returning 0 rows, RLS edge case, transient outage).
+    // A legitimately empty table for an established user is essentially impossible —
+    // we already gate new-user detection above with the null return path.
+    // Treat an unexpected empty response as a failed query: keep local to prevent silent deletion.
+    const syncedLocalCount=local.filter(r=>r._sync&&!deletedIds.has(r.id)&&!recentlyDeleted.has(r.id)).length;
+    if(remote.length===0&&syncedLocalCount>0){
+      console.warn('[Sync] Server returned empty for',localKey,'but',syncedLocalCount,'synced local records exist — keeping local to prevent data loss');
+      return local.filter(r=>!deletedIds.has(r.id)&&!recentlyDeleted.has(r.id));
+    }
     const map=Object.fromEntries(remote.map(r=>[r.id,conv(r)]));
     // Local record wins if: never synced to server (!_sync), OR has a pending edit in the queue
     local.filter(r=>!r._sync||queuedIds.has(r.id)).forEach(r=>{map[r.id]=r;});
