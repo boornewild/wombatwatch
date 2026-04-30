@@ -813,6 +813,10 @@ async function uploadPhotoToStorage(dataUrl,photoId,localStorageKey){
     const{error}=await supa.storage.from('photos').upload(path,blob,{upsert:true,contentType:'image/jpeg'});
     if(error){console.warn('[Storage]',error.message);return null;}
     const{data:{publicUrl}}=supa.storage.from('photos').getPublicUrl(path);
+    // Cache blob to IDB immediately so the photo is available offline right away —
+    // without this there is a window between upload and the next supaFullSync where
+    // IDB has no entry for this photo and an offline reload shows a broken image.
+    idbPutPhoto(photoId,dataUrl).catch(()=>{});
     // Patch localStorage so this photo is stored as a URL (not base64) going forward
     if(localStorageKey){
       try{
@@ -1347,9 +1351,16 @@ function WombatAvatarDark({size=60}){
     {Ico.wombat('#A8D4B8',Math.round(size*0.54))}
   </div>;
 }
-function WAvatar({size=60,photoUrl=null}){
+function WAvatar({size=60,photoUrl=null,photoId=null}){
   const t=useTheme();
-  if(photoUrl)return <div style={{width:size,height:size,borderRadius:Math.round(size*0.22),overflow:'hidden',flexShrink:0}}><img src={photoUrl} style={{width:'100%',height:'100%',objectFit:'cover'}} alt=""/></div>;
+  const [src,setSrc]=React.useState(photoUrl);
+  React.useEffect(()=>setSrc(photoUrl),[photoUrl]);
+  const onError=React.useCallback(()=>{
+    if(photoId){
+      idbGetPhoto(photoId).then(b=>{if(b)setSrc(b);else setSrc(null);}).catch(()=>setSrc(null));
+    }else setSrc(null);
+  },[photoId]);
+  if(src)return <div style={{width:size,height:size,borderRadius:Math.round(size*0.22),overflow:'hidden',flexShrink:0}}><img src={src} style={{width:'100%',height:'100%',objectFit:'cover'}} alt="" onError={onError}/></div>;
   return t===T.D?<WombatAvatarDark size={size}/>:<WombatAvatar size={size}/>;
 }
 function BurrowAvatar({size=48}){
@@ -1361,8 +1372,15 @@ function BurrowAvatar({size=48}){
     </svg>
   </div>;
 }
-function BAvatar({size=60,photoUrl=null}){
-  if(photoUrl)return <div style={{width:size,height:size,borderRadius:Math.round(size*0.28),overflow:'hidden',flexShrink:0}}><img src={photoUrl} style={{width:'100%',height:'100%',objectFit:'cover'}} alt=""/></div>;
+function BAvatar({size=60,photoUrl=null,photoId=null}){
+  const [src,setSrc]=React.useState(photoUrl);
+  React.useEffect(()=>setSrc(photoUrl),[photoUrl]);
+  const onError=React.useCallback(()=>{
+    if(photoId){
+      idbGetPhoto(photoId).then(b=>{if(b)setSrc(b);else setSrc(null);}).catch(()=>setSrc(null));
+    }else setSrc(null);
+  },[photoId]);
+  if(src)return <div style={{width:size,height:size,borderRadius:Math.round(size*0.28),overflow:'hidden',flexShrink:0}}><img src={src} style={{width:'100%',height:'100%',objectFit:'cover'}} alt="" onError={onError}/></div>;
   return <BurrowAvatar size={size}/>;
 }
 function SyncChip({online,pending}){
@@ -2007,7 +2025,7 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
           if(a.type==='wombat_photo'){
             const w=allWombats.find(x=>x.id===a.wombatId);
             return <Card key={i} padding={12} onClick={()=>w&&nav('wombat-profile',w.id)} style={{display:'flex',alignItems:'center',gap:12,cursor:w?'pointer':'default'}}>
-              <WAvatar size={44} photoUrl={a.dataUrl}/>
+              <WAvatar size={44} photoUrl={a.dataUrl} photoId={a.id}/>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{w?.name||'Unknown Wombat'}</div>
                 <div style={{fontSize:12,color:t.mid,marginTop:2}}>Photo added · {fmtDate(a.at)}</div>
@@ -2018,7 +2036,7 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
           if(a.type==='burrow_photo'){
             const b=burrows.find(x=>x.id===a.burrowId);
             return <Card key={i} padding={12} onClick={()=>b&&nav('burrow-profile',b.id)} style={{display:'flex',alignItems:'center',gap:12,cursor:b?'pointer':'default'}}>
-              <BAvatar size={44} photoUrl={a.dataUrl}/>
+              <BAvatar size={44} photoUrl={a.dataUrl} photoId={a.id}/>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{b?.name||'Unknown Burrow'}</div>
                 <div style={{fontSize:12,color:t.mid,marginTop:2}}>Photo added · {fmtDate(a.at)}</div>
@@ -2097,10 +2115,18 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
   const [searchQuery,setSearchQuery]=useState('');
 
   // ── Offline map state ─────────────────────────────────────────────
-  const [dlState,setDlState]=useState('checking'); // checking|idle|downloading|done|unsupported
+  // Seed dlState from localStorage so the tick shows instantly on re-mount
+  // rather than flashing the cloud icon while the async cache check runs.
+  const [dlState,setDlState]=useState(()=>{
+    if(!('caches' in window))return 'unsupported';
+    return localStorage.getItem(SK.offlineSaved)?'done':'checking';
+  });
   const [dlProgress,setDlProgress]=useState({done:0,total:OFFLINE_TILES.length});
   const [showOffSheet,setShowOffSheet]=useState(false);
-  const [offMeta,setOffMeta]=useState(null); // {savedAt}
+  const [offMeta,setOffMeta]=useState(()=>{
+    const s=localStorage.getItem(SK.offlineSaved);
+    return s?{savedAt:s}:null;
+  });
 
   useEffect(()=>{
     if(!('caches' in window)){setDlState('unsupported');return;}
@@ -2111,7 +2137,12 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
         setDlState('done');
         setOffMeta({savedAt:localStorage.getItem(SK.offlineSaved)||'previously'});
       } else {
+        // Cache was cleared externally (e.g. browser evicted it) — reset so
+        // the user can re-download. Also clear the localStorage sentinel so
+        // future mounts don't optimistically show 'done' for an empty cache.
+        localStorage.removeItem(SK.offlineSaved);
         setDlState('idle');
+        setOffMeta(null);
       }
     }).catch(()=>setDlState('idle'));
   },[]);
@@ -2336,9 +2367,22 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
         {Ico.layers(satellite?'#fff':t.f700,20)}
       </button>
       <div style={{height:4}}/>
-      {/* Offline maps button */}
+      {/* Offline maps button — tap opens sheet when not yet downloaded;
+          when done the tick stays put and is non-interactive (hold to manage) */}
       {dlState!=='unsupported'&&(
-        <button onClick={()=>setShowOffSheet(s=>!s)} style={{width:44,height:44,borderRadius:12,background:dlState==='done'?t.sage50:t.surface,boxShadow:'0 2px 10px rgba(0,0,0,0.18)',border:dlState==='done'?`1.5px solid ${t.sage700}`:'none',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',cursor:'pointer',gap:1}}>
+        <button
+          onClick={()=>{ if(dlState==='done') return; setShowOffSheet(s=>!s); }}
+          onContextMenu={e=>{e.preventDefault();if(dlState==='done')setShowOffSheet(s=>!s);}}
+          onTouchStart={e=>{
+            if(dlState!=='done')return;
+            // Long-press (600ms) on the tick opens the manage sheet
+            const t2=setTimeout(()=>setShowOffSheet(s=>!s),600);
+            const up=()=>clearTimeout(t2);
+            e.target.addEventListener('touchend',up,{once:true});
+            e.target.addEventListener('touchmove',up,{once:true});
+          }}
+          title={dlState==='done'?`Map saved${offMeta?.savedAt?' '+offMeta.savedAt:''}. Hold to manage.`:undefined}
+          style={{width:44,height:44,borderRadius:12,background:dlState==='done'?t.sage50:t.surface,boxShadow:'0 2px 10px rgba(0,0,0,0.18)',border:dlState==='done'?`1.5px solid ${t.sage700}`:'none',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',cursor:dlState==='done'?'default':'pointer',gap:1}}>
           {dlState==='downloading'
             ? <><span style={{fontSize:8,fontWeight:700,color:t.f700,lineHeight:1}}>{Math.round(dlProgress.done/dlProgress.total*100)}%</span>{Ico.cloud(t.f700,16)}</>
             : dlState==='done'
@@ -2508,7 +2552,7 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
           <button onClick={()=>nav('wombat-profile',w.id)} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
             <Card padding={16} style={{border:`1px solid rgba(45,95,63,0.1)`}}>
               <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
-                <WAvatar size={72} photoUrl={profilePhoto?.dataUrl}/>
+                <WAvatar size={72} photoUrl={profilePhoto?.dataUrl} photoId={profilePhoto?.id}/>
                 <div style={{flex:1,minWidth:0}}>
                   <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:8}}>
                     <div style={{flex:1,minWidth:0}}>
@@ -2532,7 +2576,7 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
         return <button key={w.id} onClick={()=>nav('wombat-profile',w.id)} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
           <Card padding={16} style={{border:`1px solid rgba(45,95,63,0.1)`}}>
             <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
-              <WAvatar size={72} photoUrl={profilePhoto?.dataUrl}/>
+              <WAvatar size={72} photoUrl={profilePhoto?.dataUrl} photoId={profilePhoto?.id}/>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:8}}>
                   <div style={{flex:1,minWidth:0}}>
@@ -2570,6 +2614,62 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
       onClose={()=>setEditingWombat(null)}
       onSave={patch=>{dispatch({type:'UPDATE_WOMBAT',id:editingWombat.id,patch});setEditingWombat(null);}}
     />}
+  </div>;
+}
+
+/* ── PHOTO CELL ──────────────────────────────────────────────
+   Handles three distinct states:
+   • null dataUrl   → "Tap to replace" (file never existed / pending upload)
+   • truthy dataUrl → shows photo; on load error tries IDB then shows
+                      "Unavailable offline" (not "Tap to replace") so the
+                      user knows the file still exists on the server
+   • IDB hit after error → seamlessly swaps src, no flicker
+──────────────────────────────────────────────────────────── */
+function PhotoCell({photo,onReplace,onDelete,onSetProfile,labelDelete='Delete',setProfileLabel='Set profile',isProfile=false,newIdPrefix='ph_',t}){
+  const [errored,setErrored]=React.useState(false);
+  const [recoveredSrc,setRecoveredSrc]=React.useState(null);
+  // Reset when photo changes (e.g. after replacement)
+  React.useEffect(()=>{setErrored(false);setRecoveredSrc(null);},[photo.id,photo.dataUrl]);
+  const handleError=React.useCallback(()=>{
+    idbGetPhoto(photo.id).then(b=>{
+      if(b)setRecoveredSrc(b);
+      else setErrored(true);
+    }).catch(()=>setErrored(true));
+  },[photo.id]);
+  const src=recoveredSrc||photo.dataUrl;
+  const cellStyle={width:'100%',height:'100%',objectFit:'cover',display:'block'};
+  let inner;
+  if(src&&!errored){
+    inner=<img src={src} style={cellStyle} alt="" onError={handleError}/>;
+  }else if(errored){
+    // Photo exists on server but not cached locally — don't invite replacement
+    inner=<div style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:6,padding:12,boxSizing:'border-box'}}>
+      {Ico.wifiOff(t.faint,22)}
+      <span style={{fontSize:10,color:t.faint,textAlign:'center',fontWeight:500,lineHeight:1.4}}>Unavailable offline</span>
+    </div>;
+  }else{
+    // null dataUrl — pending or never uploaded
+    inner=<label style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:7,padding:12,cursor:'pointer',boxSizing:'border-box'}}>
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" stroke={t.mid} strokeWidth="1.5"/><circle cx="12" cy="13" r="3" stroke={t.mid} strokeWidth="1.5"/></svg>
+      <span style={{fontSize:10.5,color:t.mid,textAlign:'center',fontWeight:500,lineHeight:1.4}}>{photo._sync===false?'Pending…':'Tap to replace'}</span>
+      <input type="file" accept="image/*" style={{display:'none'}} onChange={e=>{
+        const file=e.target.files?.[0];if(!file)return;e.target.value='';
+        compressImage(file).then(dataUrl=>onReplace&&onReplace(dataUrl));
+      }}/>
+    </label>;
+  }
+  return <div style={{borderRadius:16,overflow:'hidden',position:'relative',background:t.soft,aspectRatio:'1'}}>
+    {inner}
+    <div style={{position:'absolute',bottom:0,left:0,right:0,padding:'8px 8px 7px',background:'linear-gradient(transparent,rgba(0,0,0,0.72))',display:'flex',flexDirection:'column',gap:4}}>
+      {photo.at&&<div style={{fontSize:10.5,color:'rgba(255,255,255,0.75)',fontWeight:500}}>{fmtDate(photo.at.slice(0,10))}</div>}
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+        {isProfile
+          ? <span style={{fontSize:11,color:'#fff',fontWeight:700,display:'inline-flex',alignItems:'center',gap:4}}>{Ico.check('#fff',12)} Profile</span>
+          : <button onClick={onSetProfile} style={{fontSize:11,color:'#fff',fontWeight:600,background:'rgba(255,255,255,0.22)',border:'none',borderRadius:999,padding:'3px 9px',cursor:'pointer'}}>{setProfileLabel}</button>
+        }
+        <button onClick={onDelete} style={{width:26,height:26,borderRadius:13,background:'rgba(255,255,255,0.2)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>{Ico.trash('#fff',13)}</button>
+      </div>
+    </div>
   </div>;
 }
 
@@ -2653,7 +2753,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
     <div style={{padding:'14px var(--sp) 0'}}>
       <Card padding={16} style={inactive?{opacity:0.82}:{}}>
         <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
-          <WAvatar size={88} photoUrl={profilePhoto?.dataUrl}/>
+          <WAvatar size={88} photoUrl={profilePhoto?.dataUrl} photoId={profilePhoto?.id}/>
           <div style={{flex:1,minWidth:0}}>
             <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:8}}>
               <div style={{flex:1,minWidth:0}}>
@@ -2722,33 +2822,15 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
         </div>}>Photos</SectionLabel>
         {photos.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'30px 0',fontSize:14}}>No photos yet.</div>}
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-          {photos.map(p=><div key={p.id} style={{borderRadius:16,overflow:'hidden',position:'relative',background:t.soft,aspectRatio:'1'}}>
-            {p.dataUrl
-              ? <img src={p.dataUrl} style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}} alt=""/>
-              : <label style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:7,padding:12,cursor:'pointer',boxSizing:'border-box'}}>
-                  <svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" stroke={t.mid} strokeWidth="1.5"/><circle cx="12" cy="13" r="3" stroke={t.mid} strokeWidth="1.5"/></svg>
-                  <span style={{fontSize:10.5,color:t.mid,textAlign:'center',fontWeight:500,lineHeight:1.4}}>{p._sync===false?'Pending…':'Tap to replace'}</span>
-                  <input type="file" accept="image/*" style={{display:'none'}} onChange={e=>{
-                    const file=e.target.files?.[0];if(!file)return;e.target.value='';
-                    compressImage(file).then(dataUrl=>{
-                      dispatch({type:'DELETE_WOMBAT_PHOTO',photoId:p.id});
-                      const np={id:'ph_'+Date.now(),wombatId:w.id,dataUrl,isProfile:p.isProfile,at:new Date().toISOString()};
-                      dispatch({type:'ADD_WOMBAT_PHOTO',photo:np});
-                    });
-                  }}/>
-                </label>
-            }
-            <div style={{position:'absolute',bottom:0,left:0,right:0,padding:'8px 8px 7px',background:'linear-gradient(transparent,rgba(0,0,0,0.72))',display:'flex',flexDirection:'column',gap:4}}>
-              {p.at&&<div style={{fontSize:10.5,color:'rgba(255,255,255,0.75)',fontWeight:500}}>{fmtDate(p.at.slice(0,10))}</div>}
-              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-                {p.isProfile
-                  ? <span style={{fontSize:11,color:'#fff',fontWeight:700,display:'inline-flex',alignItems:'center',gap:4}}>{Ico.check('#fff',12)} Profile</span>
-                  : <button onClick={()=>dispatch({type:'SET_PROFILE_PHOTO',photoId:p.id,wombatId:w.id})} style={{fontSize:11,color:'#fff',fontWeight:600,background:'rgba(255,255,255,0.22)',border:'none',borderRadius:999,padding:'3px 9px',cursor:'pointer'}}>Set profile</button>
-                }
-                <button onClick={()=>dispatch({type:'DELETE_WOMBAT_PHOTO',photoId:p.id})} style={{width:26,height:26,borderRadius:13,background:'rgba(255,255,255,0.2)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>{Ico.trash('#fff',13)}</button>
-              </div>
-            </div>
-          </div>)}
+          {photos.map(p=><PhotoCell key={p.id} photo={p} t={t}
+            isProfile={p.isProfile}
+            onReplace={dataUrl=>{
+              dispatch({type:'DELETE_WOMBAT_PHOTO',photoId:p.id});
+              dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+Date.now(),wombatId:w.id,dataUrl,isProfile:p.isProfile,at:new Date().toISOString()}});
+            }}
+            onSetProfile={()=>dispatch({type:'SET_PROFILE_PHOTO',photoId:p.id,wombatId:w.id})}
+            onDelete={()=>dispatch({type:'DELETE_WOMBAT_PHOTO',photoId:p.id})}
+          />)}
         </div>
       </>}
       {activeTab===2&&<>
@@ -2966,7 +3048,23 @@ function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
       burrow={editingBurrow}
       wombats={data.wombats}
       onClose={()=>setEditingBurrow(null)}
-      onSave={patch=>{dispatch({type:'UPDATE_BURROW',id:editingBurrow.id,patch});setEditingBurrow(null);}}
+      onSave={patch=>{
+        const oldIds=editingBurrow.wombatIds||[];
+        const newIds=patch.wombatIds||[];
+        const added=newIds.filter(id=>!oldIds.includes(id));
+        const removed=oldIds.filter(id=>!newIds.includes(id));
+        // 1. Patch the burrow itself (sets burrow.wombatIds correctly)
+        dispatch({type:'UPDATE_BURROW',id:editingBurrow.id,patch});
+        // 2. For newly linked wombats, also update wombat.burrowIds via LINK_WOMBAT_BURROW
+        //    (this is bidirectional — safe to call even if burrow already has the wombat id)
+        added.forEach(wId=>dispatch({type:'LINK_WOMBAT_BURROW',wombatId:wId,burrowId:editingBurrow.id}));
+        // 3. For removed wombats, strip this burrow from their burrowIds
+        removed.forEach(wId=>{
+          const w=data.wombats.find(x=>x.id===wId);
+          if(w)dispatch({type:'UPDATE_WOMBAT',id:wId,patch:{burrowIds:(w.burrowIds||[]).filter(id=>id!==editingBurrow.id)}});
+        });
+        setEditingBurrow(null);
+      }}
     />}
   </div>;
 }
@@ -2999,7 +3097,7 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
     <div style={{padding:'20px var(--sp) 0'}}>
       <Card padding={16}>
         <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
-          <BAvatar size={88} photoUrl={burrowProfilePhoto?.dataUrl}/>
+          <BAvatar size={88} photoUrl={burrowProfilePhoto?.dataUrl} photoId={burrowProfilePhoto?.id}/>
           <div style={{flex:1,minWidth:0}}>
             <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:8}}>
               <div style={{flex:1,minWidth:0}}>
@@ -3109,30 +3207,15 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
         </div>}>Photos</SectionLabel>
         {bPhotos.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'30px 0',fontSize:14}}>No photos yet.</div>}
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-          {bPhotos.map(p=><div key={p.id} style={{borderRadius:16,overflow:'hidden',position:'relative',background:t.soft,aspectRatio:'1'}}>
-            {p.dataUrl
-              ? <img src={p.dataUrl} style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}} alt=""/>
-              : <label style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:7,padding:12,cursor:'pointer',boxSizing:'border-box'}}>
-                  <svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" stroke={t.mid} strokeWidth="1.5"/><circle cx="12" cy="13" r="3" stroke={t.mid} strokeWidth="1.5"/></svg>
-                  <span style={{fontSize:10.5,color:t.mid,textAlign:'center',fontWeight:500,lineHeight:1.4}}>{p._sync===false?'Pending…':'Tap to replace'}</span>
-                  <input type="file" accept="image/*" style={{display:'none'}} onChange={e=>{
-                    const file=e.target.files?.[0];if(!file)return;e.target.value='';
-                    compressImage(file).then(dataUrl=>{
-                      dispatch({type:'DELETE_BURROW_PHOTO',photoId:p.id});
-                      const np={id:'bph_'+Date.now(),burrowId:b.id,dataUrl,isProfile:p.isProfile,at:new Date().toISOString()};
-                      dispatch({type:'ADD_BURROW_PHOTO',photo:np});
-                    });
-                  }}/>
-                </label>
-            }
-            <div style={{position:'absolute',bottom:0,left:0,right:0,padding:'8px 8px 7px',background:'linear-gradient(transparent,rgba(0,0,0,0.6))',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-              {p.isProfile
-                ? <span style={{fontSize:11,color:'#fff',fontWeight:700,display:'inline-flex',alignItems:'center',gap:4}}>{Ico.check('#fff',12)} Profile</span>
-                : <button onClick={()=>dispatch({type:'SET_BURROW_PROFILE_PHOTO',photoId:p.id,burrowId:b.id})} style={{fontSize:11,color:'#fff',fontWeight:600,background:'rgba(255,255,255,0.22)',border:'none',borderRadius:999,padding:'3px 9px',cursor:'pointer'}}>Set profile</button>
-              }
-              <button onClick={()=>dispatch({type:'DELETE_BURROW_PHOTO',photoId:p.id})} style={{width:26,height:26,borderRadius:13,background:'rgba(255,255,255,0.2)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>{Ico.trash('#fff',13)}</button>
-            </div>
-          </div>)}
+          {bPhotos.map(p=><PhotoCell key={p.id} photo={p} t={t}
+            isProfile={p.isProfile}
+            onReplace={dataUrl=>{
+              dispatch({type:'DELETE_BURROW_PHOTO',photoId:p.id});
+              dispatch({type:'ADD_BURROW_PHOTO',photo:{id:'bph_'+Date.now(),burrowId:b.id,dataUrl,isProfile:p.isProfile,at:new Date().toISOString()}});
+            }}
+            onSetProfile={()=>dispatch({type:'SET_BURROW_PROFILE_PHOTO',photoId:p.id,burrowId:b.id})}
+            onDelete={()=>dispatch({type:'DELETE_BURROW_PHOTO',photoId:p.id})}
+          />)}
         </div>
       </>}
       {activeTab===3&&<>
@@ -3842,6 +3925,8 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
   const markerRef=useRef(null);
   const [picked,setPicked]=useState(initialLat?{lat:initialLat,lng:initialLng}:null);
   const [satellite,setSatellite]=useState(false);
+  const [locError,setLocError]=useState(false); // GPS button failure state
+  const isOffline=!navigator.onLine;
 
   // Map init — create the Leaflet instance once. Tile layer is handled by a separate effect below.
   useEffect(()=>{
@@ -3903,24 +3988,36 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
           onTouchEnd={e=>e.stopPropagation()}
         >
           <div ref={mapRef} style={{width:'100%',height:'100%',touchAction:'none'}}/>
+          {/* Status banner — GPS error takes priority; falls back to offline notice */}
+          {(locError||isOffline)&&<div style={{position:'absolute',top:10,left:'50%',transform:'translateX(-50%)',zIndex:500,background:'rgba(0,0,0,0.65)',color:'#fff',fontSize:11,fontWeight:600,borderRadius:20,padding:'5px 12px',display:'flex',alignItems:'center',gap:6,pointerEvents:'none',whiteSpace:'nowrap'}}>
+            {Ico.wifiOff('#fff',12)}<span>{locError?'Couldn\'t get location — tap the map to pin':'Offline — some tiles may be missing'}</span>
+          </div>}
           {/* Map control buttons: GPS snap + satellite toggle */}
           <div style={{position:'absolute',bottom:16,right:16,zIndex:500,display:'flex',flexDirection:'column',gap:8}}>
             <button
               onClick={()=>{
-                if(!navigator.geolocation)return;
+                if(!navigator.geolocation){setLocError(true);return;}
+                setLocError(false);
                 navigator.geolocation.getCurrentPosition(pos=>{
-                  const{latitude:lat,longitude:lng}=pos.coords;
+                  const lat=pos.coords?.latitude;
+                  const lng=pos.coords?.longitude;
+                  // Validate — GPS can return NaN on some devices when offline
+                  if(typeof lat!=='number'||isNaN(lat)||typeof lng!=='number'||isNaN(lng)){setLocError(true);return;}
                   if(leafRef.current){
-                    leafRef.current.setView([lat,lng],16);
+                    // Cap zoom to OFFLINE_ZOOM_MAX so cached tiles are served offline;
+                    // use 14 online too — detailed enough without being too close
+                    const zoom=navigator.onLine?14:Math.min(14,OFFLINE_ZOOM_MAX);
+                    leafRef.current.setView([lat,lng],zoom);
                     if(markerRef.current)markerRef.current.remove();
                     markerRef.current=L.marker([lat,lng]).addTo(leafRef.current);
                     setPicked({lat,lng});
                   }
-                },()=>alert('Could not get your location. Check permissions.'),{timeout:8000,maximumAge:10000});
+                },()=>setLocError(true),{timeout:8000,maximumAge:10000});
               }}
-              style={{width:44,height:44,borderRadius:12,background:t.surface,boxShadow:'0 2px 10px rgba(0,0,0,0.2)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}
+              title={locError?'Could not get location':'Show my location'}
+              style={{width:44,height:44,borderRadius:12,background:locError?t.soft:t.surface,boxShadow:'0 2px 10px rgba(0,0,0,0.2)',border:locError?`1.5px solid ${t.amb700}`:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}
             >
-              {Ico.crosshair(t.f700,20)}
+              {locError?Ico.wifiOff(t.amb700,20):Ico.crosshair(t.f700,20)}
             </button>
             {/* Satellite toggle */}
             <button
@@ -5264,6 +5361,11 @@ function App(){
         // Load all IDB photo data and merge into state
         const map=await idbGetAllPhotos();
         if(Object.keys(map).length>0) dispatch({type:'HYDRATE_PHOTO_DATA',map});
+        // If online, proactively cache any https:// photos from localStorage that
+        // aren't yet in IDB. This covers the case where IDB was cleared between
+        // sessions (e.g. iOS eviction) — photos re-cache on the very next app open
+        // while online, so an immediate offline session afterwards still works.
+        if(navigator.onLine) cacheRemotePhotosToIdb(wpRaw,bpRaw,dispatch).catch(()=>{});
         // Recovery pass: any photo still null after IDB hydration may have its
         // blob in Supabase Storage. This silently fixes the "grey box" bug where
         // IDB eviction caused offline-added photos to lose their data permanently.
