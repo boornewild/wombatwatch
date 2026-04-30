@@ -4211,9 +4211,13 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
   const leafRef=useRef(null);
   const tileLayerRef=useRef(null);
   const markerRef=useRef(null);
+  const wrapRef=useRef(null); // touch-isolation wrapper
   const [picked,setPicked]=useState(initialLat?{lat:initialLat,lng:initialLng}:null);
   const [satellite,setSatellite]=useState(false);
   const [locError,setLocError]=useState(false); // GPS button failure state
+  const [searchQ,setSearchQ]=useState('');
+  const [searching,setSearching]=useState(false);
+  const [searchErr,setSearchErr]=useState(false);
   const isOffline=!navigator.onLine;
 
   // Map init — create the Leaflet instance once. Tile layer is handled by a separate effect below.
@@ -4254,6 +4258,45 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
       {attribution:satellite?ATTR_SAT:ATTR_OSM,maxZoom:19}
     ).addTo(map);
   },[satellite]);
+
+  // Non-passive touch listeners on the map wrapper — this is the critical fix for iOS Safari.
+  // React's synthetic onTouch* handlers are passive by default (since React 17), meaning they
+  // cannot call preventDefault(), so iOS still treats the gesture as a page scroll before
+  // Leaflet's drag handler gets a chance to claim it. Attaching non-passive listeners directly
+  // to the DOM element lets us call preventDefault(), giving Leaflet full ownership of all
+  // touch input inside the map area.
+  useEffect(()=>{
+    const el=wrapRef.current;
+    if(!el)return;
+    const absorb=e=>{e.stopPropagation();if(e.cancelable)e.preventDefault();};
+    el.addEventListener('touchstart',absorb,{passive:false});
+    el.addEventListener('touchmove',absorb,{passive:false});
+    el.addEventListener('touchend',absorb,{passive:false});
+    return()=>{
+      el.removeEventListener('touchstart',absorb);
+      el.removeEventListener('touchmove',absorb);
+      el.removeEventListener('touchend',absorb);
+    };
+  },[]);
+
+  // Location search — Nominatim geocoding (no API key required, rate-limited)
+  const doSearch=async()=>{
+    const q=searchQ.trim();if(!q||!leafRef.current)return;
+    setSearching(true);setSearchErr(false);
+    try{
+      const r=await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`,{headers:{'Accept-Language':'en'}});
+      const data=await r.json();
+      if(data&&data.length>0){
+        const{lat,lon,display_name}=data[0];
+        const latlng=[parseFloat(lat),parseFloat(lon)];
+        leafRef.current.setView(latlng,14);
+        // Place a pin at the search result
+        if(markerRef.current)markerRef.current.remove();
+        markerRef.current=L.marker(latlng).addTo(leafRef.current);
+        setPicked({lat:latlng[0],lng:latlng[1]});
+      }else{setSearchErr(true);}
+    }catch(e){setSearchErr(true);}finally{setSearching(false);}
+  };
   return(
     // Backdrop — tap to cancel
     <div onClick={onClose} style={{position:'fixed',inset:0,zIndex:1100,display:'flex',flexDirection:'column',justifyContent:'flex-end',alignItems:'center',background:'rgba(0,0,0,0.55)',paddingTop:'calc(var(--sat) + 48px)',paddingBottom:'calc(72px + var(--sab))'}}>
@@ -4265,17 +4308,29 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
           <div style={{fontSize:17,fontWeight:700,color:t.ink,flex:1}}>Pick location</div>
           {picked&&<button onClick={()=>onConfirm(picked)} style={{padding:'8px 16px',borderRadius:12,background:t.f700,color:'#fff',fontSize:13,fontWeight:700,border:'none',cursor:'pointer'}}>Confirm</button>}
         </div>
-        {/* touch-action:none tells the browser to give ALL touch input to JS (Leaflet)
-            rather than applying native scroll/pan — this is required for Leaflet panning
-            to work when the map sits inside an overflow:auto ancestor (ModalWrap).
-            stopPropagation on touch events prevents the overflowY:auto ModalWrap panel
-            from seeing the drag and consuming it as a page scroll. */}
-        <div style={{flex:1,position:'relative'}}
-          onTouchStart={e=>e.stopPropagation()}
-          onTouchMove={e=>e.stopPropagation()}
-          onTouchEnd={e=>e.stopPropagation()}
-        >
-          <div ref={mapRef} style={{width:'100%',height:'100%',touchAction:'none'}}/>
+        {/* Search bar — jump to any location by name, useful when target is far from GPS */}
+        <div style={{display:'flex',gap:8,padding:'8px 12px',background:t.surface,borderBottom:`1px solid ${t.div}`,flexShrink:0}}>
+          <input
+            value={searchQ}
+            onChange={e=>setSearchQ(e.target.value)}
+            onKeyDown={e=>e.key==='Enter'&&doSearch()}
+            placeholder="Search place or address…"
+            style={{flex:1,height:36,borderRadius:10,border:`1px solid ${searchErr?t.amb700:t.div}`,padding:'0 10px',fontSize:14,background:t.bg,color:t.ink,outline:'none'}}
+          />
+          <button
+            onClick={doSearch}
+            disabled={searching||!searchQ.trim()}
+            style={{height:36,padding:'0 14px',borderRadius:10,background:t.f700,color:'#fff',fontSize:13,fontWeight:700,border:'none',cursor:'pointer',opacity:(searching||!searchQ.trim())?0.5:1,flexShrink:0}}
+          >{searching?'…':'Go'}</button>
+        </div>
+        {searchErr&&<div style={{background:t.amb700+'22',color:t.amb700,fontSize:12,padding:'4px 16px',textAlign:'center',flexShrink:0}}>Location not found — try a different search</div>}
+        {/* wrapRef + touchAction:none on the OUTER wrapper is the iOS Safari pan fix.
+            React's synthetic onTouch* handlers are passive (can't call preventDefault),
+            so iOS consumes the gesture as a page scroll before Leaflet sees it.
+            Non-passive DOM listeners attached via useEffect call preventDefault(),
+            giving Leaflet full ownership of all touch input inside the map area. */}
+        <div ref={wrapRef} style={{flex:1,position:'relative',touchAction:'none'}}>
+          <div ref={mapRef} style={{width:'100%',height:'100%'}}/>
           {/* Status banner — GPS error takes priority; falls back to offline notice */}
           {(locError||isOffline)&&<div style={{position:'absolute',top:10,left:'50%',transform:'translateX(-50%)',zIndex:500,background:'rgba(0,0,0,0.65)',color:'#fff',fontSize:11,fontWeight:600,borderRadius:20,padding:'5px 12px',display:'flex',alignItems:'center',gap:6,pointerEvents:'none',whiteSpace:'nowrap'}}>
             {Ico.wifiOff('#fff',12)}<span>{locError?'Couldn\'t get location — tap the map to pin':'Offline — some tiles may be missing'}</span>
