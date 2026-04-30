@@ -1255,9 +1255,10 @@ async function syncAction(action,userId){
         break;
       }
       case'ADD_BURROW': {
-        // Read back from localStorage rather than action.burrow — by the time syncAction runs,
+        // Read back from IDB rather than action.burrow — by the time syncAction runs,
         // the reducer may have already committed a LINK_WOMBAT_BURROW that updated wombatIds.
         // This prevents queuing a stale burrow with empty wombatIds only to have LINK overwrite it.
+        // Falls back to action.burrow if IDB write hasn't committed yet (timing edge case).
         const latestBurrow=await fromIdb('b',action.burrow.id)||action.burrow;
         await push('burrows',burrowToDb(latestBurrow,userId));
         break;
@@ -1419,12 +1420,18 @@ async function supaFullSync(){
   // If there ARE pending upserts, the user added data offline before their first sync —
   // returning null here would cause the caller to wipe that unsynchronised data.
   const hasPendingUpserts=_pendingOps.some(op=>op.t==='upsert');
-  // Only treat as a new user (return null → wipe local) if local storage is also empty.
-  // If wombats/burrows queries both failed (network hiccup) while another table succeeded,
-  // w and b are null — without this guard we'd mistake a partial failure for a new user
-  // and wipe everything the volunteer entered.
-  const [idbW,idbB]=await Promise.all([idbGetAll(STORE.w),idbGetAll(STORE.b)]);
-  const localHasData=(idbW.length>0)||(idbB.length>0);
+  // Pre-fetch ALL 7 IDB stores before the merge so merge() uses durable IDB data
+  // (eviction-resistant, GBs of quota) rather than localStorage (5 MB, iOS can evict).
+  // Without this, every branch of merge() reads [] from localStorage when evicted —
+  // the empty-server protection fires incorrectly, and the local-wins logic adds nothing.
+  // resolveWithCurrentQueue() compensates for _sync:false records, but _sync:true records
+  // that the server temporarily returns empty (expired token RLS edge case) would be lost
+  // for the current session. Pre-fetching here gives both layers the full IDB picture.
+  const idbLocal={};
+  await Promise.all(Object.entries(STORE).map(async([k,s])=>{
+    try{idbLocal[k]=await idbGetAll(s);}catch(e){idbLocal[k]=[];}
+  }));
+  const localHasData=(idbLocal.w.length>0)||(idbLocal.b.length>0);
   if(!(w?.length||0)&&!(b?.length||0)&&!hasPendingUpserts&&!localHasData)return null; // confirmed new user, genuinely empty DB
   // Pending upserts — local version must win over whatever the server returned
   const queuedIds=new Set(
@@ -1442,7 +1449,11 @@ async function supaFullSync(){
   // the deleted record. Without this filter it reappears as if never deleted.
   const recentlyDeleted=await getRecentlyDeleted();
   const merge=(remote,localKey,conv)=>{
-    const local=JSON.parse(localStorage.getItem(SK[localKey])||'[]');
+    // Use IDB as the authoritative local source — iOS can evict localStorage but IDB
+    // has much higher eviction thresholds and survives the hours-long offline sessions
+    // that field volunteers routinely do. localStorage is still written as a secondary
+    // mirror by save() but must not be the primary source of truth here.
+    const local=idbLocal[localKey]||[];
     // If this table's query failed entirely (permissions error, network blip, etc.),
     // remote is null. We can't safely merge — keep everything local so we don't
     // silently drop records that were previously synced (_sync:true).
