@@ -505,12 +505,13 @@ const load=()=>{try{return{
   theme:localStorage.getItem(SK.theme)||'light',
 };}catch(e){return{wombats:[],burrows:[],treatments:[],sightings:[],burrowLogs:[],wombatPhotos:[],burrowPhotos:[],theme:'light'};}};
 const save=(key,val)=>{
-  try{localStorage.setItem(SK[key],JSON.stringify(val));}
-  catch(e){
-    if(e&&(e.name==='QuotaExceededError'||e.code===22)){
-      console.warn('[Storage] Quota exceeded for key:',key);
-    }
-  }
+  // Primary: IDB (eviction-resistant, large quota on iOS).
+  // Fire-and-forget — React state is already updated synchronously.
+  idbSaveAll(STORE[key],val).catch(e=>console.error('[IDB] save failed:',key,e));
+  // Mirror: also write to localStorage as a secondary backup.
+  // Data is always read primarily from IDB; this copy exists as a last resort.
+  // Failures are silenced — if localStorage is full/evicted it's not critical.
+  try{localStorage.setItem(SK[key],JSON.stringify(val));}catch(e){}
 };
 
 // ── IndexedDB photo store ─────────────────────────────────────────
@@ -572,6 +573,185 @@ async function idbDeletePhoto(id){
 // Strip base64 dataUrls before saving to localStorage (they live in IDB instead).
 // Supabase Storage URLs (https://...) are small and safe to keep.
 const noB64=p=>p.dataUrl?.startsWith('data:')?{...p,dataUrl:null}:p;
+
+// ── App data IDB (records + queue + meta) ─────────────────────────────────────
+// All wombat/burrow/etc records, the sync queue, and recently-deleted cache live
+// here. IndexedDB has significantly higher eviction thresholds than localStorage
+// on iOS Safari — iOS can silently clear localStorage when device storage is low,
+// causing data loss in the field. Moving critical data to IDB prevents that.
+const STORE={w:'wombats',b:'burrows',t:'treatments',s:'sightings',bl:'burrow_logs',wp:'wombat_photos',bp:'burrow_photos'};
+let _appDb=null;
+function openAppDb(){
+  if(_appDb)return Promise.resolve(_appDb);
+  return new Promise((res,rej)=>{
+    const req=indexedDB.open('wombatwatch_v1',1);
+    req.onupgradeneeded=e=>{
+      const db=e.target.result;
+      Object.values(STORE).forEach(s=>{if(!db.objectStoreNames.contains(s))db.createObjectStore(s,{keyPath:'id'});});
+      if(!db.objectStoreNames.contains('queue'))db.createObjectStore('queue',{keyPath:'_qid',autoIncrement:true});
+      if(!db.objectStoreNames.contains('meta'))db.createObjectStore('meta',{keyPath:'key'});
+    };
+    req.onsuccess=e=>{_appDb=e.target.result;res(_appDb);};
+    req.onerror=e=>rej(e.target.error);
+  });
+}
+async function idbSaveAll(storeName,records){
+  try{
+    const db=await openAppDb();
+    return new Promise((res,rej)=>{
+      const tx=db.transaction(storeName,'readwrite');
+      const s=tx.objectStore(storeName);
+      s.clear();
+      records.forEach(r=>s.put(r));
+      tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){console.error('[IDB] idbSaveAll failed:',storeName,e);}
+}
+async function idbGetAll(storeName){
+  try{
+    const db=await openAppDb();
+    return new Promise((res,rej)=>{
+      const req=db.transaction(storeName,'readonly').objectStore(storeName).getAll();
+      req.onsuccess=e=>res(e.target.result||[]);
+      req.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){return[];}
+}
+async function idbGetOne(storeName,id){
+  try{
+    const db=await openAppDb();
+    return new Promise((res,rej)=>{
+      const req=db.transaction(storeName,'readonly').objectStore(storeName).get(id);
+      req.onsuccess=e=>res(e.target.result||null);
+      req.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){return null;}
+}
+// Patch a single record's _sync:true + _pushedAt in IDB after a successful push.
+// Much cheaper than idbSaveAll (one put, no clear).
+async function idbMarkSynced(storeName,id){
+  try{
+    const db=await openAppDb();
+    const rec=await new Promise((res,rej)=>{
+      const req=db.transaction(storeName,'readonly').objectStore(storeName).get(id);
+      req.onsuccess=e=>res(e.target.result||null);req.onerror=e=>rej(e.target.error);
+    });
+    if(!rec)return;
+    await new Promise((res,rej)=>{
+      const tx=db.transaction(storeName,'readwrite');
+      tx.objectStore(storeName).put({...rec,_sync:true,_pushedAt:Date.now()});
+      tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){}
+}
+// Queue helpers — each queue op gets an auto-assigned _qid by IDB.
+async function idbEnqueue(op){
+  try{
+    const db=await openAppDb();
+    return new Promise((res,rej)=>{
+      const tx=db.transaction('queue','readwrite');
+      tx.objectStore('queue').add({...op,_retries:op._retries||0});
+      tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){throw e;}
+}
+async function idbGetQueue(){
+  try{
+    const db=await openAppDb();
+    return new Promise((res,rej)=>{
+      const req=db.transaction('queue','readonly').objectStore('queue').getAll();
+      req.onsuccess=e=>res(e.target.result||[]);
+      req.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){return[];}
+}
+async function idbDequeueOp(qid){
+  try{
+    const db=await openAppDb();
+    return new Promise((res,rej)=>{
+      const tx=db.transaction('queue','readwrite');
+      tx.objectStore('queue').delete(qid);
+      tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){}
+}
+async function idbUpdateQueueOp(op){
+  try{
+    const db=await openAppDb();
+    return new Promise((res,rej)=>{
+      const tx=db.transaction('queue','readwrite');
+      tx.objectStore('queue').put(op); // _qid keyPath used for in-place update
+      tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){}
+}
+async function idbQueueCount(){
+  try{
+    const db=await openAppDb();
+    return new Promise((res,rej)=>{
+      const req=db.transaction('queue','readonly').objectStore('queue').count();
+      req.onsuccess=e=>res(e.target.result||0);
+      req.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){return 0;}
+}
+// Key-value meta store — used for recently-deleted cache, migration flag, etc.
+async function idbMetaGet(key){
+  try{
+    const db=await openAppDb();
+    return new Promise((res,rej)=>{
+      const req=db.transaction('meta','readonly').objectStore('meta').get(key);
+      req.onsuccess=e=>res(e.target.result?.value??null);
+      req.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){return null;}
+}
+async function idbMetaSet(key,value){
+  try{
+    const db=await openAppDb();
+    return new Promise((res,rej)=>{
+      const tx=db.transaction('meta','readwrite');
+      tx.objectStore('meta').put({key,value});
+      tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);
+    });
+  }catch(e){}
+}
+// One-time migration: copy localStorage data into IDB so existing users don't
+// lose their data when upgrading. Safe to call on every startup — once the
+// 'migrated' meta flag is set it returns in one IDB read.
+async function migrateToIdb(){
+  try{
+    const done=await idbMetaGet('migrated');
+    if(done)return;
+    // Migrate record stores
+    const OLD={w:'ww2_wombats',b:'ww2_burrows',t:'ww2_treatments',s:'ww2_sightings',bl:'ww2_burrow_logs',wp:'ww2_wombat_photos',bp:'ww2_burrow_photos'};
+    for(const[k,lsKey]of Object.entries(OLD)){
+      try{
+        const d=JSON.parse(localStorage.getItem(lsKey)||'[]');
+        if(d.length)await idbSaveAll(STORE[k],d);
+      }catch(e){}
+    }
+    // Migrate sync queue
+    try{
+      const q=JSON.parse(localStorage.getItem('ww_sync_queue')||'[]');
+      if(q.length){
+        const db=await openAppDb();
+        const tx=db.transaction('queue','readwrite');
+        const s=tx.objectStore('queue');
+        q.forEach(op=>s.add({...op,_retries:op._retries||0}));
+        await new Promise((res,rej)=>{tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);});
+      }
+    }catch(e){}
+    // Migrate recently-deleted cache
+    try{
+      const m=JSON.parse(localStorage.getItem('ww_sync_deleted')||'{}');
+      const entries=Object.entries(m).map(([id,ts])=>({id,ts}));
+      if(entries.length)await idbMetaSet('recently_deleted',entries);
+    }catch(e){}
+    await idbMetaSet('migrated',true);
+    console.log('[IDB] Migration from localStorage complete');
+  }catch(e){console.warn('[IDB] Migration failed:',e);}
+}
 // Cache remote (https://) photo URLs into IDB so they render when offline.
 // Called in the background after every full sync. Only fetches photos not
 // already in IDB, so it's cheap after the first run. Dispatches a second
@@ -644,11 +824,10 @@ async function recoverBlankPhotos(wombatPhotos,burrowPhotos,dispatch){
         recovered[p.id]=dataUrl;
         // Patch the Supabase table row so future syncs don't re-introduce the blank
         supa.from(p._table).update({data_url:publicUrl}).eq('id',p.id).then(null,()=>{});
-        // Patch localStorage so the merge keeps the recovered URL
+        // Patch IDB so the recovered URL survives future syncs
         try{
-          const arr=JSON.parse(localStorage.getItem(SK[p._lk])||'[]');
-          const patched=arr.map(r=>r.id===p.id?{...r,dataUrl:publicUrl,_sync:true}:r);
-          localStorage.setItem(SK[p._lk],JSON.stringify(patched));
+          const rec=await idbGetOne(STORE[p._lk],p.id);
+          if(rec)await idbSaveAll(STORE[p._lk],(await idbGetAll(STORE[p._lk])).map(r=>r.id===p.id?{...r,dataUrl:publicUrl,_sync:true}:r));
         }catch(e){}
         console.info('[Recovery] ✓ Recovered from Storage:',p.id);
       }catch(e){console.info('[Recovery] Error for',p.id,e?.message);}
@@ -846,44 +1025,41 @@ async function resolvePhotoUrl(dataUrl,photoId,localKey){
 // But if supaFullSync was already in flight at that moment, its stale response still
 // contains the deleted record — and since the op is no longer in the queue, deletedIds
 // won't filter it out, causing the record to reappear in the UI ("zombie resurrection").
-// Fix: track successfully-deleted IDs for 5 minutes so the merge can filter them even
-// after the queue op is gone. Entries older than 5 min are pruned automatically.
-const SD_KEY='ww_sync_deleted'; // recently-deleted cache
+// Fix: track successfully-deleted IDs in IDB meta so the merge can filter them even
+// after the queue op is gone. Entries older than SD_TTL are pruned automatically.
 const SD_TTL=30*60*1000; // 30 minutes — long enough to survive a slow flush after reconnect
-function markRecentlyDeleted(id){
+async function markRecentlyDeleted(id){
   try{
-    const m=JSON.parse(localStorage.getItem(SD_KEY)||'{}');
-    m[id]=Date.now();
-    // Prune stale entries while we're here
+    const existing=await idbMetaGet('recently_deleted')||[];
     const now=Date.now();
-    Object.keys(m).forEach(k=>{if(now-m[k]>SD_TTL)delete m[k];});
-    localStorage.setItem(SD_KEY,JSON.stringify(m));
+    const pruned=existing.filter(e=>now-e.ts<SD_TTL);
+    pruned.push({id,ts:now});
+    await idbMetaSet('recently_deleted',pruned);
   }catch(e){}
 }
-function getRecentlyDeleted(){
+async function getRecentlyDeleted(){
   try{
-    const m=JSON.parse(localStorage.getItem(SD_KEY)||'{}');
+    const entries=await idbMetaGet('recently_deleted')||[];
     const now=Date.now();
-    return new Set(Object.keys(m).filter(k=>now-m[k]<SD_TTL));
+    return new Set(entries.filter(e=>now-e.ts<SD_TTL).map(e=>e.id));
   }catch(e){return new Set();}
 }
 
 // ── Offline queue ─────────────────────────────────────────────
-const SQ_KEY='ww_sync_queue';
-const SQ_MAX_RETRIES=5; // drop an op after this many consecutive failures
-function queueOp(op){
+// Queue ops are persisted in IndexedDB ('wombatwatch_v1' → 'queue' store).
+// IDB is much more resilient to iOS eviction than localStorage, which was
+// silently cleared by iOS when storage was low, destroying pending sync ops.
+const SQ_MAX_RETRIES=5; // drop an op after this many consecutive genuine failures
+async function queueOp(op){
   try{
-    const q=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');
-    q.push({...op,_retries:0});
-    localStorage.setItem(SQ_KEY,JSON.stringify(q));
+    await idbEnqueue(op);
   }catch(e){
-    // localStorage quota exceeded or unavailable — this record won't be synced.
-    // Alert the user so they know data may be at risk rather than silently losing it.
-    console.error('[Queue] localStorage write failed — record may be lost:',op.t,op.table||op.path,e);
+    // IDB write failed — this record won't be synced.
+    console.error('[Queue] IDB write failed — record may be lost:',op.t,op.table||op.path,e);
     try{
       if(typeof alert!=='undefined') alert(
-        '⚠️ Storage is full — this record could not be saved for offline sync.\n\n'+
-        'Please free up space on your device (e.g. clear other app data) and check '+
+        '⚠️ Could not save this record for offline sync.\n\n'+
+        'Your device storage may be full. Please free up space and check '+
         'that your data was saved before closing the app.'
       );
     }catch{}
@@ -908,7 +1084,7 @@ async function flushQueue(userId){
   // polluting _lastSupaError with a network error before networkAbort kicks in.
   if(!navigator.onLine)return;
   try{
-    const q=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');
+    const q=await idbGetQueue();
     if(!q.length)return;
     // Process parents before children so FK constraints are never violated
     // wombats/burrows → treatments/sightings/logs → photos
@@ -916,15 +1092,13 @@ async function flushQueue(userId){
     // storage-delete ops have no .table field — run them last (after photos, priority 3)
     const getOpPri=op=>op.t==='storage-delete'?3:(TABLE_PRI[op.table]??1);
     q.sort((a,b)=>getOpPri(a)-getOpPri(b));
-    const remaining=[];
     let networkAbort=false; // set when a transient network failure is detected
     let authAbort=false;    // set when an auth error is detected — re-auth needed before retry
+    const lsKeyMap={wombats:'w',burrows:'b',treatments:'t',sightings:'s',burrow_logs:'bl',wombat_photos:'wp',burrow_photos:'bp'};
     for(const op of q){
-      // Once a network or auth failure is detected, stop processing — re-queue everything
-      // that hasn't been flushed yet without touching their retry counters.
-      // Network: retried on the next reconnect / visibility change.
-      // Auth: retried after the user signs in again.
-      if(networkAbort||authAbort){remaining.push(op);continue;}
+      // Once a network or auth failure is detected, stop processing — leave remaining ops
+      // in IDB unchanged (they'll be retried on next reconnect / re-auth).
+      if(networkAbort||authAbort)break;
       let ok=false;
       let skip=false;
       let netErr=false;
@@ -968,95 +1142,83 @@ async function flushQueue(userId){
         console.warn('[Queue] op threw:',op.t,op.table||op.id,e);
         netErr=true; // uncaught exceptions are almost always network issues
       }
-      if(skip) continue; // already handled above
-      if(ok){
-        // Mark successfully-pushed records as _sync:true in localStorage so that future
-        // full syncs treat them as server-authoritative. Without this, _sync:false records
-        // permanently win every merge and changes from other devices never land locally.
+      if(skip){
+        // Discard — blob gone, nothing to push
+        await idbDequeueOp(op._qid);
+      }else if(ok){
+        // Mark successfully-pushed records as _sync:true in IDB so that future full syncs
+        // treat them as server-authoritative. Without this, _sync:false records permanently
+        // win every merge and changes from other devices never land locally.
+        await idbDequeueOp(op._qid);
         if(op.t==='upsert'&&op.row?.id){
-          const lsKeyMap={wombats:'w',burrows:'b',treatments:'t',sightings:'s',burrow_logs:'bl',wombat_photos:'wp',burrow_photos:'bp'};
           const lk=lsKeyMap[op.table];
-          if(lk){
-            try{
-              const arr=JSON.parse(localStorage.getItem(SK[lk])||'[]');
-              const patched=arr.map(r=>r.id===op.row.id?{...r,_sync:true,_pushedAt:Date.now()}:r);
-              localStorage.setItem(SK[lk],JSON.stringify(patched));
-            }catch(e){}
-          }
+          if(lk)await idbMarkSynced(STORE[lk],op.row.id);
         }else if(op.t==='delete'&&op.id){
-          // Mirror syncAction's del(): mark in the recently-deleted cache so in-flight syncs
-          // don't re-introduce this record when the queue op is no longer present.
-          markRecentlyDeleted(op.id);
+          // Mark in the recently-deleted cache so in-flight syncs don't re-introduce
+          // this record when the queue op is no longer present.
+          await markRecentlyDeleted(op.id);
         }
       }else if(netErr){
-        // Transient network failure — re-queue this op unchanged (retries NOT incremented)
+        // Transient network failure — leave op in IDB unchanged (retries NOT incremented)
         // and abort the rest of the flush so subsequent ops aren't wasted either.
         console.warn('[Queue] Network error — pausing flush, will retry on reconnect:',op.t,op.table||op.id);
-        remaining.push(op);
         networkAbort=true;
       }else if(isAuthErrorStr(_lastSupaError)){
-        // Auth error — token expired or revoked. Re-queue without charging retry budget.
+        // Auth error — token expired or revoked. Leave op in IDB without charging retry budget.
         // onAuthError() (called inside supaUpsert/supaDelete via checkAuthError) will
         // trigger a sign-out; the flush will resume automatically after re-authentication.
         console.warn('[Queue] Auth error — pausing flush until re-auth:',op.t,op.table||op.id);
-        remaining.push(op);
         authAbort=true;
       }else{
         // Genuine Supabase error (bad data, permission denied, etc.) — charge the retry budget.
         const retries=(op._retries||0)+1;
         if(retries>=SQ_MAX_RETRIES){
           console.warn('[Queue] Dropping op after',retries,'failures:',op.t,op.table||op.id);
-          // Notify the user so data loss doesn't go unnoticed
+          await idbDequeueOp(op._qid);
           if(typeof alert!=='undefined') alert(`⚠️ A record could not be synced after several attempts and has been dropped.\n\nTable: ${op.table||'unknown'}\nError: ${_lastSupaError||'unknown'}\n\nPlease screenshot this and check your data.`);
         }else{
-          remaining.push({...op,_retries:retries});
+          await idbUpdateQueueOp({...op,_retries:retries});
         }
       }
     }
-    localStorage.setItem(SQ_KEY,JSON.stringify(remaining));
-  }catch(e){}
+  }catch(e){console.warn('[Queue] flush error',e);}
 }
 
 // ── Sync single action → Supabase ─────────────────────────────
 async function syncAction(action,userId){
-  const fromLS=(k,id)=>{try{return(JSON.parse(localStorage.getItem(SK[k]))||[]).find(r=>r.id===id);}catch{return null;}};
+  // Read latest record from IDB (more reliable than localStorage after eviction).
+  const fromIdb=async(k,id)=>{try{return await idbGetOne(STORE[k],id);}catch{return null;}};
   const lsKeyMap={wombats:'w',burrows:'b',treatments:'t',sightings:'s',burrow_logs:'bl',wombat_photos:'wp',burrow_photos:'bp'};
   const push=async(table,row)=>{
     const r={...row,created_by:row.created_by||userId};
-    if(!navigator.onLine){queueOp({t:'upsert',table,row:r});return;}
+    if(!navigator.onLine){await queueOp({t:'upsert',table,row:r});return;}
     // Catch exceptions as well as false returns — both mean the push failed and the op
     // must be queued so it isn't silently lost. Without this, a thrown error escapes
     // the case statement and reaches the outer catch, bypassing the queueOp fallback.
     try{
       const ok=await supaUpsert(table,r);
-      if(!ok){queueOp({t:'upsert',table,row:r});return;}
-      // Mark _sync:true so resolveWithCurrentQueue knows the push was confirmed, and
-      // record _pushedAt so it can detect pushes that completed while a sync fetch was
-      // already in flight (those pushes should still win over the stale server response).
+      if(!ok){await queueOp({t:'upsert',table,row:r});return;}
+      // Mark _sync:true in IDB so resolveWithCurrentQueue knows the push was confirmed,
+      // and record _pushedAt so it can detect pushes that completed while a sync fetch
+      // was already in flight (those pushes should still win over the stale server response).
       const lk=lsKeyMap[table];
-      if(lk&&r.id){
-        try{
-          const arr=JSON.parse(localStorage.getItem(SK[lk])||'[]');
-          const patched=arr.map(rec=>rec.id===r.id?{...rec,_sync:true,_pushedAt:Date.now()}:rec);
-          localStorage.setItem(SK[lk],JSON.stringify(patched));
-        }catch(e){}
-      }
+      if(lk&&r.id)await idbMarkSynced(STORE[lk],r.id);
     }catch(e){
       console.warn('[Supa] push threw, queuing for retry:',table,e);
-      queueOp({t:'upsert',table,row:r});
+      await queueOp({t:'upsert',table,row:r});
     }
   };
   const del=async(table,id)=>{
-    if(!navigator.onLine){queueOp({t:'delete',table,id});return;}
+    if(!navigator.onLine){await queueOp({t:'delete',table,id});return;}
     try{
       const ok=await supaDelete(table,id);
       // On success, record the ID in the recently-deleted cache so supaFullSync can
       // filter it out even if its fetch was already in flight when the delete completed.
-      if(ok)markRecentlyDeleted(id);
-      else queueOp({t:'delete',table,id});
+      if(ok)await markRecentlyDeleted(id);
+      else await queueOp({t:'delete',table,id});
     }catch(e){
       console.warn('[Supa] del threw, queuing for retry:',table,id,e);
-      queueOp({t:'delete',table,id});
+      await queueOp({t:'delete',table,id});
     }
   };
   try{
@@ -1071,11 +1233,12 @@ async function syncAction(action,userId){
         await push('wombats',wombatToDb(action.wombat,userId));
         break;
       }
-      // Apply patch directly rather than reading from localStorage — the React reducer
-      // may not have committed to localStorage yet by the time syncAction runs.
-      case'UPDATE_WOMBAT':       {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb({...w,...action.patch},userId));break;}
-      case'MARK_WOMBAT_INACTIVE':{const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:action.inactiveAt,inactiveCause:action.inactiveCause||null,inactiveNotes:action.inactiveNotes||null},userId));break;}
-      case'MARK_WOMBAT_ACTIVE':  {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:null,inactiveCause:null,inactiveNotes:null},userId));break;}
+      // Apply patch directly rather than relying on reducer timing — IDB is updated
+      // synchronously (fire-and-forget) by the reducer, so by the time syncAction's
+      // async body runs, IDB has the latest version of the record.
+      case'UPDATE_WOMBAT':       {const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,...action.patch},userId));break;}
+      case'MARK_WOMBAT_INACTIVE':{const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:action.inactiveAt,inactiveCause:action.inactiveCause||null,inactiveNotes:action.inactiveNotes||null},userId));break;}
+      case'MARK_WOMBAT_ACTIVE':  {const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:null,inactiveCause:null,inactiveNotes:null},userId));break;}
       case'IMPORT_WOMBATS': for(const w of (action.wombats||[]))await push('wombats',wombatToDb(w,userId)); break;
       case'DELETE_WOMBAT': {
         await del('wombats',action.id);
@@ -1086,7 +1249,7 @@ async function syncAction(action,userId){
         // Push each previously-linked burrow so Supabase no longer shows the deleted wombat ID
         // in their wombat_ids array. The reducer already removed it locally with _sync:false.
         for(const bId of (action.burrowIds||[])){
-          const b=fromLS('b',bId);
+          const b=await fromIdb('b',bId);
           if(b)await push('burrows',burrowToDb(b,userId));
         }
         break;
@@ -1095,11 +1258,11 @@ async function syncAction(action,userId){
         // Read back from localStorage rather than action.burrow — by the time syncAction runs,
         // the reducer may have already committed a LINK_WOMBAT_BURROW that updated wombatIds.
         // This prevents queuing a stale burrow with empty wombatIds only to have LINK overwrite it.
-        const latestBurrow=fromLS('b',action.burrow.id)||action.burrow;
+        const latestBurrow=await fromIdb('b',action.burrow.id)||action.burrow;
         await push('burrows',burrowToDb(latestBurrow,userId));
         break;
       }
-      case'UPDATE_BURROW':  {const b=fromLS('b',action.id);if(b)await push('burrows',burrowToDb({...b,...action.patch},userId));break;}
+      case'UPDATE_BURROW':  {const b=await fromIdb('b',action.id);if(b)await push('burrows',burrowToDb({...b,...action.patch},userId));break;}
       case'IMPORT_BURROWS': for(const b of (action.burrows||[]))await push('burrows',burrowToDb(b,userId)); break;
       case'DELETE_BURROW': {
         await del('burrows',action.id);
@@ -1110,7 +1273,7 @@ async function syncAction(action,userId){
         // Push each previously-linked wombat so Supabase no longer shows the deleted burrow ID
         // in their burrow_ids array. The reducer already removed it locally with _sync:false.
         for(const wId of (action.wombatIds||[])){
-          const w=fromLS('w',wId);
+          const w=await fromIdb('w',wId);
           if(w)await push('wombats',wombatToDb(w,userId));
         }
         break;
@@ -1125,7 +1288,7 @@ async function syncAction(action,userId){
       case'ADD_BURROW_LOG': {
         await push('burrow_logs',burrowLogToDb(action.log,userId));
         // Apply the same logPatch the reducer uses so we don't rely on localStorage timing.
-        const b=fromLS('b',action.log.burrowId);
+        const b=await fromIdb('b',action.log.burrowId);
         if(b){
           const lp={status:action.log.status,lastChecked:action.log.at};
           if(action.log.heightCm!=null&&action.log.heightCm!=='')lp.entranceHeightCm=action.log.heightCm;
@@ -1144,7 +1307,7 @@ async function syncAction(action,userId){
         // Also push the burrow back so Supabase reflects the reverted status/lastChecked.
         // We read from localStorage here; if the reducer hasn't committed yet the value
         // will be slightly stale, but the next full sync will reconcile it.
-        const bd=fromLS('b',action.burrowId);if(bd)await push('burrows',burrowToDb(bd,userId));
+        const bd=await fromIdb('b',action.burrowId);if(bd)await push('burrows',burrowToDb(bd,userId));
         break;
       }
       case'ADD_WOMBAT_PHOTO': {
@@ -1166,14 +1329,14 @@ async function syncAction(action,userId){
         // Remove the Storage file — queue it if offline so it's cleaned up on reconnect
         const wPath=`${action.photoId}.jpg`;
         if(navigator.onLine){supa.storage.from('photos').remove([wPath]).catch(()=>{});}
-        else{queueOp({t:'storage-delete',path:wPath});}
+        else{await queueOp({t:'storage-delete',path:wPath});}
         break;
       }
       case'SET_PROFILE_PHOTO': {
-        const ps=(JSON.parse(localStorage.getItem(SK.wp)||'[]')).filter(p=>p.wombatId===action.wombatId);
+        const ps=(await idbGetAll(STORE.wp)).filter(p=>p.wombatId===action.wombatId);
         for(const p of ps){
-          // dataUrl is null in localStorage if noB64 stripped it (blob lives in IDB).
-          // Fall back to IDB so we don't clobber an existing Storage URL with null.
+          // dataUrl is null in IDB if noB64 stripped it (blob lives in ww_photo_data).
+          // Fall back to photo IDB so we don't clobber an existing Storage URL with null.
           let dataUrl=p.dataUrl;
           if(!dataUrl)dataUrl=await idbGetPhoto(p.id)||null;
           const url=navigator.onLine?await resolvePhotoUrl(dataUrl,p.id,SK.wp):dataUrl;
@@ -1195,11 +1358,11 @@ async function syncAction(action,userId){
         // Remove the Storage file — queue it if offline so it's cleaned up on reconnect
         const bPath=`${action.photoId}.jpg`;
         if(navigator.onLine){supa.storage.from('photos').remove([bPath]).catch(()=>{});}
-        else{queueOp({t:'storage-delete',path:bPath});}
+        else{await queueOp({t:'storage-delete',path:bPath});}
         break;
       }
       case'SET_BURROW_PROFILE_PHOTO': {
-        const ps=(JSON.parse(localStorage.getItem(SK.bp)||'[]')).filter(p=>p.burrowId===action.burrowId);
+        const ps=(await idbGetAll(STORE.bp)).filter(p=>p.burrowId===action.burrowId);
         for(const p of ps){
           let dataUrl=p.dataUrl;
           if(!dataUrl)dataUrl=await idbGetPhoto(p.id)||null;
@@ -1210,9 +1373,9 @@ async function syncAction(action,userId){
       }
       case'LINK_WOMBAT_BURROW': {
         // Apply the bidirectional ID arrays directly — don't rely on reducer having updated localStorage yet.
-        const w=fromLS('w',action.wombatId);
+        const w=await fromIdb('w',action.wombatId);
         if(w)await push('wombats',wombatToDb({...w,burrowIds:[...(w.burrowIds||[]).filter(id=>id!==action.burrowId),action.burrowId]},userId));
-        const b=fromLS('b',action.burrowId);
+        const b=await fromIdb('b',action.burrowId);
         if(b)await push('burrows',burrowToDb({...b,wombatIds:[...(b.wombatIds||[]).filter(id=>id!==action.wombatId),action.wombatId]},userId));
         break;
       }
@@ -1251,7 +1414,7 @@ async function supaFullSync(){
   if(!anySucceeded)return undefined;
   // Build sets of IDs from the offline queue so the merge can respect pending operations.
   let _pendingOps=[];
-  try{_pendingOps=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');}catch(e){}
+  try{_pendingOps=await idbGetQueue();}catch(e){}
   // Only treat as a confirmed new user (empty DB) if there are also no pending local ops.
   // If there ARE pending upserts, the user added data offline before their first sync —
   // returning null here would cause the caller to wipe that unsynchronised data.
@@ -1260,7 +1423,8 @@ async function supaFullSync(){
   // If wombats/burrows queries both failed (network hiccup) while another table succeeded,
   // w and b are null — without this guard we'd mistake a partial failure for a new user
   // and wipe everything the volunteer entered.
-  const localHasData=(JSON.parse(localStorage.getItem(SK.w)||'[]').length>0)||(JSON.parse(localStorage.getItem(SK.b)||'[]').length>0);
+  const [idbW,idbB]=await Promise.all([idbGetAll(STORE.w),idbGetAll(STORE.b)]);
+  const localHasData=(idbW.length>0)||(idbB.length>0);
   if(!(w?.length||0)&&!(b?.length||0)&&!hasPendingUpserts&&!localHasData)return null; // confirmed new user, genuinely empty DB
   // Pending upserts — local version must win over whatever the server returned
   const queuedIds=new Set(
@@ -1276,7 +1440,7 @@ async function supaFullSync(){
   // These are needed to handle the zombie-resurrection race: a delete completes, clears its
   // queue op, but this fetch was already in flight so the server response still contains
   // the deleted record. Without this filter it reappears as if never deleted.
-  const recentlyDeleted=getRecentlyDeleted();
+  const recentlyDeleted=await getRecentlyDeleted();
   const merge=(remote,localKey,conv)=>{
     const local=JSON.parse(localStorage.getItem(SK[localKey])||'[]');
     // If this table's query failed entirely (permissions error, network blip, etc.),
@@ -1317,17 +1481,22 @@ async function supaFullSync(){
 // changes are in the queue and localStorage but not in the merged result.
 // Call this on the merged result RIGHT BEFORE dispatching REPLACE_ALL to
 // re-read the live queue and correct any stale entries.
-function resolveWithCurrentQueue(merged){
+async function resolveWithCurrentQueue(merged){
   let q=[];
-  try{q=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');}catch(e){}
+  try{q=await idbGetQueue();}catch(e){}
   const qIds=new Set(q.filter(op=>op.t==='upsert'&&op.row?.id).map(op=>op.row.id));
   const dIds=new Set(q.filter(op=>op.t==='delete'&&op.id).map(op=>op.id));
   // fetchStart: timestamp recorded at the very start of the supaFullSync fetch.
   // Any local record whose push completed AFTER fetchStart means the server response
   // is stale relative to that push — local wins even though _sync is true.
   const fetchStart=merged._fetchStart||0;
+  // Pre-fetch all local stores from IDB in parallel for efficiency.
+  const localStores={};
+  await Promise.all(Object.keys(STORE).map(async k=>{
+    try{localStores[k]=await idbGetAll(STORE[k]);}catch(e){localStores[k]=[];}
+  }));
   const fix=(items,lsKey)=>{
-    const local=JSON.parse(localStorage.getItem(SK[lsKey])||'[]');
+    const local=localStores[lsKey]||[];
     const localById=Object.fromEntries(local.map(r=>[r.id,r]));
     // Use local version when ANY of these are true:
     //   (a) pending queue op exists for this record
@@ -1490,10 +1659,10 @@ function BAvatar({size=60,photoUrl=null,photoId=null}){
   if(src)return <div style={{width:size,height:size,borderRadius:Math.round(size*0.28),overflow:'hidden',flexShrink:0}}><img src={src} style={{width:'100%',height:'100%',objectFit:'cover'}} alt="" onError={onError}/></div>;
   return <BurrowAvatar size={size}/>;
 }
-function SyncChip({online,pending}){
+function SyncChip({online,queueLen=0}){
   const t=useTheme();
-  if(!online)return <span style={{display:'inline-flex',alignItems:'center',gap:6,background:'rgba(255,255,255,0.12)',color:'#E8D4B0',borderRadius:999,padding:'5px 10px',fontSize:11.5,fontWeight:600}}>{Ico.wifiOff('#E8D4B0',12)} Offline</span>;
-  if(pending)return <span style={{display:'inline-flex',alignItems:'center',gap:6,background:'rgba(255,255,255,0.14)',color:'#E8D4B0',borderRadius:999,padding:'5px 10px',fontSize:11.5,fontWeight:600}}>{Ico.cloud('#E8D4B0',12)} Syncing…</span>;
+  if(!online)return <span style={{display:'inline-flex',alignItems:'center',gap:6,background:'rgba(255,255,255,0.12)',color:'#E8D4B0',borderRadius:999,padding:'5px 10px',fontSize:11.5,fontWeight:600}}>{Ico.wifiOff('#E8D4B0',12)} Offline{queueLen>0?` · ${queueLen} pending`:''}</span>;
+  if(queueLen>0)return <span style={{display:'inline-flex',alignItems:'center',gap:6,background:'rgba(255,255,255,0.14)',color:'#E8D4B0',borderRadius:999,padding:'5px 10px',fontSize:11.5,fontWeight:600}}>{Ico.cloud('#E8D4B0',12)} {queueLen} pending…</span>;
   return <span style={{display:'inline-flex',alignItems:'center',gap:6,background:'rgba(255,255,255,0.14)',color:'#D8E6D8',borderRadius:999,padding:'5px 10px',fontSize:11.5,fontWeight:600}}>{Ico.cloud('#D8E6D8',12)} All synced</span>;
 }
 function Header({title,subtitle,overline,showBack,showAvatar=true,onBack,onAvatarClick,rightAction,children}){
@@ -2023,7 +2192,7 @@ function RecoveryModal({name,photoUrl,onClose}){
 }
 
 /* ── DASHBOARD ── */
-function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
+function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0}){
   const t=useTheme();
   const wombats=data.wombats.filter(w=>!isInactive(w)); // active only for stats
   const inactiveWombats=data.wombats.filter(isInactive);
@@ -2050,7 +2219,7 @@ function Dashboard({data,nav,onFAB,online,pending,openProfile,streak=0}){
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:20}}>
     <Header overline="WOMBATWATCH" title={<span>{(()=>{const h=new Date().getHours();return h<12?'Good morning':h<17?'Good afternoon':'Good evening';})()},<br/>Ranger! 👋</span>} subtitle="It's time to help some creatures" showAvatar onAvatarClick={openProfile}>
       <div style={{marginTop:14,display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
-        <SyncChip online={online} pending={pending}/>
+        <SyncChip online={online} queueLen={queueLen}/>
         {streak>0&&<span style={{display:'inline-flex',alignItems:'center',gap:6,background:'rgba(255,255,255,0.14)',color:'#D8E6D8',borderRadius:999,padding:'5px 10px',fontSize:11.5,fontWeight:600}}><svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="#D8E6D8" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M13 2L4 14h7v8l9-12h-7z"/></svg> {streak} week{streak!==1?'s':''} streak</span>}
       </div>
     </Header>
@@ -5455,17 +5624,39 @@ function App(){
     wombats:init.wombats,burrows:init.burrows,treatments:init.treatments,
     sightings:init.sightings||[],burrowLogs:init.burrowLogs||[],wombatPhotos:init.wombatPhotos||[],burrowPhotos:init.burrowPhotos||[],
   });
+  // ── IDB bootstrap (runs once on mount, before auth resolves) ────
+  // 1. Migrates localStorage data to IDB (one-time, idempotent)
+  // 2. Loads all records from IDB → REPLACE_ALL so data appears immediately
+  // 3. Reads initial queue count for the sync indicator
+  React.useEffect(()=>{
+    async function bootstrapIdb(){
+      try{
+        await migrateToIdb();
+        // Load all record stores in parallel
+        const [w,b,t,s,bl,wp,bp]=await Promise.all([
+          idbGetAll(STORE.w),idbGetAll(STORE.b),idbGetAll(STORE.t),
+          idbGetAll(STORE.s),idbGetAll(STORE.bl),idbGetAll(STORE.wp),idbGetAll(STORE.bp),
+        ]);
+        if(w.length||b.length||t.length||s.length||bl.length||wp.length||bp.length){
+          dispatch({type:'REPLACE_ALL',data:{wombats:w,burrows:b,treatments:t,sightings:s,burrowLogs:bl,wombatPhotos:wp,burrowPhotos:bp}});
+        }
+        refreshQueue();
+      }catch(e){console.warn('[IDB] bootstrap failed',e);}
+    }
+    bootstrapIdb();
+  },[]);
+
   // ── Photo IDB hydration (runs once on mount) ─────────────────
-  // 1. Migrates any existing base64 dataUrls still in localStorage → IDB
-  // 2. Merges IDB photo data back into React state
-  // 3. Runs blank-photo recovery for any photos that are still null after
-  //    step 2 (IDB evicted but Storage may still have the file)
+  // 1. Migrates any existing base64 dataUrls still in localStorage → ww_photo_data IDB
+  // 2. Merges ww_photo_data blobs back into React state
+  // 3. Runs blank-photo recovery for any photos that are still null after step 2
   React.useEffect(()=>{
     async function hydratePhotos(){
       try{
-        // Migrate: pull any base64 still sitting in localStorage into IDB
-        const wpRaw=JSON.parse(localStorage.getItem(SK.wp)||'[]');
-        const bpRaw=JSON.parse(localStorage.getItem(SK.bp)||'[]');
+        // Read photo records from IDB (primary source after migration)
+        const wpRaw=await idbGetAll(STORE.wp).catch(()=>[]);
+        const bpRaw=await idbGetAll(STORE.bp).catch(()=>[]);
+        // Migrate: pull any base64 still sitting in photo records into ww_photo_data IDB
         let migrated=false;
         for(const p of [...wpRaw,...bpRaw]){
           if(p.dataUrl?.startsWith('data:')){
@@ -5474,22 +5665,19 @@ function App(){
           }
         }
         if(migrated){
-          // Re-save without base64 so localStorage is freed up
-          localStorage.setItem(SK.wp,JSON.stringify(wpRaw.map(noB64)));
-          localStorage.setItem(SK.bp,JSON.stringify(bpRaw.map(noB64)));
+          // Strip base64 from records in app IDB (they're now in ww_photo_data)
+          await idbSaveAll(STORE.wp,wpRaw.map(noB64));
+          await idbSaveAll(STORE.bp,bpRaw.map(noB64));
         }
-        // Load all IDB photo data and merge into state
+        // Load all ww_photo_data blobs and merge into state
         const map=await idbGetAllPhotos();
         if(Object.keys(map).length>0) dispatch({type:'HYDRATE_PHOTO_DATA',map});
-        // If online, proactively cache any https:// photos from localStorage that
-        // aren't yet in IDB. This covers the case where IDB was cleared between
-        // sessions (e.g. iOS eviction) — photos re-cache on the very next app open
-        // while online, so an immediate offline session afterwards still works.
+        // If online, proactively cache any https:// photos into ww_photo_data IDB.
+        // This covers the case where ww_photo_data was cleared between sessions
+        // (iOS eviction) — photos re-cache on the next online app open.
         if(navigator.onLine) cacheRemotePhotosToIdb(wpRaw,bpRaw,dispatch).catch(()=>{});
-        // Recovery pass: any photo still null after IDB hydration may have its
-        // blob in Supabase Storage. This silently fixes the "grey box" bug where
-        // IDB eviction caused offline-added photos to lose their data permanently.
-        // Runs in background; failures are silent to avoid blocking the UI.
+        // Recovery pass: any photo still null after hydration may have its blob in
+        // Supabase Storage. Silently fixes "grey box" caused by ww_photo_data eviction.
         recoverBlankPhotos(wpRaw,bpRaw,dispatch).catch(()=>{});
       }catch(e){console.warn('[IDB] hydration failed',e);}
     }
@@ -5511,8 +5699,8 @@ function App(){
   // Burrow list filter/sort state — survives tab switches, resets on page reload
   const [burrowFilterStatus,setBurrowFilterStatus]=useState('all');
   const [burrowSortBy,setBurrowSortBy]=useState('date_added');
-  const [queueLen,setQueueLen]=useState(()=>{try{return JSON.parse(localStorage.getItem(SQ_KEY)||'[]').length;}catch{return 0;}});
-  const refreshQueue=()=>{try{setQueueLen(JSON.parse(localStorage.getItem(SQ_KEY)||'[]').length);}catch{}};
+  const [queueLen,setQueueLen]=useState(0);
+  const refreshQueue=()=>{idbQueueCount().then(n=>setQueueLen(n)).catch(()=>{});};
   const t=theme==='dark'?T.D:T.L;
 
   // ── Auth ─────────────────────────────────────────────────────
@@ -5619,12 +5807,12 @@ function App(){
         // Show the sync bar briefly, then hide it — sync continues in background
         setSyncing(true);
         setTimeout(()=>setSyncing(false),2000);
-        supaFullSync().then(merged=>{
+        supaFullSync().then(async merged=>{
           if(merged){
             // Detect and fix any duplicate W/B codes caused by offline users
             // independently auto-assigning the same number. Earliest record keeps
             // its code; later duplicates are silently renumbered upward.
-            const fresh=resolveWithCurrentQueue(merged);
+            const fresh=await resolveWithCurrentQueue(merged);
             const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
             const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
             const synced={...fresh,wombats,burrows};
@@ -5666,7 +5854,7 @@ function App(){
       try{
         const merged=await supaFullSync();
         if(merged){
-          const fresh=resolveWithCurrentQueue(merged);
+          const fresh=await resolveWithCurrentQueue(merged);
           const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
           const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
           const synced={...fresh,wombats,burrows};
@@ -5684,9 +5872,9 @@ function App(){
       // whatever the server returns is authoritative.
       flushQueue(authUser.id).catch(()=>{}).finally(()=>{
         refreshQueue();
-        supaFullSync().then(merged=>{
+        supaFullSync().then(async merged=>{
           if(merged){
-            const fresh=resolveWithCurrentQueue(merged);
+            const fresh=await resolveWithCurrentQueue(merged);
             const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
             const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
             const synced={...fresh,wombats,burrows};
@@ -5708,10 +5896,9 @@ function App(){
     // never fired, leaving queued entries stranded until the next app reload.
     const drainInterval=setInterval(()=>{
       if(navigator.onLine&&authUser){
-        try{
-          const q=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');
-          if(q.length)flushQueue(authUser.id).catch(()=>{}).finally(refreshQueue);
-        }catch(e){}
+        idbQueueCount().then(n=>{
+          if(n>0)flushQueue(authUser.id).catch(()=>{}).finally(refreshQueue);
+        }).catch(()=>{});
       }
     },30000); // every 30 seconds
     // Periodic background pull: keeps the app up-to-date on devices that stay
@@ -5720,16 +5907,16 @@ function App(){
     // the "app sitting open, no interaction" case. Runs every 2 minutes.
     const bgSyncInterval=setInterval(()=>{
       if(!navigator.onLine||!authUser)return;
-      supaFullSync().then(merged=>{
+      supaFullSync().then(async merged=>{
         if(!merged)return;
-        const fresh=resolveWithCurrentQueue(merged);
+        const fresh=await resolveWithCurrentQueue(merged);
         const{records:wombats}=deduplicateCodes(fresh.wombats,'W');
         const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
         const synced2={...fresh,wombats,burrows};
         dispatch({type:'REPLACE_ALL',data:synced2});
         idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
         cacheRemotePhotosToIdb(synced2.wombatPhotos,synced2.burrowPhotos,dispatch).catch(()=>{});
-            recoverBlankPhotos(synced2.wombatPhotos,synced2.burrowPhotos,dispatch).catch(()=>{});
+        recoverBlankPhotos(synced2.wombatPhotos,synced2.burrowPhotos,dispatch).catch(()=>{});
       }).catch(()=>{});
     },120000); // every 2 minutes
     return()=>{
@@ -5755,9 +5942,9 @@ function App(){
         hiddenAt=null;
         if(hiddenMs<30000)return; // too brief — skip
         if(!authUser||!navigator.onLine)return;
-        supaFullSync().then(merged=>{
+        supaFullSync().then(async merged=>{
           if(merged){
-            const fresh=resolveWithCurrentQueue(merged);
+            const fresh=await resolveWithCurrentQueue(merged);
             const{records:wombats}=deduplicateCodes(fresh.wombats,'W');
             const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
             const synced3={...fresh,wombats,burrows};
@@ -5883,7 +6070,7 @@ function App(){
       {syncing&&<div style={{position:'fixed',top:0,left:'max(0px,calc(50vw - 240px))',right:'max(0px,calc(50vw - 240px))',height:3,zIndex:9999,background:t.f700,transformOrigin:'left',animation:'syncBar 1.4s ease-in-out infinite'}}/>}
       {/* ── content area: grows to fill space above the tab bar ── */}
       <div className="content-area">
-        {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} pending={queueLen>0} openProfile={openProfile} streak={streak}/></div>}
+        {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} queueLen={queueLen} openProfile={openProfile} streak={streak}/></div>}
         {screen==='activity'&&<div className="scroll noscroll"><ActivityScreen data={data} nav={nav}/></div>}
         {screen==='map'&&<MapScreen data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} theme={theme} onAddAt={onAddAt} wombatFilters={mapWombatFilters} setWombatFilters={setMapWombatFilters} burrowFilters={mapBurrowFilters} setBurrowFilters={setMapBurrowFilters} cameraFilter={mapCameraFilter} setCameraFilter={setMapCameraFilter}/>}
         {screen==='wombats'&&<div className="scroll noscroll"><WombatList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile} filterStatus={wombatFilterStatus} setFilterStatus={setWombatFilterStatus} sortBy={wombatSortBy} setSortBy={setWombatSortBy}/></div>}
