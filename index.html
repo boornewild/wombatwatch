@@ -795,9 +795,13 @@ async function supaUpsert(table,row){
 async function supaDelete(table,id){
   try{
     const{error}=await supa.from(table).delete().eq('id',id);
-    if(error){console.warn('[Supa] delete',table,error.message);checkAuthError(error);}
+    if(error){
+      _lastSupaError=`${error.message}${error.code?' ('+error.code+')':''}`;
+      console.warn('[Supa] delete',table,error.message);
+      checkAuthError(error);
+    }
     return!error;
-  }catch(e){return false;}
+  }catch(e){_lastSupaError=String(e);return false;}
 }
 
 // ── Supabase Storage — photo upload ──────────────────────────
@@ -845,7 +849,7 @@ async function resolvePhotoUrl(dataUrl,photoId,localKey){
 // Fix: track successfully-deleted IDs for 5 minutes so the merge can filter them even
 // after the queue op is gone. Entries older than 5 min are pruned automatically.
 const SD_KEY='ww_sync_deleted'; // recently-deleted cache
-const SD_TTL=5*60*1000; // 5 minutes
+const SD_TTL=30*60*1000; // 30 minutes — long enough to survive a slow flush after reconnect
 function markRecentlyDeleted(id){
   try{
     const m=JSON.parse(localStorage.getItem(SD_KEY)||'{}');
@@ -868,23 +872,63 @@ function getRecentlyDeleted(){
 const SQ_KEY='ww_sync_queue';
 const SQ_MAX_RETRIES=5; // drop an op after this many consecutive failures
 function queueOp(op){
-  try{const q=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');q.push({...op,_retries:0});localStorage.setItem(SQ_KEY,JSON.stringify(q));}catch(e){}
+  try{
+    const q=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');
+    q.push({...op,_retries:0});
+    localStorage.setItem(SQ_KEY,JSON.stringify(q));
+  }catch(e){
+    // localStorage quota exceeded or unavailable — this record won't be synced.
+    // Alert the user so they know data may be at risk rather than silently losing it.
+    console.error('[Queue] localStorage write failed — record may be lost:',op.t,op.table||op.path,e);
+    try{
+      if(typeof alert!=='undefined') alert(
+        '⚠️ Storage is full — this record could not be saved for offline sync.\n\n'+
+        'Please free up space on your device (e.g. clear other app data) and check '+
+        'that your data was saved before closing the app.'
+      );
+    }catch{}
+  }
   // Register a Background Sync tag so the queue flushes once connectivity is confirmed stable.
   // No-op on iOS (BackgroundSync not supported there) and degrades silently on older browsers.
   try{navigator.serviceWorker?.ready.then(r=>r.sync?.register('ww-queue-flush')).catch(()=>{});}catch(e){}
 }
+// Returns true if an error string looks like a transient network failure rather
+// than a real Supabase error. Transient errors should never consume retry budget.
+function isNetworkError(errStr){
+  if(!navigator.onLine)return true;
+  return/TypeError|Load failed|Failed to fetch|NetworkError|net::ERR|AbortError/i.test(errStr||'');
+}
+// Returns true if an error string looks like an authentication failure.
+// Auth failures abort the flush — ops are re-queued to retry after sign-in.
+function isAuthErrorStr(errStr){
+  return/401|PGRST301|jwt expired|jwt|not authenticated/i.test(errStr||'');
+}
 async function flushQueue(userId){
+  // Bail immediately if we know we're offline — avoids burning a failed op and
+  // polluting _lastSupaError with a network error before networkAbort kicks in.
+  if(!navigator.onLine)return;
   try{
     const q=JSON.parse(localStorage.getItem(SQ_KEY)||'[]');
     if(!q.length)return;
     // Process parents before children so FK constraints are never violated
     // wombats/burrows → treatments/sightings/logs → photos
     const TABLE_PRI={wombats:0,burrows:0,treatments:1,sightings:1,burrow_logs:1,wombat_photos:2,burrow_photos:2};
-    q.sort((a,b)=>(TABLE_PRI[a.table]??1)-(TABLE_PRI[b.table]??1));
+    // storage-delete ops have no .table field — run them last (after photos, priority 3)
+    const getOpPri=op=>op.t==='storage-delete'?3:(TABLE_PRI[op.table]??1);
+    q.sort((a,b)=>getOpPri(a)-getOpPri(b));
     const remaining=[];
+    let networkAbort=false; // set when a transient network failure is detected
+    let authAbort=false;    // set when an auth error is detected — re-auth needed before retry
     for(const op of q){
+      // Once a network or auth failure is detected, stop processing — re-queue everything
+      // that hasn't been flushed yet without touching their retry counters.
+      // Network: retried on the next reconnect / visibility change.
+      // Auth: retried after the user signs in again.
+      if(networkAbort||authAbort){remaining.push(op);continue;}
       let ok=false;
       let skip=false;
+      let netErr=false;
+      _lastSupaError=''; // reset so stale errors from prior ops don't bleed into netErr check
       try{
         if(op.t==='upsert'){
           let row={...op.row,created_by:op.row.created_by||userId};
@@ -913,9 +957,17 @@ async function flushQueue(userId){
           // Remove a file from Supabase Storage (queued when photo was deleted offline)
           const{error}=await supa.storage.from('photos').remove([op.path]);
           ok=!error;
-          if(error)console.warn('[Queue] Storage delete failed:',op.path,error.message);
+          if(error){
+            _lastSupaError=`${error.message}${error.code?' ('+error.code+')':''}`;
+            console.warn('[Queue] Storage delete failed:',op.path,error.message);
+          }
         }
-      }catch(e){console.warn('[Queue] op threw:',op.t,op.table||op.id,e);}
+        // After any failure, check whether it was a network error vs a real Supabase error
+        if(!ok&&!skip) netErr=isNetworkError(_lastSupaError);
+      }catch(e){
+        console.warn('[Queue] op threw:',op.t,op.table||op.id,e);
+        netErr=true; // uncaught exceptions are almost always network issues
+      }
       if(skip) continue; // already handled above
       if(ok){
         // Mark successfully-pushed records as _sync:true in localStorage so that future
@@ -936,7 +988,21 @@ async function flushQueue(userId){
           // don't re-introduce this record when the queue op is no longer present.
           markRecentlyDeleted(op.id);
         }
+      }else if(netErr){
+        // Transient network failure — re-queue this op unchanged (retries NOT incremented)
+        // and abort the rest of the flush so subsequent ops aren't wasted either.
+        console.warn('[Queue] Network error — pausing flush, will retry on reconnect:',op.t,op.table||op.id);
+        remaining.push(op);
+        networkAbort=true;
+      }else if(isAuthErrorStr(_lastSupaError)){
+        // Auth error — token expired or revoked. Re-queue without charging retry budget.
+        // onAuthError() (called inside supaUpsert/supaDelete via checkAuthError) will
+        // trigger a sign-out; the flush will resume automatically after re-authentication.
+        console.warn('[Queue] Auth error — pausing flush until re-auth:',op.t,op.table||op.id);
+        remaining.push(op);
+        authAbort=true;
       }else{
+        // Genuine Supabase error (bad data, permission denied, etc.) — charge the retry budget.
         const retries=(op._retries||0)+1;
         if(retries>=SQ_MAX_RETRIES){
           console.warn('[Queue] Dropping op after',retries,'failures:',op.t,op.table||op.id);
@@ -996,10 +1062,13 @@ async function syncAction(action,userId){
   try{
     switch(action.type){
       case'ADD_WOMBAT': {
-        // If a burrow link was specified, skip this push — LINK_WOMBAT_BURROW will push the wombat
-        // immediately after with burrowIds already populated in localStorage. Pushing here first
-        // would race against that push and risk landing a wombat on Supabase with empty burrowIds.
-        if(!action.linkedBurrowId) await push('wombats',wombatToDb(action.wombat,userId));
+        // Always push/queue the wombat so it is never silently lost.
+        // If a burrow link was also specified, LINK_WOMBAT_BURROW fires immediately after
+        // and upserts the wombat again with the correct burrowIds — the second upsert wins
+        // (onConflict:'id') and is idempotent. Previously we skipped this push when
+        // linkedBurrowId was set, but that meant an offline ADD_WOMBAT was never queued
+        // if LINK_WOMBAT_BURROW's syncAction ran concurrently before localStorage was updated.
+        await push('wombats',wombatToDb(action.wombat,userId));
         break;
       }
       // Apply patch directly rather than reading from localStorage — the React reducer
@@ -1007,7 +1076,7 @@ async function syncAction(action,userId){
       case'UPDATE_WOMBAT':       {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb({...w,...action.patch},userId));break;}
       case'MARK_WOMBAT_INACTIVE':{const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:action.inactiveAt,inactiveCause:action.inactiveCause||null,inactiveNotes:action.inactiveNotes||null},userId));break;}
       case'MARK_WOMBAT_ACTIVE':  {const w=fromLS('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:null,inactiveCause:null,inactiveNotes:null},userId));break;}
-      case'IMPORT_WOMBATS': for(const w of action.wombats)await push('wombats',wombatToDb(w,userId)); break;
+      case'IMPORT_WOMBATS': for(const w of (action.wombats||[]))await push('wombats',wombatToDb(w,userId)); break;
       case'DELETE_WOMBAT': {
         await del('wombats',action.id);
         // Explicitly delete child records — don't rely on CASCADE DELETE being configured in Supabase.
@@ -1022,9 +1091,16 @@ async function syncAction(action,userId){
         }
         break;
       }
-      case'ADD_BURROW':     await push('burrows',    burrowToDb(action.burrow,userId)); break;
+      case'ADD_BURROW': {
+        // Read back from localStorage rather than action.burrow — by the time syncAction runs,
+        // the reducer may have already committed a LINK_WOMBAT_BURROW that updated wombatIds.
+        // This prevents queuing a stale burrow with empty wombatIds only to have LINK overwrite it.
+        const latestBurrow=fromLS('b',action.burrow.id)||action.burrow;
+        await push('burrows',burrowToDb(latestBurrow,userId));
+        break;
+      }
       case'UPDATE_BURROW':  {const b=fromLS('b',action.id);if(b)await push('burrows',burrowToDb({...b,...action.patch},userId));break;}
-      case'IMPORT_BURROWS': for(const b of action.burrows)await push('burrows',burrowToDb(b,userId)); break;
+      case'IMPORT_BURROWS': for(const b of (action.burrows||[]))await push('burrows',burrowToDb(b,userId)); break;
       case'DELETE_BURROW': {
         await del('burrows',action.id);
         // Explicitly delete child records — don't rely on CASCADE DELETE being configured in Supabase.
@@ -1354,8 +1430,22 @@ function WombatAvatarDark({size=60}){
 function WAvatar({size=60,photoUrl=null,photoId=null}){
   const t=useTheme();
   const [src,setSrc]=React.useState(photoUrl);
-  React.useEffect(()=>setSrc(photoUrl),[photoUrl]);
+  React.useEffect(()=>{
+    if(!photoId){setSrc(photoUrl);return;}
+    // Always try IDB first when we have a photoId.
+    // • For https:// URLs: avoids relying on img onError for offline fallback — onError is
+    //   unreliable on iOS Safari when fully offline (it may never fire, leaving the avatar
+    //   permanently blank even though the blob is in IDB).
+    // • For null dataUrls: shows the photo immediately from IDB rather than waiting for
+    //   HYDRATE_PHOTO_DATA to dispatch (which can be slow on first render).
+    if(photoUrl?.startsWith('https://')||!photoUrl){
+      idbGetPhoto(photoId).then(b=>setSrc(b||photoUrl)).catch(()=>setSrc(photoUrl));
+    }else{
+      setSrc(photoUrl); // already a base64 blob — use directly
+    }
+  },[photoUrl,photoId]);
   const onError=React.useCallback(()=>{
+    // Belt-and-suspenders: if the URL still slips through and fails, try IDB again.
     if(photoId){
       idbGetPhoto(photoId).then(b=>{if(b)setSrc(b);else setSrc(null);}).catch(()=>setSrc(null));
     }else setSrc(null);
@@ -1374,7 +1464,14 @@ function BurrowAvatar({size=48}){
 }
 function BAvatar({size=60,photoUrl=null,photoId=null}){
   const [src,setSrc]=React.useState(photoUrl);
-  React.useEffect(()=>setSrc(photoUrl),[photoUrl]);
+  React.useEffect(()=>{
+    if(!photoId){setSrc(photoUrl);return;}
+    if(photoUrl?.startsWith('https://')||!photoUrl){
+      idbGetPhoto(photoId).then(b=>setSrc(b||photoUrl)).catch(()=>setSrc(photoUrl));
+    }else{
+      setSrc(photoUrl);
+    }
+  },[photoUrl,photoId]);
   const onError=React.useCallback(()=>{
     if(photoId){
       idbGetPhoto(photoId).then(b=>{if(b)setSrc(b);else setSrc(null);}).catch(()=>setSrc(null));
@@ -2628,9 +2725,21 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
 function PhotoCell({photo,onReplace,onDelete,onSetProfile,labelDelete='Delete',setProfileLabel='Set profile',isProfile=false,newIdPrefix='ph_',t}){
   const [errored,setErrored]=React.useState(false);
   const [recoveredSrc,setRecoveredSrc]=React.useState(null);
-  // Reset when photo changes (e.g. after replacement)
-  React.useEffect(()=>{setErrored(false);setRecoveredSrc(null);},[photo.id,photo.dataUrl]);
+  // When photo changes: reset error state and, if it has a remote URL,
+  // proactively load the blob from IDB so it shows immediately offline without
+  // relying on img onError (which is unreliable on iOS Safari when fully offline).
+  React.useEffect(()=>{
+    setErrored(false);
+    setRecoveredSrc(null);
+    // Proactively load from IDB for both https:// URLs (avoids broken img on iOS
+    // Safari offline) and null dataUrls (shows photo immediately without waiting
+    // for HYDRATE_PHOTO_DATA to dispatch).
+    if(photo.dataUrl?.startsWith('https://')||!photo.dataUrl){
+      idbGetPhoto(photo.id).then(b=>{if(b)setRecoveredSrc(b);}).catch(()=>{});
+    }
+  },[photo.id,photo.dataUrl]);
   const handleError=React.useCallback(()=>{
+    // Belt-and-suspenders: still try IDB on any img load failure.
     idbGetPhoto(photo.id).then(b=>{
       if(b)setRecoveredSrc(b);
       else setErrored(true);
@@ -4786,7 +4895,7 @@ function reducer(state,action){
   switch(action.type){
 
     // ── Wombats ──────────────────────────────────────────────────
-    case 'ADD_WOMBAT':{const wombats=[...state.wombats,action.wombat];save('w',wombats);return{...state,wombats};}
+    case 'ADD_WOMBAT':{const wombats=[...state.wombats,{...action.wombat,_sync:false}];save('w',wombats);return{...state,wombats};}
     case 'UPDATE_WOMBAT':{const wombats=state.wombats.map(w=>w.id===action.id?{...w,...action.patch,_sync:false}:w);save('w',wombats);return{...state,wombats};}
     // _sync:false ensures local version wins on next supaFullSync merge even if the
     // page is refreshed before the async Supabase push completes (edit never gets lost).
@@ -4817,7 +4926,7 @@ function reducer(state,action){
     }
 
     // ── Burrows ──────────────────────────────────────────────────
-    case 'ADD_BURROW':{const burrows=[...state.burrows,action.burrow];save('b',burrows);return{...state,burrows};}
+    case 'ADD_BURROW':{const burrows=[...state.burrows,{...action.burrow,_sync:false}];save('b',burrows);return{...state,burrows};}
     case 'IMPORT_BURROWS':{const burrows=[...state.burrows,...action.burrows];save('b',burrows);return{...state,burrows};}
     case 'UPDATE_BURROW':{const burrows=state.burrows.map(b=>b.id===action.id?{...b,...action.patch,_sync:false}:b);save('b',burrows);return{...state,burrows};}
     // _sync:false mirrors the UPDATE_WOMBAT fix: local edit wins merge until server confirms.
@@ -4834,18 +4943,19 @@ function reducer(state,action){
     }
 
     // ── Treatments ───────────────────────────────────────────────
-    case 'ADD_TREATMENT':{const treatments=[...state.treatments,action.treatment];save('t',treatments);return{...state,treatments};}
+    case 'ADD_TREATMENT':{const treatments=[...state.treatments,{...action.treatment,_sync:false}];save('t',treatments);return{...state,treatments};}
     case 'DELETE_TREATMENT':{const treatments=state.treatments.filter(tr=>tr.id!==action.treatmentId);save('t',treatments);return{...state,treatments};}
 
     // ── Sightings ────────────────────────────────────────────────
     // Sighting cases — not an active UI feature but kept for data model completeness
     // (seed data includes sightings; these ensure they persist correctly).
-    case 'ADD_SIGHTING':{const sightings=[...state.sightings,action.sighting];save('s',sightings);return{...state,sightings};}
+    case 'ADD_SIGHTING':{const sightings=[...state.sightings,{...action.sighting,_sync:false}];save('s',sightings);return{...state,sightings};}
     case 'DELETE_SIGHTING':{const sightings=state.sightings.filter(s=>s.id!==action.sightingId);save('s',sightings);return{...state,sightings};}
 
     // ── Photos ───────────────────────────────────────────────────
     // base64 blobs live in IDB; localStorage only holds metadata (dataUrl:null).
-    case 'ADD_WOMBAT_PHOTO':{const wombatPhotos=[...state.wombatPhotos,action.photo];save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};}
+    // _sync:false on new photos so a concurrent server pull doesn't clobber the local record.
+    case 'ADD_WOMBAT_PHOTO':{const wombatPhotos=[...state.wombatPhotos,{...action.photo,_sync:false}];save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};}
     case 'SET_PROFILE_PHOTO':{
       // Mark one photo as the profile image; clear the flag on all others for this wombat.
       // _sync:false on all affected photos so isProfile changes survive any concurrent server pull.
@@ -4853,7 +4963,7 @@ function reducer(state,action){
       save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};
     }
     case 'DELETE_WOMBAT_PHOTO':{const wombatPhotos=state.wombatPhotos.filter(p=>p.id!==action.photoId);save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};}
-    case 'ADD_BURROW_PHOTO':{const burrowPhotos=[...state.burrowPhotos,action.photo];save('bp',burrowPhotos.map(noB64));return{...state,burrowPhotos};}
+    case 'ADD_BURROW_PHOTO':{const burrowPhotos=[...state.burrowPhotos,{...action.photo,_sync:false}];save('bp',burrowPhotos.map(noB64));return{...state,burrowPhotos};}
     case 'SET_BURROW_PROFILE_PHOTO':{
       // Mark one photo as the profile image; clear the flag on all others for this burrow.
       // _sync:false on all affected photos so isProfile changes survive any concurrent server pull.
@@ -4882,7 +4992,7 @@ function reducer(state,action){
       save('bl',bl);save('b',burs);
       return{...state,burrowLogs:bl,burrows:burs};}
     case 'ADD_BURROW_LOG':{
-      const bl=[...state.burrowLogs,action.log];
+      const bl=[...state.burrowLogs,{...action.log,_sync:false}];
       // Mirror log data onto the parent burrow: status, lastChecked, entrance
       // measurements, and habitat fields (substrate, vegetation, trailCamera).
       // Only fields present in the log are patched — missing fields are left alone.
