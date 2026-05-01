@@ -757,29 +757,41 @@ async function migrateToIdb(){
     console.log('[IDB] Migration from localStorage complete');
   }catch(e){console.warn('[IDB] Migration failed:',e);}
 }
-// Cache remote (https://) photo URLs into IDB so they render when offline.
-// Called in the background after every full sync. Only fetches photos not
-// already in IDB, so it's cheap after the first run. Dispatches a second
-// HYDRATE_PHOTO_DATA once blobs are cached so the UI updates without reload.
+// Cache remote photos into IDB so they render when offline.
+// Called after every full sync and on bootstrap. Downloads in parallel using
+// the Supabase Storage SDK (CORS-safe) so results are consistent with
+// fetchAndCachePhoto. Only fetches photos not already in IDB — cheap after
+// first run. Dispatches HYDRATE_PHOTO_DATA so the UI updates without reload.
 async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch){
   try{
     const existing=await idbGetAllPhotos();
     const all=[...(wombatPhotos||[]),...(burrowPhotos||[])];
-    const toFetch=all.filter(p=>p.dataUrl&&p.dataUrl.startsWith('https://')&&!existing[p.id]);
+    // Include photos with https:// dataUrl OR photos whose IDB entry is already
+    // missing — photo ID is always enough to reconstruct the storage path.
+    const toFetch=all.filter(p=>p.id&&!existing[p.id]&&(p.dataUrl?.startsWith('https://')||!p.dataUrl));
     if(!toFetch.length)return;
     const newMap={};
-    for(const p of toFetch){
+    await Promise.allSettled(toFetch.map(async p=>{
       try{
+        // Primary: Supabase Storage SDK — handles CORS, auth, and CDN correctly.
+        const{data,error}=await supa.storage.from('photos').download(`${p.id}.jpg`);
+        if(!error&&data instanceof Blob){
+          const dataUrl=await blobToDataUrl(data);
+          await idbPutPhoto(p.id,dataUrl);
+          newMap[p.id]=dataUrl;
+          return;
+        }
+      }catch(e){}
+      // Fallback: direct fetch via the stored https:// URL
+      try{
+        if(!p.dataUrl?.startsWith('https://'))return;
         const res=await fetch(p.dataUrl);
-        if(!res.ok)continue;
-        const blob=await res.blob();
-        const dataUrl=await new Promise(resolve=>{
-          const r=new FileReader();r.onload=()=>resolve(r.result);r.readAsDataURL(blob);
-        });
+        if(!res.ok)return;
+        const dataUrl=await blobToDataUrl(await res.blob());
         await idbPutPhoto(p.id,dataUrl);
         newMap[p.id]=dataUrl;
-      }catch(e){/* ignore — won't be offline-cached, but won't break anything */}
-    }
+      }catch(e){}
+    }));
     if(Object.keys(newMap).length&&dispatch)dispatch({type:'HYDRATE_PHOTO_DATA',map:newMap});
   }catch(e){}
 }
@@ -1622,18 +1634,35 @@ function WombatAvatarDark({size=60}){
     {Ico.wombat('#A8D4B8',Math.round(size*0.54))}
   </div>;
 }
-// Fetch an https:// photo URL and save the blob to ww_photo_data IDB.
-// Called at display-time so the cache is populated while the user is actually
-// looking at the photo — far more reliable than a background sweep that may
-// not complete before the app is closed.
+// Convert a Blob to a base64 data URL.
+function blobToDataUrl(blob){
+  return new Promise(resolve=>{
+    const r=new FileReader();r.onload=()=>resolve(r.result);r.readAsDataURL(blob);
+  });
+}
+// Download a photo and cache it in ww_photo_data IDB.
+// Uses the Supabase Storage SDK as primary path — it handles CORS and auth
+// correctly, unlike a bare fetch() which is blocked by CORS on many origins.
+// Falls back to direct fetch for any photos with non-standard storage paths.
+// Called at display-time (in WAvatar/BAvatar/PhotoCell) so caching is tied to
+// the user actually viewing the photo — reliable regardless of app close timing.
 async function fetchAndCachePhoto(id,url){
+  // Primary: Supabase Storage SDK download — CORS-safe, auth-aware.
+  // Path convention: all photos are stored as {id}.jpg (see uploadPhotoToStorage).
   try{
+    const{data,error}=await supa.storage.from('photos').download(`${id}.jpg`);
+    if(!error&&data instanceof Blob){
+      const dataUrl=await blobToDataUrl(data);
+      await idbPutPhoto(id,dataUrl);
+      return dataUrl;
+    }
+  }catch(e){}
+  // Fallback: direct fetch (covers any legacy photos with non-standard paths)
+  try{
+    if(!url?.startsWith('https://'))return null;
     const res=await fetch(url);
     if(!res.ok)return null;
-    const blob=await res.blob();
-    const dataUrl=await new Promise(resolve=>{
-      const r=new FileReader();r.onload=()=>resolve(r.result);r.readAsDataURL(blob);
-    });
+    const dataUrl=await blobToDataUrl(await res.blob());
     await idbPutPhoto(id,dataUrl);
     return dataUrl;
   }catch(e){return null;}
