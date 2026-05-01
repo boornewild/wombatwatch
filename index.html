@@ -762,14 +762,20 @@ async function migrateToIdb(){
 // the Supabase Storage SDK (CORS-safe) so results are consistent with
 // fetchAndCachePhoto. Only fetches photos not already in IDB — cheap after
 // first run. Dispatches HYDRATE_PHOTO_DATA so the UI updates without reload.
-async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch){
+// forcedIds: Set of photo IDs to re-download even if their blob is already in IDB.
+// Used after flushQueue to guarantee freshly-uploaded photos are cached locally.
+async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch,forcedIds=new Set()){
   try{
     const existing=await idbGetAllPhotos();
     const all=[...(wombatPhotos||[]),...(burrowPhotos||[])];
-    // Include photos with https:// dataUrl OR photos whose IDB entry is already
-    // missing — photo ID is always enough to reconstruct the storage path.
-    const toFetch=all.filter(p=>p.id&&!existing[p.id]&&(p.dataUrl?.startsWith('https://')||!p.dataUrl));
+    // Include photos where:
+    //   (a) the blob is missing from IDB and there is a Storage URL or no URL at all, OR
+    //   (b) the photo ID is in forcedIds — these were just uploaded so we force a fresh
+    //       cache even if a stale blob already exists (ensures post-sync offline viewing).
+    const toFetch=all.filter(p=>p.id&&(forcedIds.has(p.id)||!existing[p.id])&&(p.dataUrl?.startsWith('https://')||!p.dataUrl));
+    if(forcedIds.size) console.info('[Photo] cacheRemotePhotosToIdb: forced re-cache for',forcedIds.size,'IDs, toFetch='+toFetch.length);
     if(!toFetch.length)return;
+    console.info('[Photo] cacheRemotePhotosToIdb: downloading',toFetch.length,'photo(s)',toFetch.map(p=>p.id));
     const newMap={};
     await Promise.allSettled(toFetch.map(async p=>{
       try{
@@ -792,7 +798,9 @@ async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch){
         newMap[p.id]=dataUrl;
       }catch(e){}
     }));
-    if(Object.keys(newMap).length&&dispatch)dispatch({type:'HYDRATE_PHOTO_DATA',map:newMap});
+    const cached=Object.keys(newMap).length;
+    console.info('[Photo] cacheRemotePhotosToIdb: cached',cached,'blob(s) into ww_photo_data');
+    if(cached&&dispatch)dispatch({type:'HYDRATE_PHOTO_DATA',map:newMap});
   }catch(e){}
 }
 // ── Blank photo recovery ──────────────────────────────────────
@@ -1007,6 +1015,7 @@ async function supaDelete(table,id){
 // URL so subsequent syncs don't re-upload the same image.
 async function uploadPhotoToStorage(dataUrl,photoId,localStorageKey){
   try{
+    console.info('[Photo] uploadPhotoToStorage: uploading',photoId,'dataUrl len='+dataUrl?.length);
     const res=await fetch(dataUrl);
     const blob=await res.blob();
     const path=`${photoId}.jpg`;
@@ -1016,7 +1025,11 @@ async function uploadPhotoToStorage(dataUrl,photoId,localStorageKey){
     // Cache blob to IDB immediately so the photo is available offline right away —
     // without this there is a window between upload and the next supaFullSync where
     // IDB has no entry for this photo and an offline reload shows a broken image.
-    idbPutPhoto(photoId,dataUrl).catch(()=>{});
+    // AWAITED (not fire-and-forget) so the write completes before we return publicUrl.
+    // If the IDB write fails we log but still return the URL — the blob will be
+    // re-downloaded by cacheRemotePhotosToIdb on the next online session.
+    await idbPutPhoto(photoId,dataUrl).catch(e=>console.warn('[Photo] idbPutPhoto FAILED for',photoId,e));
+    console.info('[Photo] uploadPhotoToStorage: IDB blob saved for',photoId,'→',publicUrl);
     // Patch localStorage so this photo is stored as a URL (not base64) going forward
     if(localStorageKey){
       try{
@@ -1096,13 +1109,17 @@ function isNetworkError(errStr){
 function isAuthErrorStr(errStr){
   return/401|PGRST301|jwt expired|jwt|not authenticated/i.test(errStr||'');
 }
+// Returns a Set of photo IDs that were successfully uploaded to Supabase Storage
+// during this flush. Callers use this to force-re-cache those specific blobs into
+// ww_photo_data via cacheRemotePhotosToIdb(forcedIds) after the post-flush sync.
 async function flushQueue(userId){
   // Bail immediately if we know we're offline — avoids burning a failed op and
   // polluting _lastSupaError with a network error before networkAbort kicks in.
-  if(!navigator.onLine)return;
+  if(!navigator.onLine)return new Set();
+  const uploadedPhotoIds=new Set(); // track photo IDs whose Storage upload succeeded
   try{
     const q=await idbGetQueue();
-    if(!q.length)return;
+    if(!q.length)return new Set();
     // Process parents before children so FK constraints are never violated
     // wombats/burrows → treatments/sightings/logs → photos
     const TABLE_PRI={wombats:0,burrows:0,treatments:1,sightings:1,burrow_logs:1,wombat_photos:2,burrow_photos:2};
@@ -1170,6 +1187,8 @@ async function flushQueue(userId){
         if(op.t==='upsert'&&op.row?.id){
           const lk=lsKeyMap[op.table];
           if(lk)await idbMarkSynced(STORE[lk],op.row.id);
+          // Track photo uploads so callers can force-re-cache those blobs after sync
+          if(op.table==='wombat_photos'||op.table==='burrow_photos') uploadedPhotoIds.add(op.row.id);
         }else if(op.t==='delete'&&op.id){
           // Mark in the recently-deleted cache so in-flight syncs don't re-introduce
           // this record when the queue op is no longer present.
@@ -1199,6 +1218,7 @@ async function flushQueue(userId){
       }
     }
   }catch(e){console.warn('[Queue] flush error',e);}
+  return uploadedPhotoIds;
 }
 
 // ── Sync single action → Supabase ─────────────────────────────
@@ -5788,6 +5808,18 @@ function App(){
         // 4. Load all blobs from ww_photo_data — after steps 2+3, this map is as
         //    complete as possible before hitting the network.
         const photoMap=await idbGetAllPhotos();
+        // Diagnostic: log photo state at startup so issues with missing blobs can be traced.
+        if(wp.length||bp.length){
+          const allPhotos=[...wp,...bp];
+          const blobCount=Object.keys(photoMap).length;
+          const withUrl=allPhotos.filter(p=>p.dataUrl?.startsWith('https://')).length;
+          const withNull=allPhotos.filter(p=>!p.dataUrl).length;
+          console.info('[Photo] Bootstrap: records='+allPhotos.length+' blobs_in_idb='+blobCount+' https_url='+withUrl+' null_url='+withNull);
+          if(blobCount<allPhotos.length){
+            const missingIds=allPhotos.filter(p=>!photoMap[p.id]).map(p=>p.id);
+            console.warn('[Photo] Blobs missing from ww_photo_data for IDs:',missingIds);
+          }
+        }
         // 5. REPLACE_ALL first (wombatwatch_v1 records have dataUrl:null from noB64),
         //    then immediately HYDRATE_PHOTO_DATA. React 18 automatic batching groups
         //    both dispatches into one render, but the reducer processes them in order:
@@ -6003,7 +6035,12 @@ function App(){
       // After flushing, do a second full sync so records created by other volunteers
       // while we were offline appear immediately. The queue is empty at this point so
       // whatever the server returns is authoritative.
-      flushQueue(authUser.id).catch(()=>{}).finally(()=>{
+      // Capture uploaded photo IDs from flush so the post-flush sync can force-recache them
+      let _uploadedPhotoIds=new Set();
+      flushQueue(authUser.id)
+        .then(ids=>{if(ids instanceof Set)_uploadedPhotoIds=ids;})
+        .catch(()=>{})
+        .finally(()=>{
         refreshQueue();
         supaFullSync().then(async merged=>{
           if(merged){
@@ -6013,7 +6050,9 @@ function App(){
             const synced={...fresh,wombats,burrows};
             dispatch({type:'REPLACE_ALL',data:synced});
             idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
-            cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
+            // Pass _uploadedPhotoIds so just-synced photos are force-recached into ww_photo_data
+            // even if a (potentially stale) offline blob already exists for them.
+            cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch,_uploadedPhotoIds).catch(()=>{});
             recoverBlankPhotos(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
             changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
             changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
