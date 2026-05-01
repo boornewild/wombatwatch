@@ -685,14 +685,19 @@ async function idbUpdateQueueOp(op){
     });
   }catch(e){}
 }
+// Only count ops for core data tables — wombats, burrows, treatments, burrow_logs,
+// sightings. Photo uploads and storage-deletes are excluded so the "N pending"
+// badge reflects meaningful data entries, not individual photo blobs.
+const DATA_TABLES=new Set(['wombats','burrows','treatments','burrow_logs','sightings']);
 async function idbQueueCount(){
   try{
     const db=await openAppDb();
-    return new Promise((res,rej)=>{
-      const req=db.transaction('queue','readonly').objectStore('queue').count();
-      req.onsuccess=e=>res(e.target.result||0);
+    const all=await new Promise((res,rej)=>{
+      const req=db.transaction('queue','readonly').objectStore('queue').getAll();
+      req.onsuccess=e=>res(e.target.result||[]);
       req.onerror=e=>rej(e.target.error);
     });
+    return all.filter(op=>DATA_TABLES.has(op.table)).length;
   }catch(e){return 0;}
 }
 // Key-value meta store — used for recently-deleted cache, migration flag, etc.
@@ -2203,7 +2208,7 @@ function RecoveryModal({name,photoUrl,onClose}){
 }
 
 /* ── DASHBOARD ── */
-function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0}){
+function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunteerCount='—'}){
   const t=useTheme();
   const wombats=data.wombats.filter(w=>!isInactive(w)); // active only for stats
   const inactiveWombats=data.wombats.filter(isInactive);
@@ -2214,12 +2219,6 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0}){
   const allByEntries=[...treatments,...data.burrowLogs].map(x=>x.by).filter(Boolean);
   const byContributor=allByEntries.reduce((acc,name)=>{acc[name]=(acc[name]||0)+1;return acc;},{});
   const topContrib=Object.entries(byContributor).sort((a,b)=>b[1]-a[1])[0]?.[0]||'—';
-  const [volunteerCount,setVolunteerCount]=useState('—');
-  useEffect(()=>{
-    supa.rpc('volunteer_count').then(({data,error})=>{
-      if(!error&&data!=null)setVolunteerCount(data);
-    });
-  },[]);
   const lav=t.lav500;
   const allWombats=data.wombats; // all wombats (incl. inactive) for activity lookups
   const allActivity=[
@@ -5690,64 +5689,70 @@ function App(){
     wombats:init.wombats,burrows:init.burrows,treatments:init.treatments,
     sightings:init.sightings||[],burrowLogs:init.burrowLogs||[],wombatPhotos:init.wombatPhotos||[],burrowPhotos:init.burrowPhotos||[],
   });
-  // ── IDB bootstrap (runs once on mount, before auth resolves) ────
-  // 1. Migrates localStorage data to IDB (one-time, idempotent)
-  // 2. Loads all records from IDB → REPLACE_ALL so data appears immediately
-  // 3. Reads initial queue count for the sync indicator
+  // ── IDB bootstrap + photo hydration (single sequential effect) ──────────────
+  // IMPORTANT: These must stay in ONE effect. Previously two separate useEffect([])
+  // hooks ran concurrently — hydratePhotos could complete first and dispatch
+  // HYDRATE_PHOTO_DATA (setting base64 blobs in state), then bootstrapIdb would
+  // dispatch REPLACE_ALL with dataUrl:null records from wombatwatch_v1, wiping all
+  // the blobs. Merging into one async function guarantees REPLACE_ALL always fires
+  // before HYDRATE_PHOTO_DATA so hydration is never overwritten.
   React.useEffect(()=>{
-    async function bootstrapIdb(){
+    async function bootstrap(){
       try{
         await migrateToIdb();
-        // Load all record stores in parallel
-        const [w,b,t,s,bl,wp,bp]=await Promise.all([
+        // 1. Load all record stores + queue in parallel
+        const [w,b,t,s,bl,wp,bp,queue]=await Promise.all([
           idbGetAll(STORE.w),idbGetAll(STORE.b),idbGetAll(STORE.t),
           idbGetAll(STORE.s),idbGetAll(STORE.bl),idbGetAll(STORE.wp),idbGetAll(STORE.bp),
+          idbGetQueue().catch(()=>[]),
         ]);
-        if(w.length||b.length||t.length||s.length||bl.length||wp.length||bp.length){
-          dispatch({type:'REPLACE_ALL',data:{wombats:w,burrows:b,treatments:t,sightings:s,burrowLogs:bl,wombatPhotos:wp,burrowPhotos:bp}});
+        // 2. Rescue base64 blobs embedded in pending queue ops into ww_photo_data.
+        //    Covers the case where iOS evicted ww_photo_data between sessions but the
+        //    queue op still holds the original base64 (the photo hasn't uploaded yet).
+        //    Without this, offline-added photos that haven't synced yet go grey after
+        //    any session that clears ww_photo_data.
+        for(const op of queue){
+          if(op.row?.data_url?.startsWith('data:')){
+            const existing=await idbGetPhoto(op.row.id);
+            if(!existing) await idbPutPhoto(op.row.id,op.row.data_url).catch(()=>{});
+          }
         }
-        refreshQueue();
-      }catch(e){console.warn('[IDB] bootstrap failed',e);}
-    }
-    bootstrapIdb();
-  },[]);
-
-  // ── Photo IDB hydration (runs once on mount) ─────────────────
-  // 1. Migrates any existing base64 dataUrls still in localStorage → ww_photo_data IDB
-  // 2. Merges ww_photo_data blobs back into React state
-  // 3. Runs blank-photo recovery for any photos that are still null after step 2
-  React.useEffect(()=>{
-    async function hydratePhotos(){
-      try{
-        // Read photo records from IDB (primary source after migration)
-        const wpRaw=await idbGetAll(STORE.wp).catch(()=>[]);
-        const bpRaw=await idbGetAll(STORE.bp).catch(()=>[]);
-        // Migrate: pull any base64 still sitting in photo records into ww_photo_data IDB
+        // 3. Migrate any base64 still sitting in photo records → ww_photo_data
+        //    (legacy cleanup — new records always go through noB64 before IDB save)
         let migrated=false;
-        for(const p of [...wpRaw,...bpRaw]){
+        for(const p of [...wp,...bp]){
           if(p.dataUrl?.startsWith('data:')){
             await idbPutPhoto(p.id,p.dataUrl);
             migrated=true;
           }
         }
         if(migrated){
-          // Strip base64 from records in app IDB (they're now in ww_photo_data)
-          await idbSaveAll(STORE.wp,wpRaw.map(noB64));
-          await idbSaveAll(STORE.bp,bpRaw.map(noB64));
+          await idbSaveAll(STORE.wp,wp.map(noB64));
+          await idbSaveAll(STORE.bp,bp.map(noB64));
         }
-        // Load all ww_photo_data blobs and merge into state
-        const map=await idbGetAllPhotos();
-        if(Object.keys(map).length>0) dispatch({type:'HYDRATE_PHOTO_DATA',map});
-        // If online, proactively cache any https:// photos into ww_photo_data IDB.
-        // This covers the case where ww_photo_data was cleared between sessions
-        // (iOS eviction) — photos re-cache on the next online app open.
-        if(navigator.onLine) cacheRemotePhotosToIdb(wpRaw,bpRaw,dispatch).catch(()=>{});
-        // Recovery pass: any photo still null after hydration may have its blob in
-        // Supabase Storage. Silently fixes "grey box" caused by ww_photo_data eviction.
-        recoverBlankPhotos(wpRaw,bpRaw,dispatch).catch(()=>{});
-      }catch(e){console.warn('[IDB] hydration failed',e);}
+        // 4. Load all blobs from ww_photo_data — after steps 2+3, this map is as
+        //    complete as possible before hitting the network.
+        const photoMap=await idbGetAllPhotos();
+        // 5. REPLACE_ALL first (wombatwatch_v1 records have dataUrl:null from noB64),
+        //    then immediately HYDRATE_PHOTO_DATA. React 18 automatic batching groups
+        //    both dispatches into one render, but the reducer processes them in order:
+        //    REPLACE_ALL sets records with null dataUrls, then HYDRATE patches in the
+        //    blobs. No await between them — ordering is guaranteed by JS call sequence.
+        if(w.length||b.length||t.length||s.length||bl.length||wp.length||bp.length){
+          dispatch({type:'REPLACE_ALL',data:{wombats:w,burrows:b,treatments:t,sightings:s,burrowLogs:bl,wombatPhotos:wp,burrowPhotos:bp}});
+        }
+        if(Object.keys(photoMap).length>0) dispatch({type:'HYDRATE_PHOTO_DATA',map:photoMap});
+        refreshQueue();
+        // 6. Online-only recovery (best-effort, non-blocking):
+        //    • cacheRemotePhotosToIdb: proactively fetches https:// photo URLs into
+        //      ww_photo_data so next offline session finds them already cached.
+        //    • recoverBlankPhotos: re-fetches any still-null blobs from Supabase
+        //      Storage (belt-and-suspenders for eviction-caused grey boxes).
+        if(navigator.onLine) cacheRemotePhotosToIdb(wp,bp,dispatch).catch(()=>{});
+        recoverBlankPhotos(wp,bp,dispatch).catch(()=>{});
+      }catch(e){console.warn('[IDB] bootstrap failed',e);}
     }
-    hydratePhotos();
+    bootstrap();
   },[]);
 
   const [screen,setScreen]=useState('dashboard');
@@ -5767,6 +5772,13 @@ function App(){
   const [burrowSortBy,setBurrowSortBy]=useState('date_added');
   const [queueLen,setQueueLen]=useState(0);
   const refreshQueue=()=>{idbQueueCount().then(n=>setQueueLen(n)).catch(()=>{});};
+  // Volunteer count — fetched once when online, cached in localStorage so the last
+  // known value shows immediately on mount and when the device is offline. Lifted to
+  // App level so it isn't reset to '—' every time the Dashboard tab is re-entered.
+  const VOL_COUNT_KEY='ww_vol_count';
+  const [volunteerCount,setVolunteerCount]=useState(()=>{
+    try{const v=localStorage.getItem(VOL_COUNT_KEY);return v!=null?Number(v):'—';}catch{return'—';}
+  });
   const t=theme==='dark'?T.D:T.L;
 
   // ── Auth ─────────────────────────────────────────────────────
@@ -5993,6 +6005,20 @@ function App(){
     };
   },[authUser]);
 
+  // ── Volunteer count ───────────────────────────────────────────
+  // Fetched once on mount and re-fetched whenever online status changes to true.
+  // Result is cached in localStorage so the last known value shows immediately
+  // on startup and while offline (no flash to '—' on tab switch).
+  React.useEffect(()=>{
+    if(!online||!authUser)return;
+    supa.rpc('volunteer_count').then(({data,error})=>{
+      if(!error&&data!=null){
+        setVolunteerCount(data);
+        try{localStorage.setItem(VOL_COUNT_KEY,String(data));}catch{}
+      }
+    });
+  },[online,authUser]);
+
   // ── Tab visibility re-sync ────────────────────────────────────
   // When the user switches back to this tab (e.g. after editing on their phone),
   // pull the latest from Supabase so changes made on other devices appear immediately.
@@ -6136,7 +6162,7 @@ function App(){
       {syncing&&<div style={{position:'fixed',top:0,left:'max(0px,calc(50vw - 240px))',right:'max(0px,calc(50vw - 240px))',height:3,zIndex:9999,background:t.f700,transformOrigin:'left',animation:'syncBar 1.4s ease-in-out infinite'}}/>}
       {/* ── content area: grows to fill space above the tab bar ── */}
       <div className="content-area">
-        {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} queueLen={queueLen} openProfile={openProfile} streak={streak}/></div>}
+        {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} queueLen={queueLen} openProfile={openProfile} streak={streak} volunteerCount={volunteerCount}/></div>}
         {screen==='activity'&&<div className="scroll noscroll"><ActivityScreen data={data} nav={nav}/></div>}
         {screen==='map'&&<MapScreen data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} theme={theme} onAddAt={onAddAt} wombatFilters={mapWombatFilters} setWombatFilters={setMapWombatFilters} burrowFilters={mapBurrowFilters} setBurrowFilters={setMapBurrowFilters} cameraFilter={mapCameraFilter} setCameraFilter={setMapCameraFilter}/>}
         {screen==='wombats'&&<div className="scroll noscroll"><WombatList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile} filterStatus={wombatFilterStatus} setFilterStatus={setWombatFilterStatus} sortBy={wombatSortBy} setSortBy={setWombatSortBy}/></div>}
