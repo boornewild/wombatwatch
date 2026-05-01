@@ -1622,25 +1622,45 @@ function WombatAvatarDark({size=60}){
     {Ico.wombat('#A8D4B8',Math.round(size*0.54))}
   </div>;
 }
+// Fetch an https:// photo URL and save the blob to ww_photo_data IDB.
+// Called at display-time so the cache is populated while the user is actually
+// looking at the photo — far more reliable than a background sweep that may
+// not complete before the app is closed.
+async function fetchAndCachePhoto(id,url){
+  try{
+    const res=await fetch(url);
+    if(!res.ok)return null;
+    const blob=await res.blob();
+    const dataUrl=await new Promise(resolve=>{
+      const r=new FileReader();r.onload=()=>resolve(r.result);r.readAsDataURL(blob);
+    });
+    await idbPutPhoto(id,dataUrl);
+    return dataUrl;
+  }catch(e){return null;}
+}
 function WAvatar({size=60,photoUrl=null,photoId=null}){
   const t=useTheme();
-  const [src,setSrc]=React.useState(photoUrl);
+  const [src,setSrc]=React.useState(null);
   React.useEffect(()=>{
     if(!photoId){setSrc(photoUrl);return;}
-    // Always try IDB first when we have a photoId.
-    // • For https:// URLs: avoids relying on img onError for offline fallback — onError is
-    //   unreliable on iOS Safari when fully offline (it may never fire, leaving the avatar
-    //   permanently blank even though the blob is in IDB).
-    // • For null dataUrls: shows the photo immediately from IDB rather than waiting for
-    //   HYDRATE_PHOTO_DATA to dispatch (which can be slow on first render).
-    if(photoUrl?.startsWith('https://')||!photoUrl){
-      idbGetPhoto(photoId).then(b=>setSrc(b||photoUrl)).catch(()=>setSrc(photoUrl));
-    }else{
-      setSrc(photoUrl); // already a base64 blob — use directly
-    }
+    if(photoUrl?.startsWith('data:')){setSrc(photoUrl);return;}
+    // For https:// URLs and null: always check IDB first.
+    // If IDB is empty and we're online, fetch + cache now so the next offline
+    // session finds the blob waiting — don't rely on background cacheRemotePhotosToIdb
+    // which races against the app being closed.
+    idbGetPhoto(photoId).then(cached=>{
+      if(cached){setSrc(cached);return;}
+      // Nothing in IDB yet.
+      if(!photoUrl){setSrc(null);return;}
+      // Show the https:// URL immediately (renders fine while online), then
+      // fetch + cache the blob so it survives the next offline cold start.
+      setSrc(photoUrl);
+      if(navigator.onLine){
+        fetchAndCachePhoto(photoId,photoUrl).then(blob=>{if(blob)setSrc(blob);}).catch(()=>{});
+      }
+    }).catch(()=>setSrc(photoUrl||null));
   },[photoUrl,photoId]);
   const onError=React.useCallback(()=>{
-    // Belt-and-suspenders: if the URL still slips through and fails, try IDB again.
     if(photoId){
       idbGetPhoto(photoId).then(b=>{if(b)setSrc(b);else setSrc(null);}).catch(()=>setSrc(null));
     }else setSrc(null);
@@ -1658,14 +1678,18 @@ function BurrowAvatar({size=48}){
   </div>;
 }
 function BAvatar({size=60,photoUrl=null,photoId=null}){
-  const [src,setSrc]=React.useState(photoUrl);
+  const [src,setSrc]=React.useState(null);
   React.useEffect(()=>{
     if(!photoId){setSrc(photoUrl);return;}
-    if(photoUrl?.startsWith('https://')||!photoUrl){
-      idbGetPhoto(photoId).then(b=>setSrc(b||photoUrl)).catch(()=>setSrc(photoUrl));
-    }else{
+    if(photoUrl?.startsWith('data:')){setSrc(photoUrl);return;}
+    idbGetPhoto(photoId).then(cached=>{
+      if(cached){setSrc(cached);return;}
+      if(!photoUrl){setSrc(null);return;}
       setSrc(photoUrl);
-    }
+      if(navigator.onLine){
+        fetchAndCachePhoto(photoId,photoUrl).then(blob=>{if(blob)setSrc(blob);}).catch(()=>{});
+      }
+    }).catch(()=>setSrc(photoUrl||null));
   },[photoUrl,photoId]);
   const onError=React.useCallback(()=>{
     if(photoId){
@@ -2914,21 +2938,23 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
 function PhotoCell({photo,onReplace,onDelete,onSetProfile,labelDelete='Delete',setProfileLabel='Set profile',isProfile=false,newIdPrefix='ph_',t}){
   const [errored,setErrored]=React.useState(false);
   const [recoveredSrc,setRecoveredSrc]=React.useState(null);
-  // When photo changes: reset error state and, if it has a remote URL,
-  // proactively load the blob from IDB so it shows immediately offline without
-  // relying on img onError (which is unreliable on iOS Safari when fully offline).
   React.useEffect(()=>{
     setErrored(false);
     setRecoveredSrc(null);
-    // Proactively load from IDB for both https:// URLs (avoids broken img on iOS
-    // Safari offline) and null dataUrls (shows photo immediately without waiting
-    // for HYDRATE_PHOTO_DATA to dispatch).
-    if(photo.dataUrl?.startsWith('https://')||!photo.dataUrl){
-      idbGetPhoto(photo.id).then(b=>{if(b)setRecoveredSrc(b);}).catch(()=>{});
-    }
+    if(!photo.dataUrl&&!photo.id)return;
+    if(photo.dataUrl?.startsWith('data:')){return;} // already a blob in state — no IDB needed
+    // For https:// URLs and null dataUrls: check IDB first.
+    // If IDB is empty and we're online, fetch + cache now so the next offline
+    // cold start finds the blob — don't rely on cacheRemotePhotosToIdb which
+    // races against the app being closed.
+    idbGetPhoto(photo.id).then(cached=>{
+      if(cached){setRecoveredSrc(cached);return;}
+      if(photo.dataUrl?.startsWith('https://')&&navigator.onLine){
+        fetchAndCachePhoto(photo.id,photo.dataUrl).then(blob=>{if(blob)setRecoveredSrc(blob);}).catch(()=>{});
+      }
+    }).catch(()=>{});
   },[photo.id,photo.dataUrl]);
   const handleError=React.useCallback(()=>{
-    // Belt-and-suspenders: still try IDB on any img load failure.
     idbGetPhoto(photo.id).then(b=>{
       if(b)setRecoveredSrc(b);
       else setErrored(true);
