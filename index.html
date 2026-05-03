@@ -220,6 +220,8 @@ const uid=()=>{
   return'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==='x'?r:(r&0x3|0x8)).toString(16);});
 };
 const fmtDate=s=>{if(!s)return'—';const d=new Date(s);return`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;};
+// Like fmtDate but also shows time (h:mm AM/PM) when the string includes a time component.
+const fmtDateTime=s=>{if(!s)return'—';const hasTime=s.length>10&&s.includes('T')||s.includes(' ')&&s.split(' ')[1]?.includes(':');const d=new Date(s);const date=`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;if(!hasTime)return date;const h=d.getHours(),m=String(d.getMinutes()).padStart(2,'0');return`${date} ${h%12||12}:${m} ${h<12?'AM':'PM'}`;};
 const timeAgo=s=>{if(!s)return'';const h=Math.floor((Date.now()-new Date(s))/36e5);if(h<1)return'Just now';if(h<24)return`${h}h ago`;const d=Math.floor(h/24);return d===1?'Yesterday':`${d}d ago`;};
 const today=()=>new Date().toISOString().slice(0,10);
 const statusTone=s=>({healthy:'sage',under_treatment:'amber',missing:'pearl',deceased:'rose'}[s]||'pearl');
@@ -2292,8 +2294,6 @@ function ActivityScreen({data,nav,dispatch}){
     ...(data.burrowLogs||[]).map(x=>({...x,type:'burrowlog',at:x.at})),
     ...wombats.filter(x=>x.firstSeen).map(x=>({...x,type:'wombat_added',at:x.firstSeen})),
     ...burrows.filter(x=>x.lastChecked).map(x=>({...x,type:'burrow_added',at:x.lastChecked})),
-    ...(data.wombatPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'wombat_photo',at:x.at})),
-    ...(data.burrowPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'burrow_photo',at:x.at})),
   ].sort((a,b)=>new Date(b.at)-new Date(a.at)).slice(0,100);
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
     <Header showBack onBack={()=>nav('dashboard')} title="All Activity" showAvatar={false}/>
@@ -2303,8 +2303,9 @@ function ActivityScreen({data,nav,dispatch}){
         if(a.type==='treatment'){
           const w=wombats.find(x=>x.id===a.wombatId);
           const ab=a.linkedBurrowId?burrows.find(b=>b.id===a.linkedBurrowId):null;
+          const wp=data.wombatPhotos?.find(p=>p.wombatId===w?.id&&p.isProfile)||data.wombatPhotos?.find(p=>p.wombatId===w?.id);
           return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
-            <WAvatar size={44}/>
+            <WAvatar size={44} photoUrl={wp?.dataUrl} photoId={wp?.id}/>
             <div style={{flex:1,minWidth:0}}>
               <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{w?.name||'Unknown Wombat'}</div>
               <div style={{fontSize:12,color:t.mid,marginTop:2,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>Treatment applied · {fmtDate(a.at)}</div>
@@ -2315,8 +2316,9 @@ function ActivityScreen({data,nav,dispatch}){
         }
         if(a.type==='burrowlog'){
           const b=burrows.find(x=>x.id===a.burrowId);
+          const bp=data.burrowPhotos?.find(p=>p.burrowId===b?.id&&p.isProfile)||data.burrowPhotos?.find(p=>p.burrowId===b?.id);
           return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
-            <BurrowAvatar size={44}/>
+            <BAvatar size={44} photoUrl={bp?.dataUrl} photoId={bp?.id}/>
             <div style={{flex:1,minWidth:0}}>
               <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{b?.name||'Unknown Burrow'}</div>
               <div style={{fontSize:12,color:t.mid,marginTop:2}}>Status change · {fmtDate(a.at)}</div>
@@ -2325,8 +2327,9 @@ function ActivityScreen({data,nav,dispatch}){
           </Card>;
         }
         if(a.type==='wombat_added'){
+          const wp=data.wombatPhotos?.find(p=>p.wombatId===a.id&&p.isProfile)||data.wombatPhotos?.find(p=>p.wombatId===a.id);
           return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
-            <WAvatar size={44}/>
+            <WAvatar size={44} photoUrl={wp?.dataUrl} photoId={wp?.id}/>
             <div style={{flex:1,minWidth:0}}>
               <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{a.name||'Unknown Wombat'}</div>
               <div style={{fontSize:12,color:t.mid,marginTop:2}}>Wombat registered · {fmtDate(a.at)}</div>
@@ -2335,8 +2338,9 @@ function ActivityScreen({data,nav,dispatch}){
           </Card>;
         }
         if(a.type==='burrow_added'){
+          const bp=data.burrowPhotos?.find(p=>p.burrowId===a.id&&p.isProfile)||data.burrowPhotos?.find(p=>p.burrowId===a.id);
           return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
-            <BurrowAvatar size={44}/>
+            <BAvatar size={44} photoUrl={bp?.dataUrl} photoId={bp?.id}/>
             <div style={{flex:1,minWidth:0}}>
               <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{a.name||'Unknown Burrow'}</div>
               <div style={{fontSize:12,color:t.mid,marginTop:2}}>Burrow recorded · {fmtDate(a.at)}</div>
@@ -2403,8 +2407,6 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
     ...treatments.map(x=>({...x,type:'treatment',at:x.at})),
     ...data.wombats.filter(x=>x.firstSeen).map(x=>({...x,type:'wombat_added',at:x.firstSeen})),
     ...burrows.filter(x=>x.lastChecked).map(x=>({...x,type:'burrow_added',at:x.lastChecked})),
-    ...(data.wombatPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'wombat_photo',at:x.at})),
-    ...(data.burrowPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'burrow_photo',at:x.at})),
   ].sort((a,b)=>new Date(b.at)-new Date(a.at)).slice(0,4);
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:20}}>
     <Header overline="WOMBATWATCH" title={<span>{(()=>{const h=new Date().getHours();return h<12?'Good morning':h<17?'Good afternoon':'Good evening';})()},<br/>Ranger! 👋</span>} subtitle="It's time to help some creatures" showAvatar onAvatarClick={openProfile}>
@@ -2436,8 +2438,9 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
           if(a.type==='treatment'){
             const w=allWombats.find(x=>x.id===a.wombatId);
             const ab=a.linkedBurrowId?burrows.find(b=>b.id===a.linkedBurrowId):null;
+            const wp=data.wombatPhotos?.find(p=>p.wombatId===w?.id&&p.isProfile)||data.wombatPhotos?.find(p=>p.wombatId===w?.id);
             return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
-              <WAvatar size={44}/>
+              <WAvatar size={44} photoUrl={wp?.dataUrl} photoId={wp?.id}/>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{w?.name||'Unknown Wombat'}</div>
                 <div style={{fontSize:12,color:t.mid,marginTop:2,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>Treatment applied · {fmtDate(a.at)}</div>
@@ -2448,8 +2451,9 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
           }
           if(a.type==='sighting'){
             const w=allWombats.find(x=>x.id===a.wombatId);
+            const wp=data.wombatPhotos?.find(p=>p.wombatId===w?.id&&p.isProfile)||data.wombatPhotos?.find(p=>p.wombatId===w?.id);
             return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
-              <WAvatar size={44}/>
+              <WAvatar size={44} photoUrl={wp?.dataUrl} photoId={wp?.id}/>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{w?.name||'Unknown Wombat'}</div>
                 <div style={{fontSize:12,color:t.mid,marginTop:2}}>Sighted · {fmtDate(a.at)}</div>
@@ -2459,8 +2463,9 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
           }
           if(a.type==='burrowlog'){
             const b=burrows.find(x=>x.id===a.burrowId);
+            const bp=data.burrowPhotos?.find(p=>p.burrowId===b?.id&&p.isProfile)||data.burrowPhotos?.find(p=>p.burrowId===b?.id);
             return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
-              <BurrowAvatar size={44}/>
+              <BAvatar size={44} photoUrl={bp?.dataUrl} photoId={bp?.id}/>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{b?.name||'Unknown Burrow'}</div>
                 <div style={{fontSize:12,color:t.mid,marginTop:2}}>Status change · {fmtDate(a.at)}</div>
@@ -2469,8 +2474,9 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
             </Card>;
           }
           if(a.type==='wombat_added'){
+            const wp=data.wombatPhotos?.find(p=>p.wombatId===a.id&&p.isProfile)||data.wombatPhotos?.find(p=>p.wombatId===a.id);
             return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
-              <WAvatar size={44}/>
+              <WAvatar size={44} photoUrl={wp?.dataUrl} photoId={wp?.id}/>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{a.name||'Unknown Wombat'}</div>
                 <div style={{fontSize:12,color:t.mid,marginTop:2}}>Wombat registered · {fmtDate(a.at)}</div>
@@ -2479,8 +2485,9 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
             </Card>;
           }
           if(a.type==='burrow_added'){
+            const bp=data.burrowPhotos?.find(p=>p.burrowId===a.id&&p.isProfile)||data.burrowPhotos?.find(p=>p.burrowId===a.id);
             return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
-              <BurrowAvatar size={44}/>
+              <BAvatar size={44} photoUrl={bp?.dataUrl} photoId={bp?.id}/>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{a.name||'Unknown Burrow'}</div>
                 <div style={{fontSize:12,color:t.mid,marginTop:2}}>Burrow recorded · {fmtDate(a.at)}</div>
