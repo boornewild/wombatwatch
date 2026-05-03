@@ -1009,6 +1009,19 @@ async function supaDelete(table,id){
 }
 
 // ── Supabase Storage — photo upload ──────────────────────────
+// Convert a base64 data URL to a Blob without using fetch() — Safari iOS does not
+// support fetch() on data: URLs, which would silently cause the upload to fail.
+function dataUrlToBlob(dataUrl){
+  try{
+    const[header,b64]=dataUrl.split(',');
+    const mime=(header.match(/:(.*?);/)||[])[1]||'image/jpeg';
+    const binary=atob(b64);
+    const bytes=new Uint8Array(binary.length);
+    for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
+    return new Blob([bytes],{type:mime});
+  }catch(e){console.warn('[Photo] dataUrlToBlob failed',e);return null;}
+}
+
 // Uploads a base64 dataUrl to the 'photos' storage bucket.
 // Returns the public URL on success, or null if upload fails.
 // After a successful upload the local record is patched to use the
@@ -1016,8 +1029,10 @@ async function supaDelete(table,id){
 async function uploadPhotoToStorage(dataUrl,photoId,localStorageKey){
   try{
     console.info('[Photo] uploadPhotoToStorage: uploading',photoId,'dataUrl len='+dataUrl?.length);
-    const res=await fetch(dataUrl);
-    const blob=await res.blob();
+    // Use dataUrlToBlob() instead of fetch(dataUrl) — Safari iOS doesn't support
+    // fetching data: URLs, which would silently make the whole upload fail.
+    const blob=dataUrlToBlob(dataUrl);
+    if(!blob){console.warn('[Photo] dataUrlToBlob returned null for',photoId);return null;}
     const path=`${photoId}.jpg`;
     const{error}=await supa.storage.from('photos').upload(path,blob,{upsert:true,contentType:'image/jpeg'});
     if(error){console.warn('[Storage]',error.message);return null;}
@@ -1146,6 +1161,14 @@ async function flushQueue(userId){
               const lk=op.table==='wombat_photos'?SK.wp:SK.bp;
               const url=await resolvePhotoUrl(row.data_url,row.id,lk);
               row={...row,data_url:url};
+              // If we got a Storage URL back, write it to the IDB record immediately so
+              // the record survives with data_url:'https://...' even if ww_photo_data is evicted.
+              if(url?.startsWith('https://')){
+                try{
+                  const existing=await idbGetOne(STORE[lk],op.row.id);
+                  if(existing)await idbSaveAll(STORE[lk],(await idbGetAll(STORE[lk])).map(r=>r.id===op.row.id?{...r,dataUrl:url}:r));
+                }catch(e){}
+              }
             }else if(!row.data_url){
               const idbData=await idbGetPhoto(row.id);
               if(!idbData){
@@ -5774,6 +5797,14 @@ function App(){
   React.useEffect(()=>{
     async function bootstrap(){
       try{
+        // Request durable storage so iOS Safari doesn't evict ww_photo_data between sessions.
+        // Without this, Safari treats IDB as a best-effort cache and can clear it silently.
+        // The request is advisory — Safari may not grant it, but calling it improves persistence.
+        if(navigator.storage?.persist){
+          navigator.storage.persist().then(granted=>{
+            console.info('[Storage] Persistent storage granted:',granted);
+          }).catch(()=>{});
+        }
         await migrateToIdb();
         // 1. Load all record stores + queue in parallel
         const [w,b,t,s,bl,wp,bp,queue]=await Promise.all([
