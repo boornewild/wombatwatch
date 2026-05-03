@@ -2292,6 +2292,8 @@ function ActivityScreen({data,nav,dispatch}){
     ...(data.burrowLogs||[]).map(x=>({...x,type:'burrowlog',at:x.at})),
     ...wombats.filter(x=>x.firstSeen).map(x=>({...x,type:'wombat_added',at:x.firstSeen})),
     ...burrows.filter(x=>x.lastChecked).map(x=>({...x,type:'burrow_added',at:x.lastChecked})),
+    ...(data.wombatPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'wombat_photo',at:x.at})),
+    ...(data.burrowPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'burrow_photo',at:x.at})),
   ].sort((a,b)=>new Date(b.at)-new Date(a.at)).slice(0,100);
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
     <Header showBack onBack={()=>nav('dashboard')} title="All Activity" showAvatar={false}/>
@@ -2401,6 +2403,8 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
     ...treatments.map(x=>({...x,type:'treatment',at:x.at})),
     ...data.wombats.filter(x=>x.firstSeen).map(x=>({...x,type:'wombat_added',at:x.firstSeen})),
     ...burrows.filter(x=>x.lastChecked).map(x=>({...x,type:'burrow_added',at:x.lastChecked})),
+    ...(data.wombatPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'wombat_photo',at:x.at})),
+    ...(data.burrowPhotos||[]).filter(x=>x.at).map(x=>({...x,type:'burrow_photo',at:x.at})),
   ].sort((a,b)=>new Date(b.at)-new Date(a.at)).slice(0,4);
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:20}}>
     <Header overline="WOMBATWATCH" title={<span>{(()=>{const h=new Date().getHours();return h<12?'Good morning':h<17?'Good afternoon':'Good evening';})()},<br/>Ranger! 👋</span>} subtitle="It's time to help some creatures" showAvatar onAvatarClick={openProfile}>
@@ -2618,23 +2622,36 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
       const cache=await caches.open(TILE_CACHE_NAME);
       const tiles=OFFLINE_TILES;
       let done=0;
-      const BATCH=6;
-      for(let i=0;i<tiles.length;i+=BATCH){
-        const batch=tiles.slice(i,i+BATCH);
-        await Promise.allSettled(batch.map(async({z,x,y})=>{
-          const url=`https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
-          try{
-            const hit=await cache.match(url);
-            if(!hit){
-              const r=await fetch(url,{mode:'cors'});
-              if(r.ok) await cache.put(url,r);
-            }
-          }catch(e){}
-          done++;
-          // Update progress every 20 tiles to avoid too many re-renders
-          if(done%20===0||done===tiles.length) setDlProgress({done,total:tiles.length});
-        }));
-      }
+      // Use all three OSM subdomains (a/b/c) — each is a separate server so the browser
+      // opens independent connection pools, roughly tripling throughput vs one subdomain.
+      const OSM_SUBS=['a','b','c'];
+      // Keep CONCURRENCY requests in flight at all times instead of fixed batches.
+      // Fixed batches (old approach) stall the pipeline waiting for a slow tile in each
+      // group before starting the next group. A pool drains immediately on each completion.
+      const CONCURRENCY=12;
+      await new Promise(resolve=>{
+        let idx=0;
+        let inFlight=0;
+        function next(){
+          while(inFlight<CONCURRENCY&&idx<tiles.length){
+            const{z,x,y}=tiles[idx];
+            const sub=OSM_SUBS[idx%3];
+            idx++;inFlight++;
+            (async()=>{
+              const url=`https://${sub}.tile.openstreetmap.org/${z}/${x}/${y}.png`;
+              try{
+                const hit=await cache.match(url);
+                if(!hit){const r=await fetch(url,{mode:'cors'});if(r.ok)await cache.put(url,r);}
+              }catch(e){}
+              done++;inFlight--;
+              if(done%20===0||done===tiles.length)setDlProgress({done,total:tiles.length});
+              if(done===tiles.length)resolve();else next();
+            })();
+          }
+        }
+        next();
+        if(tiles.length===0)resolve();
+      });
       const savedAt=new Date().toLocaleDateString('en-AU',{day:'numeric',month:'short',year:'numeric'});
       localStorage.setItem(SK.offlineSaved,savedAt);
       setOffMeta({savedAt});
