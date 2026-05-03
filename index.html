@@ -789,10 +789,24 @@ async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch,forcedI
     //   (b) the photo ID is in forcedIds — these were just uploaded so we force a fresh
     //       cache even if a stale blob already exists (ensures post-sync offline viewing).
     const toFetch=all.filter(p=>p.id&&(forcedIds.has(p.id)||!existing[p.id])&&(p.dataUrl?.startsWith('https://')||!p.dataUrl));
+    // Direct-save: if Supabase DB returned a base64 blob in data_url (Storage not configured),
+    // we already have the bytes — just write them to ww_photo_data without a network round-trip.
+    const toSaveDirect=all.filter(p=>p.id&&!existing[p.id]&&p.dataUrl?.startsWith('data:'));
     if(forcedIds.size) console.info('[Photo] cacheRemotePhotosToIdb: forced re-cache for',forcedIds.size,'IDs, toFetch='+toFetch.length);
-    if(!toFetch.length)return;
-    console.info('[Photo] cacheRemotePhotosToIdb: downloading',toFetch.length,'photo(s)',toFetch.map(p=>p.id));
+    console.info('[Photo] cacheRemotePhotosToIdb: direct-save='+toSaveDirect.length+' network-fetch='+toFetch.length);
+    if(!toFetch.length&&!toSaveDirect.length)return;
     const newMap={};
+    // Direct-save pass: photos whose base64 blob came back from Supabase DB directly.
+    // Storage might not be configured — the DB column stores the raw base64 as fallback.
+    // No network request needed; just persist to ww_photo_data for offline use.
+    for(const p of toSaveDirect){
+      try{
+        await idbPutPhoto(p.id,p.dataUrl);
+        newMap[p.id]=p.dataUrl;
+        console.info('[Photo] cacheRemote: direct-save base64 ok',p.id);
+      }catch(e){console.warn('[Photo] cacheRemote: direct-save failed for',p.id,e?.message);}
+    }
+    // Network-fetch pass: photos with https:// URLs or null (try Storage SDK + CDN fallback)
     await Promise.allSettled(toFetch.map(async p=>{
       // Attempt 1: Supabase Storage SDK (uses auth token + CDN)
       try{
@@ -1080,7 +1094,14 @@ async function uploadPhotoToStorage(dataUrl,photoId,localStorageKey){
     if(!blob){console.warn('[Photo] dataUrlToBlob returned null for',photoId);return null;}
     const path=`${photoId}.jpg`;
     const{error}=await supa.storage.from('photos').upload(path,blob,{upsert:true,contentType:'image/jpeg'});
-    if(error){console.warn('[Storage]',error.message);return null;}
+    if(error){
+      console.warn('[Storage] upload failed ('+error.message+') — caching base64 directly in IDB so offline still works');
+      // Storage upload failed (bucket missing, permissions, etc.) — the base64 dataUrl
+      // will go into Supabase DB as a fallback, but we also cache it in ww_photo_data
+      // so offline viewing works even though no Storage URL exists.
+      await idbPutPhoto(photoId,dataUrl).catch(e=>console.warn('[Photo] idbPutPhoto FAILED (storage-fallback)',photoId,e));
+      return null;
+    }
     const{data:{publicUrl}}=supa.storage.from('photos').getPublicUrl(path);
     // Cache blob to IDB immediately so the photo is available offline right away —
     // without this there is a window between upload and the next supaFullSync where
