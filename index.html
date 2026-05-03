@@ -5808,14 +5808,14 @@ function App(){
         // 4. Load all blobs from ww_photo_data — after steps 2+3, this map is as
         //    complete as possible before hitting the network.
         const photoMap=await idbGetAllPhotos();
-        // Diagnostic: log photo state at startup so issues with missing blobs can be traced.
-        if(wp.length||bp.length){
+        // Diagnostic: always log photo state at startup so issues can be traced.
+        {
           const allPhotos=[...wp,...bp];
           const blobCount=Object.keys(photoMap).length;
           const withUrl=allPhotos.filter(p=>p.dataUrl?.startsWith('https://')).length;
           const withNull=allPhotos.filter(p=>!p.dataUrl).length;
-          console.info('[Photo] Bootstrap: records='+allPhotos.length+' blobs_in_idb='+blobCount+' https_url='+withUrl+' null_url='+withNull);
-          if(blobCount<allPhotos.length){
+          console.info('[Photo] Bootstrap: records='+allPhotos.length+' blobs_in_idb='+blobCount+' https_url='+withUrl+' null_url='+withNull+' online='+navigator.onLine);
+          if(allPhotos.length>0&&blobCount<allPhotos.length){
             const missingIds=allPhotos.filter(p=>!photoMap[p.id]).map(p=>p.id);
             console.warn('[Photo] Blobs missing from ww_photo_data for IDs:',missingIds);
           }
