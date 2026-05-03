@@ -5840,6 +5840,34 @@ function App(){
       }catch(e){console.warn('[IDB] bootstrap failed',e);}
     }
     bootstrap();
+    // ── Debug helper — run __wwPhotoDebug() in the console at any time ──
+    // Reports the full state of both IDB databases so photo issues can be diagnosed
+    // without needing to catch bootstrap logs before Web Inspector connects.
+    window.__wwPhotoDebug=async function(){
+      console.group('📷 WombatWatch Photo Debug');
+      try{
+        // ww_photo_data
+        const blobs=await idbGetAllPhotos();
+        const blobIds=Object.keys(blobs);
+        console.log('ww_photo_data blobs:',blobIds.length,'entries');
+        blobIds.forEach(id=>console.log('  blob',id,'len='+blobs[id]?.length));
+        // wombatwatch_v1 photo records
+        const wp2=await idbGetAll(STORE.wp);
+        const bp2=await idbGetAll(STORE.bp);
+        console.log('wombat_photos records:',wp2.length);
+        wp2.forEach(p=>console.log('  wp',p.id,'dataUrl='+(p.dataUrl?.substring(0,40)||'null'),'_sync='+p._sync,'blob_cached='+(!!blobs[p.id])));
+        console.log('burrow_photos records:',bp2.length);
+        bp2.forEach(p=>console.log('  bp',p.id,'dataUrl='+(p.dataUrl?.substring(0,40)||'null'),'_sync='+p._sync,'blob_cached='+(!!blobs[p.id])));
+        // queue
+        const q=await idbGetQueue().catch(()=>[]);
+        const photoOps=q.filter(op=>op.table==='wombat_photos'||op.table==='burrow_photos');
+        console.log('queue photo ops:',photoOps.length);
+        photoOps.forEach(op=>console.log('  queue',op.table,op.row?.id,'data_url_len='+(op.row?.data_url?.length||0)));
+        console.log('navigator.onLine:',navigator.onLine);
+      }catch(e){console.error('debug error',e);}
+      console.groupEnd();
+    };
+    console.info('💡 Run __wwPhotoDebug() in console to inspect photo IDB state at any time');
   },[]);
 
   const [screen,setScreen]=useState('dashboard');
