@@ -529,15 +529,31 @@ function openPhotoIdb(){
     req.onerror=e=>rej(e.target.error);
   });
 }
+// Write a photo blob (dataUrl string) to ww_photo_data.
+// Retries once on InvalidStateError/DatabaseClosedError — iOS Safari can close
+// IDB connections silently, so the first attempt resets the singleton and retries.
 async function idbPutPhoto(id,dataUrl){
-  try{
-    const db=await openPhotoIdb();
-    return new Promise((res,rej)=>{
-      const tx=db.transaction('p','readwrite');
-      tx.objectStore('p').put(dataUrl,id);
-      tx.oncomplete=res;tx.onerror=rej;
-    });
-  }catch(e){console.warn('[IDB] put failed',e);}
+  for(let attempt=0;attempt<2;attempt++){
+    try{
+      const db=await openPhotoIdb();
+      await new Promise((res,rej)=>{
+        const tx=db.transaction('p','readwrite');
+        tx.objectStore('p').put(dataUrl,id);
+        tx.oncomplete=()=>res();
+        tx.onerror=e=>rej(e.target?.error||new Error('IDB tx error'));
+        tx.onabort=e=>rej(e.target?.error||new Error('IDB tx aborted'));
+      });
+      return; // success
+    }catch(e){
+      if(attempt===0&&(e?.name==='InvalidStateError'||e?.name==='DatabaseClosedError')){
+        // Stale connection — reset singleton and retry with a fresh open
+        console.warn('[IDB] Stale connection, retrying idbPutPhoto for',id);
+        _photoIdb=null;
+        continue;
+      }
+      throw e; // let caller handle (already have .catch() wrappers)
+    }
+  }
 }
 async function idbGetAllPhotos(){
   try{
@@ -778,25 +794,54 @@ async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch,forcedI
     console.info('[Photo] cacheRemotePhotosToIdb: downloading',toFetch.length,'photo(s)',toFetch.map(p=>p.id));
     const newMap={};
     await Promise.allSettled(toFetch.map(async p=>{
+      // Attempt 1: Supabase Storage SDK (uses auth token + CDN)
       try{
-        // Primary: Supabase Storage SDK — handles CORS, auth, and CDN correctly.
         const{data,error}=await supa.storage.from('photos').download(`${p.id}.jpg`);
         if(!error&&data instanceof Blob){
           const dataUrl=await blobToDataUrl(data);
           await idbPutPhoto(p.id,dataUrl);
           newMap[p.id]=dataUrl;
+          console.info('[Photo] cacheRemote: SDK ok',p.id);
           return;
         }
-      }catch(e){}
-      // Fallback: direct fetch via the stored https:// URL
+        // Log the failure so we know why attempt 1 didn't work
+        console.info('[Photo] cacheRemote: SDK failed for',p.id,'error=',error?.message||'no blob');
+      }catch(e){console.info('[Photo] cacheRemote: SDK exception for',p.id,e?.message);}
+      // Attempt 2: direct fetch via the stored https:// URL (if one is present in state)
+      if(p.dataUrl?.startsWith('https://')){
+        try{
+          const res=await fetch(p.dataUrl);
+          if(res.ok){
+            const dataUrl=await blobToDataUrl(await res.blob());
+            await idbPutPhoto(p.id,dataUrl);
+            newMap[p.id]=dataUrl;
+            console.info('[Photo] cacheRemote: direct fetch ok',p.id);
+            return;
+          }
+          console.info('[Photo] cacheRemote: direct fetch',res.status,'for',p.id);
+        }catch(e){console.info('[Photo] cacheRemote: direct fetch exception for',p.id,e?.message);}
+      }
+      // Attempt 3: construct the public CDN URL from the known Storage path convention.
+      // This covers the common case where p.dataUrl is null (noB64 stripped it from IDB)
+      // but the file DOES exist in Storage under the standard {id}.jpg naming.
       try{
-        if(!p.dataUrl?.startsWith('https://'))return;
-        const res=await fetch(p.dataUrl);
-        if(!res.ok)return;
-        const dataUrl=await blobToDataUrl(await res.blob());
-        await idbPutPhoto(p.id,dataUrl);
-        newMap[p.id]=dataUrl;
-      }catch(e){}
+        const{data:{publicUrl}}=supa.storage.from('photos').getPublicUrl(`${p.id}.jpg`);
+        const res=await fetch(publicUrl);
+        if(res.ok){
+          const dataUrl=await blobToDataUrl(await res.blob());
+          await idbPutPhoto(p.id,dataUrl);
+          newMap[p.id]=dataUrl;
+          // Update DB row with the URL so future syncs return it and noB64 doesn't wipe it
+          // (belt-and-suspenders alongside flushQueue/syncAction upsert paths)
+          try{
+            const tbl=p.wombatId?'wombat_photos':'burrow_photos';
+            supa.from(tbl).update({data_url:publicUrl}).eq('id',p.id).then(null,()=>{});
+          }catch{}
+          console.info('[Photo] cacheRemote: constructed-URL ok',p.id,'→',publicUrl.substring(0,60));
+          return;
+        }
+        console.info('[Photo] cacheRemote: constructed-URL',res.status,'for',p.id,'(file may not be in Storage yet)');
+      }catch(e){console.info('[Photo] cacheRemote: constructed-URL exception for',p.id,e?.message);}
     }));
     const cached=Object.keys(newMap).length;
     console.info('[Photo] cacheRemotePhotosToIdb: cached',cached,'blob(s) into ww_photo_data');
@@ -1045,8 +1090,22 @@ async function uploadPhotoToStorage(dataUrl,photoId,localStorageKey){
     // re-downloaded by cacheRemotePhotosToIdb on the next online session.
     await idbPutPhoto(photoId,dataUrl).catch(e=>console.warn('[Photo] idbPutPhoto FAILED for',photoId,e));
     console.info('[Photo] uploadPhotoToStorage: IDB blob saved for',photoId,'→',publicUrl);
-    // Patch localStorage so this photo is stored as a URL (not base64) going forward
+    // Belt-and-suspenders: directly update the Supabase DB row with the Storage URL.
+    // The queue upsert (in flushQueue / syncAction) will also carry the URL, but that
+    // path can carry a large base64 fallback if anything goes wrong — this direct UPDATE
+    // guarantees the URL is persisted in the DB so every future sync returns data_url
+    // as an https:// URL rather than null. When sync returns the URL, noB64 preserves it
+    // in IDB (only strips data: URLs), so cacheRemotePhotosToIdb has a URL to fall back to.
     if(localStorageKey){
+      const supaTable=localStorageKey===SK.wp?'wombat_photos':'burrow_photos';
+      supa.from(supaTable).update({data_url:publicUrl}).eq('id',photoId).then(
+        ({error:ue})=>{
+          if(ue) console.warn('[Photo] DB url update failed for',photoId,ue.message);
+          else console.info('[Photo] DB url updated for',photoId);
+        },
+        err=>console.warn('[Photo] DB url update exception for',photoId,err?.message)
+      );
+      // Also patch localStorage key so this record survives until the next sync
       try{
         const list=JSON.parse(localStorage.getItem(localStorageKey)||'[]');
         const updated=list.map(p=>p.id===photoId?{...p,dataUrl:publicUrl}:p);
@@ -5886,9 +5945,9 @@ function App(){
         const wp2=await idbGetAll(STORE.wp);
         const bp2=await idbGetAll(STORE.bp);
         console.log('wombat_photos records:',wp2.length);
-        wp2.forEach(p=>console.log('  wp',p.id,'dataUrl='+(p.dataUrl?.substring(0,40)||'null'),'_sync='+p._sync,'blob_cached='+(!!blobs[p.id])));
+        wp2.forEach(p=>console.log('  wp',p.id,'dataUrl='+(p.dataUrl?.startsWith('https://')?'https://…'+p.dataUrl.slice(-20):p.dataUrl?.substring(0,40)||'null'),'_sync='+p._sync,'blob_cached='+(!!blobs[p.id])));
         console.log('burrow_photos records:',bp2.length);
-        bp2.forEach(p=>console.log('  bp',p.id,'dataUrl='+(p.dataUrl?.substring(0,40)||'null'),'_sync='+p._sync,'blob_cached='+(!!blobs[p.id])));
+        bp2.forEach(p=>console.log('  bp',p.id,'dataUrl='+(p.dataUrl?.startsWith('https://')?'https://…'+p.dataUrl.slice(-20):p.dataUrl?.substring(0,40)||'null'),'_sync='+p._sync,'blob_cached='+(!!blobs[p.id])));
         // queue
         const q=await idbGetQueue().catch(()=>[]);
         const photoOps=q.filter(op=>op.table==='wombat_photos'||op.table==='burrow_photos');
