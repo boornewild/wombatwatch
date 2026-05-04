@@ -1014,10 +1014,10 @@ const SUPA_ANON='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsIn
 const supa=window.supabase.createClient(SUPA_URL,SUPA_ANON);
 
 // ── camelCase ↔ snake_case mappings ──────────────────────────
-const wombatToDb=(w,uid)=>({id:w.id,created_by:uid||null,name:w.name,sex:w.sex||null,age_class:w.ageClass||null,status:w.status||null,severity:w.severity||{},burrow_ids:w.burrowIds||[],first_seen:w.firstSeen||null,location:w.location||null,lat:w.lat||null,lng:w.lng||null,notes:w.notes||null,code:w.code||null,location_label:w.locationLabel||null,inactive_at:w.inactiveAt||null,inactive_cause:w.inactiveCause||null,inactive_notes:w.inactiveNotes||null});
-const dbToWombat=r=>({id:r.id,name:r.name,sex:r.sex,ageClass:r.age_class,status:r.status==='mange'?'under_treatment':r.status,severity:r.severity||{},burrowIds:r.burrow_ids||[],firstSeen:r.first_seen,location:r.location,lat:r.lat,lng:r.lng,notes:r.notes,code:r.code,locationLabel:r.location_label||null,inactiveAt:r.inactive_at||null,inactiveCause:r.inactive_cause||null,inactiveNotes:r.inactive_notes||null,_createdBy:r.created_by,_sync:true});
-const burrowToDb=(b,uid)=>({id:b.id,created_by:uid||null,name:b.name,status:b.status||null,location:b.location||null,lat:b.lat||null,lng:b.lng||null,habitat:b.habitat||{},wombat_ids:b.wombatIds||[],last_checked:b.lastChecked||null,next_check:b.nextCheck||null,entrance_height_cm:b.entranceHeightCm||null,entrance_width_cm:b.entranceWidthCm||null,orientation:b.orientation||null,code:b.code||null});
-const dbToBurrow=r=>({id:r.id,name:r.name,status:r.status,location:r.location,lat:r.lat,lng:r.lng,habitat:r.habitat||{},wombatIds:r.wombat_ids||[],lastChecked:r.last_checked,nextCheck:r.next_check,entranceHeightCm:r.entrance_height_cm,entranceWidthCm:r.entrance_width_cm,orientation:r.orientation,code:r.code,_createdBy:r.created_by,_sync:true});
+const wombatToDb=(w,uid)=>({id:w.id,created_by:uid||null,squad_id:w.squadId||null,name:w.name,sex:w.sex||null,age_class:w.ageClass||null,status:w.status||null,severity:w.severity||{},burrow_ids:w.burrowIds||[],first_seen:w.firstSeen||null,location:w.location||null,lat:w.lat||null,lng:w.lng||null,notes:w.notes||null,code:w.code||null,location_label:w.locationLabel||null,inactive_at:w.inactiveAt||null,inactive_cause:w.inactiveCause||null,inactive_notes:w.inactiveNotes||null});
+const dbToWombat=r=>({id:r.id,name:r.name,sex:r.sex,ageClass:r.age_class,status:r.status==='mange'?'under_treatment':r.status,severity:r.severity||{},burrowIds:r.burrow_ids||[],firstSeen:r.first_seen,location:r.location,lat:r.lat,lng:r.lng,notes:r.notes,code:r.code,locationLabel:r.location_label||null,inactiveAt:r.inactive_at||null,inactiveCause:r.inactive_cause||null,inactiveNotes:r.inactive_notes||null,squadId:r.squad_id||null,_createdBy:r.created_by,_sync:true});
+const burrowToDb=(b,uid)=>({id:b.id,created_by:uid||null,squad_id:b.squadId||null,name:b.name,status:b.status||null,location:b.location||null,lat:b.lat||null,lng:b.lng||null,habitat:b.habitat||{},wombat_ids:b.wombatIds||[],last_checked:b.lastChecked||null,next_check:b.nextCheck||null,entrance_height_cm:b.entranceHeightCm||null,entrance_width_cm:b.entranceWidthCm||null,orientation:b.orientation||null,code:b.code||null});
+const dbToBurrow=r=>({id:r.id,name:r.name,status:r.status,location:r.location,lat:r.lat,lng:r.lng,habitat:r.habitat||{},wombatIds:r.wombat_ids||[],lastChecked:r.last_checked,nextCheck:r.next_check,entranceHeightCm:r.entrance_height_cm,entranceWidthCm:r.entrance_width_cm,orientation:r.orientation,code:r.code,squadId:r.squad_id||null,_createdBy:r.created_by,_sync:true});
 const treatmentToDb=(t,uid)=>({id:t.id,wombat_id:t.wombatId,created_by:uid||null,at:t.at,by_name:t.by||null,product:t.product||null,dose:t.dose||null,method:t.method||null,severity:t.severity||null,regions:t.regions||{},note:t.note||null,linked_burrow_id:t.linkedBurrowId||null,marked_recovered:t.markedRecovered||false});
 const dbToTreatment=r=>({id:r.id,wombatId:r.wombat_id,at:r.at,by:r.by_name,product:r.product,dose:r.dose,method:r.method,severity:r.severity,regions:r.regions||{},note:r.note,linkedBurrowId:r.linked_burrow_id||null,markedRecovered:r.marked_recovered||false,_createdBy:r.created_by,_sync:true});
 const sightingToDb=(s,uid)=>({id:s.id,wombat_id:s.wombatId,created_by:uid||null,at:s.at,lat:s.lat||null,lng:s.lng||null,note:s.note||null});
@@ -3741,7 +3741,258 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
 ════════════════════════════════════════════════════════════════ */
 
 /* ── PROFILE SHEET ── */
-function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,onToggleSignIn,data,onExport,onCSVImport,authUser,authProfile}){
+// ── SQUAD SETUP SCREEN ────────────────────────────────────────────
+// Shown when user is signed in but has no squad yet.
+function SquadSetupScreen({onSquadReady,pendingToken}){
+  const t=useTheme();
+  const [mode,setMode]=useState(pendingToken?'join':null); // null|'create'|'join'
+  const [squadName,setSquadName]=useState('');
+  const [squadDesc,setSquadDesc]=useState('');
+  const [token,setToken]=useState(pendingToken||'');
+  const [busy,setBusy]=useState(false);
+  const [err,setErr]=useState(null);
+
+  const loadSquad=async()=>{
+    const{data:{user}}=await supa.auth.getUser();
+    if(!user)return;
+    const{data:m}=await supa.from('squad_members').select('role, squad:squads(id,name)').eq('user_id',user.id).single();
+    if(m?.squad)onSquadReady({id:m.squad.id,name:m.squad.name,role:m.role});
+  };
+
+  const handleCreate=async()=>{
+    if(!squadName.trim()){setErr('Please enter a squad name.');return;}
+    setBusy(true);setErr(null);
+    const{data,error}=await supa.rpc('create_squad',{p_name:squadName.trim(),p_description:squadDesc.trim()||null});
+    if(error||!data?.ok){setErr(error?.message||data?.error||'Could not create squad.');setBusy(false);return;}
+    await loadSquad();
+    setBusy(false);
+  };
+
+  const handleJoin=async()=>{
+    const raw=token.trim();
+    if(!raw){setErr('Paste the invite link or token code.');return;}
+    // Support full URLs (e.g. https://…?join=TOKEN) or bare tokens
+    let tk=raw;
+    try{const u=new URL(raw);const j=u.searchParams.get('join');if(j)tk=j;}catch{}
+    setBusy(true);setErr(null);
+    const{data,error}=await supa.rpc('join_squad_by_invite',{p_token:tk});
+    if(error||!data?.ok){
+      const msg=data?.error==='invalid_token'?'That invite link is invalid or has already been revoked.'
+        :data?.error==='expired'?'This invite link has expired.'
+        :data?.error==='max_uses_reached'?'This invite link has reached its maximum uses.'
+        :error?.message||data?.error||'Could not join squad.';
+      setErr(msg);setBusy(false);return;
+    }
+    await loadSquad();
+    setBusy(false);
+  };
+
+  const Btn=({children,onClick,secondary=false,disabled=false})=>(
+    <button onClick={onClick} disabled={disabled}
+      style={{width:'100%',padding:'14px 0',borderRadius:14,border:'none',fontWeight:700,fontSize:15,cursor:disabled?'not-allowed':'pointer',
+        background:secondary?t.soft:t.f700,color:secondary?t.ink:'#fff',opacity:disabled?0.6:1,transition:'opacity 0.15s'}}>
+      {children}
+    </button>
+  );
+
+  return <div style={{minHeight:'100vh',background:t.bg,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'32px 24px',boxSizing:'border-box'}}>
+    <div style={{width:'100%',maxWidth:420}}>
+      {/* Logo */}
+      <div style={{textAlign:'center',marginBottom:32}}>
+        <div style={{width:64,height:64,borderRadius:20,background:t.f700,display:'inline-flex',alignItems:'center',justifyContent:'center',marginBottom:16}}>
+          {Ico.wombat('#fff',30)}
+        </div>
+        <div style={{fontSize:24,fontWeight:800,color:t.ink,letterSpacing:-0.5}}>WombatWatch</div>
+        <div style={{fontSize:14,color:t.mid,marginTop:6}}>Join or create your monitoring squad</div>
+      </div>
+
+      {mode===null&&<>
+        <div style={{display:'flex',flexDirection:'column',gap:12}}>
+          <button onClick={()=>setMode('create')}
+            style={{padding:'20px 20px',borderRadius:16,border:`2px solid ${t.div}`,background:t.surface,textAlign:'left',cursor:'pointer',display:'flex',alignItems:'center',gap:16}}>
+            <div style={{width:44,height:44,borderRadius:12,background:t.sage50,flexShrink:0,display:'flex',alignItems:'center',justifyContent:'center'}}>
+              {Ico.add(t.f700,22)}
+            </div>
+            <div>
+              <div style={{fontSize:16,fontWeight:700,color:t.ink}}>Create a new squad</div>
+              <div style={{fontSize:13,color:t.mid,marginTop:2}}>You'll be the admin — share invite links with your team</div>
+            </div>
+          </button>
+          <button onClick={()=>setMode('join')}
+            style={{padding:'20px 20px',borderRadius:16,border:`2px solid ${t.div}`,background:t.surface,textAlign:'left',cursor:'pointer',display:'flex',alignItems:'center',gap:16}}>
+            <div style={{width:44,height:44,borderRadius:12,background:t.sky50,flexShrink:0,display:'flex',alignItems:'center',justifyContent:'center'}}>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={t.sky700} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+            </div>
+            <div>
+              <div style={{fontSize:16,fontWeight:700,color:t.ink}}>Join with invite link</div>
+              <div style={{fontSize:13,color:t.mid,marginTop:2}}>Paste a link or token shared by your squad admin</div>
+            </div>
+          </button>
+        </div>
+      </>}
+
+      {mode==='create'&&<>
+        <button onClick={()=>{setMode(null);setErr(null);}} style={{background:'none',border:'none',color:t.mid,fontSize:13,cursor:'pointer',marginBottom:20,padding:0,display:'flex',alignItems:'center',gap:6}}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
+          Back
+        </button>
+        <div style={{fontSize:20,fontWeight:800,color:t.ink,marginBottom:20}}>Create your squad</div>
+        <div style={{display:'flex',flexDirection:'column',gap:12,marginBottom:20}}>
+          <div>
+            <div style={{fontSize:13,fontWeight:600,color:t.mid,marginBottom:6}}>Squad name *</div>
+            <input value={squadName} onChange={e=>setSquadName(e.target.value)}
+              placeholder="e.g. Macedon Ranges Wombat Watch"
+              style={{width:'100%',padding:'13px 14px',borderRadius:12,border:`1.5px solid ${t.div}`,background:t.surface,color:t.ink,fontSize:15,boxSizing:'border-box',outline:'none'}}/>
+          </div>
+          <div>
+            <div style={{fontSize:13,fontWeight:600,color:t.mid,marginBottom:6}}>Description (optional)</div>
+            <input value={squadDesc} onChange={e=>setSquadDesc(e.target.value)}
+              placeholder="e.g. Central Victoria mange monitoring"
+              style={{width:'100%',padding:'13px 14px',borderRadius:12,border:`1.5px solid ${t.div}`,background:t.surface,color:t.ink,fontSize:15,boxSizing:'border-box',outline:'none'}}/>
+          </div>
+        </div>
+        {err&&<div style={{fontSize:13,color:t.rose700,background:t.rose50,borderRadius:10,padding:'10px 14px',marginBottom:14}}>{err}</div>}
+        <Btn onClick={handleCreate} disabled={busy}>{busy?'Creating…':'Create Squad'}</Btn>
+      </>}
+
+      {mode==='join'&&<>
+        <button onClick={()=>{setMode(null);setErr(null);}} style={{background:'none',border:'none',color:t.mid,fontSize:13,cursor:'pointer',marginBottom:20,padding:0,display:'flex',alignItems:'center',gap:6}}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
+          Back
+        </button>
+        <div style={{fontSize:20,fontWeight:800,color:t.ink,marginBottom:8}}>Join a squad</div>
+        <div style={{fontSize:13,color:t.mid,marginBottom:20}}>Paste the invite link or token your admin shared with you.</div>
+        <textarea value={token} onChange={e=>setToken(e.target.value)}
+          placeholder="https://boornewild.github.io/index.html?join=…"
+          rows={3}
+          style={{width:'100%',padding:'13px 14px',borderRadius:12,border:`1.5px solid ${t.div}`,background:t.surface,color:t.ink,fontSize:14,boxSizing:'border-box',outline:'none',resize:'none',fontFamily:'inherit'}}/>
+        {err&&<div style={{fontSize:13,color:t.rose700,background:t.rose50,borderRadius:10,padding:'10px 14px',margin:'12px 0 4px'}}>{err}</div>}
+        <div style={{marginTop:14}}><Btn onClick={handleJoin} disabled={busy}>{busy?'Joining…':'Join Squad'}</Btn></div>
+      </>}
+    </div>
+  </div>;
+}
+
+// ── SQUAD MODAL (settings overlay) ───────────────────────────────
+// Shown from ProfileSheet → "My Squad" row
+function SquadModal({onClose,authSquad,authUser,setAuthSquad,cacheSquad,clearSquadCache}){
+  const t=useTheme();
+  const isAdmin=authSquad?.role==='admin';
+  const [invites,setInvites]=useState([]);
+  const [loadingInvites,setLoadingInvites]=useState(false);
+  const [generating,setGenerating]=useState(false);
+  const [leaving,setLeaving]=useState(false);
+  const [copied,setCopied]=useState(null); // invite id that was just copied
+  const baseUrl=window.location.origin+window.location.pathname;
+
+  // Load existing invites (admin only)
+  useEffect(()=>{
+    if(!isAdmin||!authSquad?.id)return;
+    setLoadingInvites(true);
+    supa.from('squad_invites').select('*').eq('squad_id',authSquad.id).order('created_at',{ascending:false})
+      .then(({data})=>{setInvites(data||[]);setLoadingInvites(false);})
+      .catch(()=>setLoadingInvites(false));
+  },[isAdmin,authSquad?.id]);
+
+  const makeLink=token=>`${baseUrl}?join=${token}`;
+
+  const handleCopy=async(invite)=>{
+    try{await navigator.clipboard.writeText(makeLink(invite.token));setCopied(invite.id);setTimeout(()=>setCopied(null),2000);}
+    catch{alert(makeLink(invite.token));}
+  };
+
+  const handleGenerate=async()=>{
+    setGenerating(true);
+    const{data,error}=await supa.rpc('create_squad_invite',{p_squad_id:authSquad.id});
+    if(error||!data?.ok){alert('Could not create invite: '+(error?.message||data?.error));setGenerating(false);return;}
+    // Refresh invite list
+    const{data:rows}=await supa.from('squad_invites').select('*').eq('squad_id',authSquad.id).order('created_at',{ascending:false});
+    setInvites(rows||[]);
+    setGenerating(false);
+  };
+
+  const handleRevoke=async(inviteId)=>{
+    if(!window.confirm('Revoke this invite link? Anyone who has the link will no longer be able to join.'))return;
+    await supa.from('squad_invites').delete().eq('id',inviteId);
+    setInvites(prev=>prev.filter(i=>i.id!==inviteId));
+  };
+
+  const handleLeave=async()=>{
+    if(!window.confirm(`Leave "${authSquad.name}"? You'll need a new invite link to re-join.`))return;
+    setLeaving(true);
+    const{data:{user}}=await supa.auth.getUser();
+    const{error}=await supa.from('squad_members').delete().eq('squad_id',authSquad.id).eq('user_id',user.id);
+    if(error){alert('Could not leave squad: '+error.message);setLeaving(false);return;}
+    clearSquadCache();
+    setAuthSquad(null);
+    onClose();
+  };
+
+  const fmtUses=inv=>{
+    if(inv.max_uses===null)return `${inv.use_count} uses`;
+    return `${inv.use_count} / ${inv.max_uses} uses`;
+  };
+
+  return <div style={{position:'fixed',inset:0,zIndex:1600,background:'rgba(15,25,18,0.5)'}}>
+    <button onClick={onClose} style={{position:'absolute',inset:0,width:'100%',background:'none'}}/>
+    <div style={{position:'absolute',left:'50%',transform:'translateX(-50%)',bottom:0,width:'100%',maxWidth:480,background:t.surface,borderTopLeftRadius:28,borderTopRightRadius:28,boxShadow:'0 -10px 40px rgba(0,0,0,0.2)',maxHeight:'90vh',overflowY:'auto'}}>
+      <div style={{width:40,height:4,borderRadius:2,background:t.faint,margin:'14px auto 0',opacity:0.5}}/>
+      <div style={{padding:'20px 20px 8px',display:'flex',alignItems:'flex-start',justifyContent:'space-between'}}>
+        <div>
+          <div style={{fontSize:20,fontWeight:800,color:t.ink}}>{authSquad?.name}</div>
+          <div style={{display:'flex',alignItems:'center',gap:8,marginTop:4}}>
+            {isAdmin
+              ?<span style={{fontSize:11,fontWeight:700,color:t.amb700,background:t.amb50,borderRadius:6,padding:'2px 8px',letterSpacing:0.3}}>ADMIN</span>
+              :<span style={{fontSize:11,fontWeight:700,color:t.f700,background:t.sage50,borderRadius:6,padding:'2px 8px',letterSpacing:0.3}}>MEMBER</span>}
+          </div>
+        </div>
+      </div>
+      <div style={{height:1,background:t.div,margin:'12px 20px'}}/>
+
+      {/* Invite Links — admin only */}
+      {isAdmin&&<>
+        <div style={{padding:'0 20px 8px'}}>
+          <div style={{fontSize:13,fontWeight:700,color:t.mid,letterSpacing:0.5,textTransform:'uppercase',marginBottom:12}}>Invite Links</div>
+          {loadingInvites&&<div style={{fontSize:13,color:t.mid,padding:'8px 0'}}>Loading…</div>}
+          {invites.length===0&&!loadingInvites&&<div style={{fontSize:13,color:t.mid,padding:'4px 0 8px'}}>No invite links yet.</div>}
+          {invites.map(inv=><div key={inv.id} style={{background:t.soft,borderRadius:12,padding:'12px 14px',marginBottom:10}}>
+            <div style={{fontFamily:'monospace',fontSize:12,color:t.ink,wordBreak:'break-all',marginBottom:8,lineHeight:1.5}}>{makeLink(inv.token)}</div>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
+              <span style={{fontSize:12,color:t.mid}}>{fmtUses(inv)}</span>
+              <div style={{display:'flex',gap:8}}>
+                <button onClick={()=>handleCopy(inv)}
+                  style={{padding:'5px 12px',borderRadius:8,border:'none',background:copied===inv.id?t.sage50:t.f700,color:copied===inv.id?t.f700:'#fff',fontSize:12,fontWeight:600,cursor:'pointer'}}>
+                  {copied===inv.id?'Copied!':'Copy'}
+                </button>
+                <button onClick={()=>handleRevoke(inv.id)}
+                  style={{padding:'5px 12px',borderRadius:8,border:'none',background:t.rose50,color:t.rose700,fontSize:12,fontWeight:600,cursor:'pointer'}}>
+                  Revoke
+                </button>
+              </div>
+            </div>
+          </div>)}
+          <button onClick={handleGenerate} disabled={generating}
+            style={{width:'100%',padding:'12px 0',borderRadius:12,border:`1.5px dashed ${t.f700}`,background:'none',color:t.f700,fontSize:14,fontWeight:700,cursor:generating?'not-allowed':'pointer',opacity:generating?0.6:1}}>
+            {generating?'Generating…':'+ Generate New Invite Link'}
+          </button>
+        </div>
+        <div style={{height:1,background:t.div,margin:'12px 20px'}}/>
+      </>}
+
+      {/* Leave squad */}
+      <div style={{padding:'8px 20px 20px'}}>
+        <button onClick={handleLeave} disabled={leaving}
+          style={{width:'100%',padding:'13px 0',borderRadius:12,border:'none',background:t.rose50,color:t.rose700,fontSize:14,fontWeight:700,cursor:leaving?'not-allowed':'pointer',opacity:leaving?0.6:1}}>
+          {leaving?'Leaving…':'Leave Squad'}
+        </button>
+        {isAdmin&&<div style={{fontSize:12,color:t.mid,marginTop:8,textAlign:'center'}}>As admin, you should transfer admin rights before leaving.</div>}
+      </div>
+      <div style={{height:'calc(var(--sab) + 8px)'}}/>
+    </div>
+  </div>;
+}
+
+function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,onToggleSignIn,data,onExport,onCSVImport,authUser,authProfile,authSquad,onOpenSquad}){
   const t=useTheme();
   const userName=(typeof localStorage!=='undefined'&&localStorage.getItem(SK.userName))||(authProfile?.display_name)||'Volunteer';
   const userEmail=authUser?.email||null;
@@ -3832,6 +4083,14 @@ function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,
       <Row icon={Ico.edit(t.f700,17)} label="Edit Profile" onClick={()=>{onClose();onEditProfile();}}/>
       <Row icon={theme==='dark'?Ico.sun(t.f700,17):Ico.moon(t.f700,17)} label={theme==='dark'?'Switch to Light Mode':'Switch to Dark Mode'} right={null} onClick={()=>{onToggleTheme();onClose();}}/>
       <Row icon={Ico.help(t.f700,17)} label="FAQ" onClick={()=>{onClose();onFAQ();}}/>
+      <div style={{height:8,background:t.soft,margin:'6px 0'}}/>
+      {/* Squad row */}
+      <Row
+        icon={<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke={t.f700} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>}
+        label={authSquad?authSquad.name:'No Squad'}
+        sub={authSquad?(authSquad.role==='admin'?'Admin · tap to manage invites':'Member · tap for invite options'):'Set up or join a monitoring squad'}
+        onClick={()=>{onClose();onOpenSquad();}}
+      />
       <div style={{height:8,background:t.soft,margin:'6px 0'}}/>
       {isAdmin&&<>
         <Row
@@ -6045,8 +6304,26 @@ function App(){
   const clearProfileCache=()=>{try{localStorage.removeItem(PROFILE_CACHE);}catch{}};
   const getCachedProfile=()=>{try{return JSON.parse(localStorage.getItem(PROFILE_CACHE)||'null');}catch{return null;}};
 
+  // Squad cache — { id, name, role }. Persisted so squad name + admin controls
+  // remain available when the device is offline.
+  const SQUAD_CACHE='ww_squad_cache';
+  const cacheSquad=s=>{try{localStorage.setItem(SQUAD_CACHE,JSON.stringify(s));}catch{}};
+  const clearSquadCache=()=>{try{localStorage.removeItem(SQUAD_CACHE);}catch{}};
+  const getCachedSquad=()=>{try{return JSON.parse(localStorage.getItem(SQUAD_CACHE)||'null');}catch{return null;}};
+
   const [authUser,setAuthUser]=useState(null);
   const [authProfile,setAuthProfile]=useState(()=>getCachedProfile());
+  // null = no squad (or not yet loaded). Object = squad loaded.
+  const [authSquad,setAuthSquad]=useState(()=>getCachedSquad());
+  // true once we've completed at least one squad fetch (online or from cache)
+  const [squadChecked,setSquadChecked]=useState(()=>!!getCachedSquad());
+
+  // Detect an invite token in the URL (e.g. ?join=TOKEN). This is read once on mount;
+  // if the user is already signed in we join immediately, otherwise we store it and
+  // join after sign-in completes.
+  const [pendingInviteToken]=useState(()=>{
+    try{return new URLSearchParams(window.location.search).get('join')||null;}catch{return null;}
+  });
   const [syncing,setSyncing]=useState(false);
   const [authChecked,setAuthChecked]=useState(false);
   const [resetMode,setResetMode]=useState(false); // true while handling a password-reset link
@@ -6068,8 +6345,11 @@ function App(){
       console.warn('[Auth] 401 received — clearing session');
       clearUserCache();
       clearProfileCache();
+      clearSquadCache();
       setAuthUser(null);
       setAuthProfile(null);
+      setAuthSquad(null);
+      setSquadChecked(false);
       setAuthChecked(true);
     };
     return()=>{onAuthError=null;};
@@ -6132,6 +6412,32 @@ function App(){
             else{const c=getCachedProfile();if(c)setAuthProfile(c);}
           })
           .catch(()=>{const c=getCachedProfile();if(c)setAuthProfile(c);});
+        // Load the user's squad (role + squad name). Falls back to cache when offline.
+        // Also handles a pending invite token from the URL (?join=TOKEN).
+        const loadSquad=async(inviteToken)=>{
+          try{
+            // If there's a pending invite token, process it first
+            if(inviteToken){
+              const{data:jr}=await supa.rpc('join_squad_by_invite',{p_token:inviteToken});
+              if(jr?.ok)console.info('[Squad] joined via invite token:',jr.squad_name);
+              // Clear the token from the URL so refreshing doesn't re-trigger
+              try{const u=new URL(window.location.href);u.searchParams.delete('join');window.history.replaceState({},'',u);}catch{}
+            }
+            const{data:m,error:me}=await supa.from('squad_members').select('role, squad:squads(id,name)').eq('user_id',user.id).single();
+            if(m&&!me){
+              const sq={id:m.squad.id,name:m.squad.name,role:m.role};
+              cacheSquad(sq);setAuthSquad(sq);
+            }else if(me?.code==='PGRST116'||me?.code==='406'){
+              // PGRST116 = "0 rows" — user has no squad yet
+              clearSquadCache();setAuthSquad(null);
+            }else{
+              // Other error (network?) — fall back to cache
+              const c=getCachedSquad();if(c)setAuthSquad(c);
+            }
+          }catch{const c=getCachedSquad();if(c)setAuthSquad(c);}
+          finally{setSquadChecked(true);}
+        };
+        loadSquad(pendingInviteToken);
         // Show the sync bar briefly, then hide it — sync continues in background
         setSyncing(true);
         setTimeout(()=>setSyncing(false),2000);
@@ -6383,8 +6689,9 @@ function App(){
       explicitSignOut.current=true;
       clearUserCache();
       clearProfileCache();
+      clearSquadCache();
       await supa.auth.signOut();
-      setAuthUser(null);setAuthProfile(null);
+      setAuthUser(null);setAuthProfile(null);setAuthSquad(null);setSquadChecked(false);
     }else{
       setModal('sign-in');
     }
@@ -6412,6 +6719,19 @@ function App(){
   if(resetMode)return <ThemeCtx.Provider value={t}><div data-theme={theme} className="app" style={{background:t.bg}}><SetPasswordModal onDone={()=>setResetMode(false)}/></div></ThemeCtx.Provider>;
   // Gate: show only the login wall until signed in
   if(!authUser)return <ThemeCtx.Provider value={t}><div data-theme={theme} className="app" style={{background:t.bg}}><SignInModal/></div></ThemeCtx.Provider>;
+  // Gate: show squad setup when user is signed in but has no squad
+  // Only shown when squadChecked (so we don't flash it while loading from server) and online
+  // (no point showing setup if they can't create/join a squad right now).
+  if(squadChecked&&authSquad===null&&online){
+    return <ThemeCtx.Provider value={t}>
+      <div data-theme={theme} className="app" style={{background:t.bg}}>
+        <SquadSetupScreen
+          pendingToken={pendingInviteToken}
+          onSquadReady={sq=>{cacheSquad(sq);setAuthSquad(sq);}}
+        />
+      </div>
+    </ThemeCtx.Provider>;
+  }
 
   return <ThemeCtx.Provider value={t}>
     <div data-theme={theme} className="app">
@@ -6431,14 +6751,15 @@ function App(){
       <div style={{flexShrink:0,height:'62px',background:'var(--tabbar)',borderTop:'1px solid var(--tabborder)'}}/>
       <TabBar active={screen} onNav={nav} onFAB={onFAB}/>
 
-      {modal==='profile'&&<ProfileSheet onClose={()=>setModal(null)} onToggleTheme={toggleTheme} theme={theme} onEditProfile={()=>setModal('edit-profile')} onFAQ={()=>setModal('faq')} signedIn={signedIn} onToggleSignIn={toggleSignIn} data={data} onExport={()=>setModal('export')} onCSVImport={()=>setModal('csv-import')} authUser={authUser} authProfile={authProfile}/>}
+      {modal==='profile'&&<ProfileSheet onClose={()=>setModal(null)} onToggleTheme={toggleTheme} theme={theme} onEditProfile={()=>setModal('edit-profile')} onFAQ={()=>setModal('faq')} signedIn={signedIn} onToggleSignIn={toggleSignIn} data={data} onExport={()=>setModal('export')} onCSVImport={()=>setModal('csv-import')} authUser={authUser} authProfile={authProfile} authSquad={authSquad} onOpenSquad={()=>setModal('squad')}/>}
+      {modal==='squad'&&authUser&&<SquadModal onClose={()=>setModal(null)} authSquad={authSquad} authUser={authUser} setAuthSquad={setAuthSquad} cacheSquad={cacheSquad} clearSquadCache={clearSquadCache}/>}
       {modal==='edit-profile'&&<EditProfileModal onClose={()=>setModal(null)}/>}
       {modal==='faq'&&<FAQSheet onClose={()=>setModal(null)}/>}
       {modal==='export'&&authProfile?.role==='admin'&&<ExportSheet data={data} onClose={()=>setModal(null)}/>}
       {modal==='csv-import'&&authProfile?.role==='admin'&&<CSVImportModal onClose={()=>setModal(null)} onImportWombats={wombats=>{syncDispatch({type:'IMPORT_WOMBATS',wombats});nav('wombats');}} onImportBurrows={burrows=>{syncDispatch({type:'IMPORT_BURROWS',burrows});nav('burrows');}}/>}
       {modal==='fab'&&<FABSheet onClose={()=>setModal(null)} onSelect={fabSelect}/>}
-      {modal==='add-wombat'&&<AddWombatModal burrows={data.burrows} initialLocation={addAtLoc} nextCode={nextWombatCode(data.wombats)} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(w,linkedBurrowId,photo)=>{syncDispatch({type:'ADD_WOMBAT',wombat:w,linkedBurrowId:linkedBurrowId||null});if(linkedBurrowId)syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(photo)syncDispatch({type:'ADD_WOMBAT_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('wombat-profile',w.id);}}/>}
-      {modal==='add-burrow'&&<AddBurrowModal initialLocation={addAtLoc} nextCode={nextBurrowCode(data.burrows)} wombats={data.wombats} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(b,photo)=>{syncDispatch({type:'ADD_BURROW',burrow:b});(b.wombatIds||[]).forEach(wId=>syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:wId,burrowId:b.id}));if(photo)syncDispatch({type:'ADD_BURROW_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('burrow-profile',b.id);}}/>}
+      {modal==='add-wombat'&&<AddWombatModal burrows={data.burrows} initialLocation={addAtLoc} nextCode={nextWombatCode(data.wombats)} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(w,linkedBurrowId,photo)=>{syncDispatch({type:'ADD_WOMBAT',wombat:{...w,squadId:authSquad?.id||null},linkedBurrowId:linkedBurrowId||null});if(linkedBurrowId)syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(photo)syncDispatch({type:'ADD_WOMBAT_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('wombat-profile',w.id);}}/>}
+      {modal==='add-burrow'&&<AddBurrowModal initialLocation={addAtLoc} nextCode={nextBurrowCode(data.burrows)} wombats={data.wombats} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(b,photo)=>{syncDispatch({type:'ADD_BURROW',burrow:{...b,squadId:authSquad?.id||null}});(b.wombatIds||[]).forEach(wId=>syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:wId,burrowId:b.id}));if(photo)syncDispatch({type:'ADD_BURROW_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('burrow-profile',b.id);}}/>}
       {modal==='sign-in'&&<SignInModal onClose={()=>setModal(null)}/>}
       {recoveredWombat&&<RecoveryModal name={recoveredWombat.name} photoUrl={recoveredWombat.photoUrl} onClose={()=>setRecoveredWombat(null)}/>}
     </div>
