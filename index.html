@@ -17,6 +17,7 @@
 <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin=""></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js" crossorigin=""></script>
 <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin=""></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" crossorigin=""></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
 html{height:100%;height:-webkit-fill-available;}
@@ -81,7 +82,35 @@ button{cursor:pointer;font-family:inherit;border:none;background:none;padding:0;
 </style>
 </head>
 <body>
-<div id="root"></div>
+<div id="root" translate="no"></div>
+<script>
+/* ── DOM guard: prevent React removeChild/insertBefore crashes ──────────────
+   Browser features (iOS autocorrect, Chrome spellcheck, Android autocomplete,
+   browser-extension overlays, Chrome Translate) occasionally inject or move DOM
+   nodes that React then tries to remove — causing an uncaught NotFoundError that
+   tears down the entire app.  We patch the two DOM methods React uses so that if
+   the node is no longer where React expects it, we silently no-op rather than
+   crash.  The visual effect is negligible: the node is already not where React
+   thought it was, so the DOM was already inconsistent.                          */
+(function(){
+  var _rc=Node.prototype.removeChild;
+  Node.prototype.removeChild=function(child){
+    if(child.parentNode!==this){
+      console.warn('[WW] removeChild skipped — node not a child (browser modified DOM)');
+      return child;
+    }
+    return _rc.call(this,child);
+  };
+  var _ib=Node.prototype.insertBefore;
+  Node.prototype.insertBefore=function(node,ref){
+    if(ref&&ref.parentNode!==this){
+      console.warn('[WW] insertBefore: ref not a child — appending instead');
+      return _ib.call(this,node,null);
+    }
+    return _ib.call(this,node,ref);
+  };
+})();
+</script>
 <script>
 /* Surface any JS error visibly on screen so blank-white-screen bugs show their cause */
 window.onerror = function(msg, src, line, col, err) {
@@ -326,6 +355,10 @@ const Ico={
                              NOTE: distinct from Treatment.regions, which
                              records severity *at time of treatment*
      burrowIds   string[]    — associated burrow IDs (bidirectional with Burrow.wombatIds)
+     assignees   {userId:string, name:string}[]
+                             — volunteers assigned to monitor this wombat.
+                             Data model + sync fully implemented; UI hidden pending
+                             rollout (search "ASSIGNMENT UI HIDDEN" to re-enable).
      firstSeen   string      — ISO date 'YYYY-MM-DD'
      location    string      — human-readable place name
      lat         number|null — WGS84 decimal degrees
@@ -414,14 +447,14 @@ const Ico={
 const SD={
   // Hawkesbury–Macdonald region, NSW — Wisemans Ferry, Webbs Creek, Colo, Wrights Creek, Fernances, Macdonald Valley
   wombats:[
-    {id:'w1',name:'Maggie',sex:'F',ageClass:'adult',status:'healthy',severity:{},burrowIds:['b1','b2'],firstSeen:'2026-02-14',location:'St Albans',lat:-33.127,lng:150.975,notes:'Resident near the Settlers Arms Inn paddocks. Healthy weight and coat. Regular at both burrows.',_sync:true},
-    {id:'w2',name:'Bruce',sex:'M',ageClass:'adult',status:'under_treatment',severity:{back:3,shoulders:2},burrowIds:['b3'],firstSeen:'2026-01-28',location:'Lower Macdonald',lat:-33.358,lng:150.968,notes:'Moderate mange on back and shoulders. Responding well to fortnightly cydectin flap treatments.',_sync:true},
-    {id:'w3',name:'Rosie',sex:'F',ageClass:'sub-adult',status:'under_treatment',severity:{back:4,head:3,rump:2},burrowIds:['b5'],firstSeen:'2026-03-10',location:'Central Macdonald',lat:-33.072,lng:150.972,notes:'Severe mange. Spotted near Macdonald River rd. Urgent treatment program initiated.',_sync:true},
-    {id:'w4',name:'Digger',sex:'M',ageClass:'adult',status:'under_treatment',severity:{rump:2,legs:1},burrowIds:['b1','b7'],firstSeen:'2026-02-05',location:'St Albans',lat:-33.141,lng:150.962,notes:'Mild mange on rump and hind legs. Second treatment applied. Good prognosis.',_sync:true},
-    {id:'w5',name:'Matilda',sex:'F',ageClass:'adult',status:'healthy',severity:{},burrowIds:['b8'],firstSeen:'2026-01-19',location:'Webbs Creek',lat:-33.198,lng:151.009,notes:'Healthy female near Webbs Creek Rd. Observed with a joey in pouch March–April.',_sync:true},
-    {id:'w6',name:'Stumpy',sex:'M',ageClass:'senior',status:'under_treatment',severity:{back:2,legs:2},burrowIds:['b9'],firstSeen:'2025-11-03',location:'Pomeroy',lat:-33.052,lng:150.956,notes:'Old male with recurring mild mange. On maintenance treatment schedule. Missing tip of left ear.',_sync:true},
-    {id:'w7',name:'Bella',sex:'F',ageClass:'adult',status:'healthy',severity:{},burrowIds:['b10','b11'],firstSeen:'2026-03-22',location:'Higher Macdonald',lat:-32.972,lng:150.937,notes:'Northern population individual. No mange. Observed at two burrows on the ridge above Higher Macdonald Rd.',_sync:true},
-    {id:'w8',name:'Rocky',sex:'M',ageClass:'adult',status:'under_treatment',severity:{back:4,legs:3,rump:3},burrowIds:['b12'],firstSeen:'2026-04-01',location:'Lower Macdonald',lat:-33.273,lng:150.989,notes:'Advanced mange across back, legs and rump. Located near river flats south of Fernances Crossing. Treatment access difficult.',_sync:true},
+    {id:'w1',name:'Maggie',sex:'F',ageClass:'adult',status:'healthy',severity:{},burrowIds:['b1','b2'],firstSeen:'2026-02-14',location:'St Albans',lat:-33.127,lng:150.975,notes:'Resident near the Settlers Arms Inn paddocks. Healthy weight and coat. Regular at both burrows.',assignees:[],_sync:true},
+    {id:'w2',name:'Bruce',sex:'M',ageClass:'adult',status:'under_treatment',severity:{back:3,shoulders:2},burrowIds:['b3'],firstSeen:'2026-01-28',location:'Lower Macdonald',lat:-33.358,lng:150.968,notes:'Moderate mange on back and shoulders. Responding well to fortnightly cydectin flap treatments.',assignees:[],_sync:true},
+    {id:'w3',name:'Rosie',sex:'F',ageClass:'sub-adult',status:'under_treatment',severity:{back:4,head:3,rump:2},burrowIds:['b5'],firstSeen:'2026-03-10',location:'Central Macdonald',lat:-33.072,lng:150.972,notes:'Severe mange. Spotted near Macdonald River rd. Urgent treatment program initiated.',assignees:[],_sync:true},
+    {id:'w4',name:'Digger',sex:'M',ageClass:'adult',status:'under_treatment',severity:{rump:2,legs:1},burrowIds:['b1','b7'],firstSeen:'2026-02-05',location:'St Albans',lat:-33.141,lng:150.962,notes:'Mild mange on rump and hind legs. Second treatment applied. Good prognosis.',assignees:[],_sync:true},
+    {id:'w5',name:'Matilda',sex:'F',ageClass:'adult',status:'healthy',severity:{},burrowIds:['b8'],firstSeen:'2026-01-19',location:'Webbs Creek',lat:-33.198,lng:151.009,notes:'Healthy female near Webbs Creek Rd. Observed with a joey in pouch March–April.',assignees:[],_sync:true},
+    {id:'w6',name:'Stumpy',sex:'M',ageClass:'senior',status:'under_treatment',severity:{back:2,legs:2},burrowIds:['b9'],firstSeen:'2025-11-03',location:'Pomeroy',lat:-33.052,lng:150.956,notes:'Old male with recurring mild mange. On maintenance treatment schedule. Missing tip of left ear.',assignees:[],_sync:true},
+    {id:'w7',name:'Bella',sex:'F',ageClass:'adult',status:'healthy',severity:{},burrowIds:['b10','b11'],firstSeen:'2026-03-22',location:'Higher Macdonald',lat:-32.972,lng:150.937,notes:'Northern population individual. No mange. Observed at two burrows on the ridge above Higher Macdonald Rd.',assignees:[],_sync:true},
+    {id:'w8',name:'Rocky',sex:'M',ageClass:'adult',status:'under_treatment',severity:{back:4,legs:3,rump:3},burrowIds:['b12'],firstSeen:'2026-04-01',location:'Lower Macdonald',lat:-33.273,lng:150.989,notes:'Advanced mange across back, legs and rump. Located near river flats south of Fernances Crossing. Treatment access difficult.',assignees:[],_sync:true},
   ],
   burrows:[
     {id:'b1',name:'Settlers Flat #1',status:'active',location:'St Albans',lat:-33.125,lng:150.977,habitat:{substrate:'Clay loam',vegetation:'Riparian woodland',notes:'Below old orchard, 40m from riverbank'},wombatIds:['w1','w4'],lastChecked:'2026-04-18',nextCheck:'2026-05-02',entranceHeightCm:32,entranceWidthCm:41,orientation:'NE (48°)',_sync:true},
@@ -1014,8 +1047,8 @@ const SUPA_ANON='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsIn
 const supa=window.supabase.createClient(SUPA_URL,SUPA_ANON);
 
 // ── camelCase ↔ snake_case mappings ──────────────────────────
-const wombatToDb=(w,uid)=>({id:w.id,created_by:uid||null,squad_id:w.squadId||null,name:w.name,sex:w.sex||null,age_class:w.ageClass||null,status:w.status||null,severity:w.severity||{},burrow_ids:w.burrowIds||[],first_seen:w.firstSeen||null,location:w.location||null,lat:w.lat||null,lng:w.lng||null,notes:w.notes||null,code:w.code||null,location_label:w.locationLabel||null,inactive_at:w.inactiveAt||null,inactive_cause:w.inactiveCause||null,inactive_notes:w.inactiveNotes||null});
-const dbToWombat=r=>({id:r.id,name:r.name,sex:r.sex,ageClass:r.age_class,status:r.status==='mange'?'under_treatment':r.status,severity:r.severity||{},burrowIds:r.burrow_ids||[],firstSeen:r.first_seen,location:r.location,lat:r.lat,lng:r.lng,notes:r.notes,code:r.code,locationLabel:r.location_label||null,inactiveAt:r.inactive_at||null,inactiveCause:r.inactive_cause||null,inactiveNotes:r.inactive_notes||null,squadId:r.squad_id||null,_createdBy:r.created_by,_sync:true});
+const wombatToDb=(w,uid)=>({id:w.id,created_by:uid||null,squad_id:w.squadId||null,name:w.name,sex:w.sex||null,age_class:w.ageClass||null,status:w.status||null,severity:w.severity||{},burrow_ids:w.burrowIds||[],first_seen:w.firstSeen||null,location:w.location||null,lat:w.lat||null,lng:w.lng||null,notes:w.notes||null,code:w.code||null,location_label:w.locationLabel||null,inactive_at:w.inactiveAt||null,inactive_cause:w.inactiveCause||null,inactive_notes:w.inactiveNotes||null,assignees:w.assignees||[]});
+const dbToWombat=r=>({id:r.id,name:r.name,sex:r.sex,ageClass:r.age_class,status:r.status==='mange'?'under_treatment':r.status,severity:r.severity||{},burrowIds:r.burrow_ids||[],firstSeen:r.first_seen,location:r.location,lat:r.lat,lng:r.lng,notes:r.notes,code:r.code,locationLabel:r.location_label||null,inactiveAt:r.inactive_at||null,inactiveCause:r.inactive_cause||null,inactiveNotes:r.inactive_notes||null,squadId:r.squad_id||null,assignees:r.assignees||[],_createdBy:r.created_by,_sync:true});
 const burrowToDb=(b,uid)=>({id:b.id,created_by:uid||null,squad_id:b.squadId||null,name:b.name,status:b.status||null,location:b.location||null,lat:b.lat||null,lng:b.lng||null,habitat:b.habitat||{},wombat_ids:b.wombatIds||[],last_checked:b.lastChecked||null,next_check:b.nextCheck||null,entrance_height_cm:b.entranceHeightCm||null,entrance_width_cm:b.entranceWidthCm||null,orientation:b.orientation||null,code:b.code||null});
 const dbToBurrow=r=>({id:r.id,name:r.name,status:r.status,location:r.location,lat:r.lat,lng:r.lng,habitat:r.habitat||{},wombatIds:r.wombat_ids||[],lastChecked:r.last_checked,nextCheck:r.next_check,entranceHeightCm:r.entrance_height_cm,entranceWidthCm:r.entrance_width_cm,orientation:r.orientation,code:r.code,squadId:r.squad_id||null,_createdBy:r.created_by,_sync:true});
 const treatmentToDb=(t,uid)=>({id:t.id,wombat_id:t.wombatId,created_by:uid||null,at:t.at,by_name:t.by||null,product:t.product||null,dose:t.dose||null,method:t.method||null,severity:t.severity||null,regions:t.regions||{},note:t.note||null,linked_burrow_id:t.linkedBurrowId||null,marked_recovered:t.markedRecovered||false});
@@ -1382,6 +1415,21 @@ async function syncAction(action,userId){
       case'MARK_WOMBAT_INACTIVE':{const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:action.inactiveAt,inactiveCause:action.inactiveCause||null,inactiveNotes:action.inactiveNotes||null},userId));break;}
       case'MARK_WOMBAT_ACTIVE':  {const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:null,inactiveCause:null,inactiveNotes:null},userId));break;}
       case'IMPORT_WOMBATS': for(const w of (action.wombats||[]))await push('wombats',wombatToDb(w,userId)); break;
+      case'ASSIGN_WOMBAT':{
+        const w=await fromIdb('w',action.wombatId);
+        if(w){
+          const cur=w.assignees||[];
+          const assignees=cur.some(a=>a.userId===action.userId)?cur:[...cur,{userId:action.userId,name:action.name}];
+          await push('wombats',wombatToDb({...w,assignees},userId));
+        }
+        break;}
+      case'UNASSIGN_WOMBAT':{
+        const w=await fromIdb('w',action.wombatId);
+        if(w){
+          const assignees=(w.assignees||[]).filter(a=>a.userId!==action.userId);
+          await push('wombats',wombatToDb({...w,assignees},userId));
+        }
+        break;}
       case'DELETE_WOMBAT': {
         await del('wombats',action.id);
         // Explicitly delete child records — don't rely on CASCADE DELETE being configured in Supabase.
@@ -1724,6 +1772,7 @@ function StatChip({count,label,tone='pearl',active=false,onClick}){
     amber:{bg:isDark?'rgba(253,199,0,0.18)':'rgba(253,199,0,0.1)',  border:'rgba(253,199,0,0.3)',  activeBorder:'rgba(200,140,0,0.85)'},
     rose: {bg:isDark?'rgba(130,24,26,0.22)':'rgba(130,24,26,0.09)', border:'rgba(130,24,26,0.22)', activeBorder:'rgba(130,24,26,0.85)'},
     sky:  {bg:isDark?'rgba(98,116,142,0.22)':'rgba(98,116,142,0.09)',border:'rgba(98,116,142,0.22)',activeBorder:'rgba(98,116,142,0.85)'},
+    lav:  {bg:isDark?'rgba(109,77,161,0.22)':'rgba(109,77,161,0.09)',border:'rgba(109,77,161,0.22)',activeBorder:'rgba(109,77,161,0.85)'},
     pearl:{bg:t.soft,border:t.div,                                                                 activeBorder:t.softInk}
   };
   const tc=toneMap[tone]||toneMap.pearl;
@@ -1972,9 +2021,9 @@ function FormField({label,required,children}){
     {children}
   </div>;
 }
-function FInput({value,onChange,placeholder,type='text',monospace=false}){
+function FInput({value,onChange,placeholder,type='text',monospace=false,maxLength}){
   const t=useTheme();
-  return <input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder}
+  return <input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} maxLength={maxLength}
     style={{width:'100%',height:42,borderRadius:12,padding:'0 14px',background:t.soft,border:`1.5px solid ${t.div}`,fontSize:14,color:t.ink,fontFamily:monospace?'monospace':'-apple-system,system-ui'}}/>;
 }
 function FTextarea({value,onChange,placeholder,rows=3}){
@@ -2135,7 +2184,7 @@ function AcknowledgementFooter(){
 // Weather: Open-Meteo (no API key, Access-Control-Allow-Origin:* — works from file://)
 // River:   BOM KISTERS via allorigins CORS proxy (file:// sends null origin, BOM rejects it)
 const WX_CACHE_KEY='ww_weather_cache';
-function WeatherWidget(){
+function WeatherWidget({lat,lng}){
   const t=useTheme();
   // Initialise from cache so offline visits show last known data immediately
   const [wx,setWx]=useState(()=>{
@@ -2183,14 +2232,16 @@ function WeatherWidget(){
       }catch{}
     };
 
-    // ── Weather: Open-Meteo (St Albans NSW -33.13, 150.98) ───────────
+    // ── Weather: Open-Meteo (lat/lng from squad bounds midpoint, or St Albans NSW fallback) ──
     const doWeather=async()=>{
       try{
+        const wxLat=lat!=null?lat:-33.13;
+        const wxLng=lng!=null?lng:150.98;
         const url='https://api.open-meteo.com/v1/forecast'
-          +'?latitude=-33.13&longitude=150.98'
+          +'?latitude='+wxLat+'&longitude='+wxLng
           +'&current=temperature_2m,weather_code'
           +'&daily=temperature_2m_max,temperature_2m_min'
-          +'&timezone=Australia%2FSydney&forecast_days=1';
+          +'&timezone=auto&forecast_days=1';
         const r=await fetch(url);
         if(!r.ok) throw 0;
         const d=await r.json();
@@ -2390,7 +2441,7 @@ function RecoveryModal({name,photoUrl,onClose}){
 }
 
 /* ── DASHBOARD ── */
-function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunteerCount='—'}){
+function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunteerCount='—',squadLat,squadLng}){
   const t=useTheme();
   const wombats=data.wombats.filter(w=>!isInactive(w)); // active only for stats
   const inactiveWombats=data.wombats.filter(isInactive);
@@ -2416,7 +2467,7 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
       </div>
     </Header>
     <div style={{padding:'20px var(--sp) 0'}}>
-      <WeatherWidget/>
+      <WeatherWidget lat={squadLat} lng={squadLng}/>
     </div>
     <div style={{padding:'20px var(--sp) 0'}}>
       <SectionLabel>At a Glance</SectionLabel>
@@ -2570,7 +2621,7 @@ const ATTR_SAT   = '© Esri World Imagery';
    Full-screen Leaflet map. Long-press to add a wombat or burrow
    at a chosen location. Offline tile download managed here.
 ════════════════════════════════════════════════════════════════ */
-function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWombatFilters,burrowFilters,setBurrowFilters,cameraFilter,setCameraFilter}){
+function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWombatFilters,burrowFilters,setBurrowFilters,cameraFilter,setCameraFilter,authSquad}){
   const t=useTheme();
   const mapRef=useRef(null);
   const leafletRef=useRef(null);
@@ -2695,10 +2746,17 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
 
   useEffect(()=>{
     if(!mapRef.current||leafletRef.current)return;
-    // Centred on the operational area: Macdonald Valley, Webbs Creek,
-    // Colo, Wrights Creek, Fernances Creek, and Wisemans Ferry
-    const center=[-33.22,150.97];
-    const map=L.map(mapRef.current,{zoomControl:false}).setView(center,11);
+    // Initial view: use squad home bounds if set, otherwise fall back to
+    // the Macdonald Valley / Wisemans Ferry area (original default).
+    const map=L.map(mapRef.current,{zoomControl:false});
+    if(authSquad?.boundsSwLat!=null&&authSquad?.boundsNeLat!=null){
+      map.fitBounds([
+        [authSquad.boundsSwLat,authSquad.boundsSwLng],
+        [authSquad.boundsNeLat,authSquad.boundsNeLng]
+      ],{animate:false});
+    }else{
+      map.setView([-33.22,150.97],11);
+    }
     leafletRef.current=map;
     // Tile layer is created by the satellite effect below (runs after this effect on mount)
     // Long press detection
@@ -2980,8 +3038,13 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
   const [editingWombat,setEditingWombat]=useState(null); // wombat being edited
   const activeWombats=data.wombats.filter(w=>!isInactive(w));
   const inactiveWombats=data.wombats.filter(isInactive);
+  const myId=authUser?.id;
+  // mineCount and the 'mine' filter case are kept ready for when the assignment UI
+  // is re-enabled (search "ASSIGNMENT UI HIDDEN"). Harmless while toggle is hidden.
+  const mineCount=data.wombats.filter(w=>!isInactive(w)&&(w.assignees||[]).some(a=>a.userId===myId)).length;
   const filtered=data.wombats.filter(w=>{
     const active=!isInactive(w);
+    if(filterStatus==='mine') return (w.assignees||[]).some(a=>a.userId===myId);
     if(filterStatus==='inactive') return !active;
     if(filterStatus!=='active'&&w.status!==filterStatus) return false;
     if(!active) return false; // default active-only views exclude inactive
@@ -3021,6 +3084,13 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
         <option value="location">Location</option>
         <option value="last_treated">Last Treated</option>
       </select>
+      {/* ASSIGNMENT UI HIDDEN — re-enable when rolling out volunteer assignment feature
+      <button onClick={()=>setFilterStatus(filterStatus==='mine'?'active':'mine')}
+        style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:5,padding:'6px 12px',borderRadius:999,border:`1.5px solid ${filterStatus==='mine'?t.lav500:t.div}`,background:filterStatus==='mine'?t.lav100:'none',color:filterStatus==='mine'?t.lav500:t.mid,fontSize:12.5,fontWeight:600,cursor:'pointer',whiteSpace:'nowrap',transition:'all 0.15s'}}>
+        {Ico.person(filterStatus==='mine'?t.lav500:t.mid,13)}
+        My wombats{mineCount>0?` · ${mineCount}`:''}
+      </button>
+      */}
     </div>
     <div style={{padding:'0 var(--sp)',display:'flex',flexDirection:'column',gap:10}}>
       {filtered.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'40px 0',fontSize:14}}>No wombats found.</div>}
@@ -3174,7 +3244,7 @@ function PhotoCell({photo,onReplace,onDelete,onSetProfile,labelDelete='Delete',s
 }
 
 /* ── WOMBAT PROFILE ── */
-function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
+function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
   const t=useTheme();
   const isAdmin=authProfile?.role==='admin';
   const [activeTab,setActiveTab]=useState(0);
@@ -3271,6 +3341,42 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
         </div>
       </Card>
     </div>
+    {/* ASSIGNMENT UI HIDDEN — re-enable when rolling out volunteer assignment feature
+    {(()=>{
+      const assignees=w.assignees||[];
+      const myId=authUser?.id;
+      const iAmAssigned=assignees.some(a=>a.userId===myId);
+      const handleAssign=()=>{
+        if(!myId)return;
+        const name=(authProfile?.display_name)||'Volunteer';
+        dispatch({type:'ASSIGN_WOMBAT',wombatId:w.id,userId:myId,name});
+      };
+      const handleUnassign=userId=>{
+        dispatch({type:'UNASSIGN_WOMBAT',wombatId:w.id,userId});
+      };
+      return <div style={{padding:'12px var(--sp) 0'}}>
+        <Card padding={14}>
+          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:assignees.length>0?10:0}}>
+            <div style={{fontSize:12,fontWeight:700,color:t.mid,textTransform:'uppercase',letterSpacing:0.6}}>Assigned Volunteers</div>
+            {!iAmAssigned&&<button onClick={handleAssign} style={{fontSize:12.5,fontWeight:700,color:t.lav500,background:t.lav100,border:'none',borderRadius:8,padding:'5px 12px',cursor:'pointer'}}>+ Assign me</button>}
+          </div>
+          {assignees.length===0
+            ?<div style={{fontSize:13,color:t.faint,fontStyle:'italic'}}>No one assigned yet</div>
+            :<div style={{display:'flex',flexWrap:'wrap',gap:8}}>
+              {assignees.map(a=>{
+                const canRemove=isAdmin||a.userId===myId;
+                return <div key={a.userId} style={{display:'inline-flex',alignItems:'center',gap:6,background:t.lav100,borderRadius:999,padding:'5px 10px 5px 12px'}}>
+                  <span style={{fontSize:13,fontWeight:600,color:t.lav500}}>{a.name}</span>
+                  {canRemove&&<button onClick={()=>handleUnassign(a.userId)} style={{background:'none',border:'none',padding:0,cursor:'pointer',display:'flex',alignItems:'center',color:t.lav500,opacity:0.7,lineHeight:1}}>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                  </button>}
+                </div>;
+              })}
+            </div>}
+        </Card>
+      </div>;
+    })()}
+    */}
     {/* Tabs */}
     <div style={{padding:'16px 12px 0'}}><TabPills tabs={['Treatments','Photos','Notes','Location']} active={activeTab} onChange={setActiveTab}/></div>
     <div style={{padding:'20px var(--sp) 0'}}>
@@ -3299,7 +3405,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile}){
                 {trBurrow&&<button onClick={()=>nav('burrow-profile',trBurrow.id)} style={{display:'inline-flex',alignItems:'center',gap:5,marginTop:6,marginBottom:2,padding:'3px 8px',borderRadius:8,background:t.soft,border:'none',cursor:'pointer'}}>{Ico.burrow(t.f700,12)}<span style={{fontSize:12,fontWeight:600,color:t.f700}}>{trBurrow.name}</span></button>}
                 <div style={{display:'flex',flexDirection:'column',gap:3,margin:'7px 0 5px'}}>
                   {(tr.product||tr.dose)&&<div style={{fontSize:13,color:t.mid}}>{productLabels[tr.product]||tr.product}{tr.dose?` · ${tr.dose} ml`:''}</div>}
-                  <div style={{fontSize:13,color:t.mid}}>Applied by {tr.by}{tr.severity?` · Severity ${tr.severity}/5`:''}</div>
+                  <div style={{fontSize:13,color:t.mid,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>Applied by {tr.by}{tr.severity?` · Severity ${tr.severity}/5`:''}</div>
                 </div>
                 {tr.note&&(noteLong
                   ? <div style={{position:'relative'}}>
@@ -3634,7 +3740,7 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
                   <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12,color:t.mid,flexShrink:0}}>{Ico.cal(t.mid,12)} {fmtDate(l.at)}</div>
                 </div>
                 <div style={{display:'flex',flexDirection:'column',gap:3,margin:'7px 0 5px'}}>
-                  {l.by&&<div style={{fontSize:13,color:t.mid}}>Logged by {l.by}</div>}
+                  {l.by&&<div style={{fontSize:13,color:t.mid,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>Logged by {l.by}</div>}
                   {/* wombatIds on BurrowLog is optional — populate when multiple wombats are observed at a log visit */}
                   {l.wombatIds?.length>0&&<div style={{fontSize:13,color:t.mid}}>Wombats: {l.wombatIds.map(id=>data.wombats.find(w=>w.id===id)?.name).filter(Boolean).join(', ')}</div>}
                   {(l.heightCm||l.widthCm)&&<div style={{fontSize:13,color:t.mid}}>Entrance: {[l.heightCm&&`${l.heightCm} cm H`,l.widthCm&&`${l.widthCm} cm W`].filter(Boolean).join(' × ')}</div>}
@@ -3745,18 +3851,19 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
 // Shown when user is signed in but has no squad yet.
 function SquadSetupScreen({onSquadReady,pendingToken}){
   const t=useTheme();
-  const [mode,setMode]=useState(pendingToken?'join':null); // null|'create'|'join'
+  const [mode,setMode]=useState(pendingToken?'join':null); // null|'create'|'join'|'set-area'
   const [squadName,setSquadName]=useState('');
   const [squadDesc,setSquadDesc]=useState('');
   const [token,setToken]=useState(pendingToken||'');
   const [busy,setBusy]=useState(false);
   const [err,setErr]=useState(null);
+  const [createdSquadId,setCreatedSquadId]=useState(null);
 
-  const loadSquad=async()=>{
+  const fetchSquadAndFinish=async()=>{
     const{data:{user}}=await supa.auth.getUser();
     if(!user)return;
-    const{data:m}=await supa.from('squad_members').select('role, squad:squads(id,name)').eq('user_id',user.id).single();
-    if(m?.squad)onSquadReady({id:m.squad.id,name:m.squad.name,role:m.role});
+    const{data:m}=await supa.from('squad_members').select('role, squad:squads(id,name,bounds_sw_lat,bounds_sw_lng,bounds_ne_lat,bounds_ne_lng,emergency_contacts)').eq('user_id',user.id).single();
+    if(m?.squad)onSquadReady({id:m.squad.id,name:m.squad.name,role:m.role,boundsSwLat:m.squad.bounds_sw_lat,boundsSwLng:m.squad.bounds_sw_lng,boundsNeLat:m.squad.bounds_ne_lat,boundsNeLng:m.squad.bounds_ne_lng,emergencyContacts:m.squad.emergency_contacts||[]});
   };
 
   const handleCreate=async()=>{
@@ -3764,9 +3871,12 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
     setBusy(true);setErr(null);
     const{data,error}=await supa.rpc('create_squad',{p_name:squadName.trim(),p_description:squadDesc.trim()||null});
     if(error||!data?.ok){setErr(error?.message||data?.error||'Could not create squad.');setBusy(false);return;}
-    await loadSquad();
+    // Squad created — move to the home area picker
+    setCreatedSquadId(data.squad_id);
     setBusy(false);
+    setMode('set-area');
   };
+
 
   const handleJoin=async()=>{
     const raw=token.trim();
@@ -3783,7 +3893,7 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
         :error?.message||data?.error||'Could not join squad.';
       setErr(msg);setBusy(false);return;
     }
-    await loadSquad();
+    await fetchSquadAndFinish();
     setBusy(false);
   };
 
@@ -3795,13 +3905,30 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
     </button>
   );
 
+  // ── Set-area mode: full-screen map to pick home bounds ────────
+  if(mode==='set-area'){
+    return <div style={{height:'100%',background:t.bg,display:'flex',flexDirection:'column',padding:'24px 20px',boxSizing:'border-box'}}>
+      <div style={{fontSize:22,fontWeight:800,color:t.ink,marginBottom:4}}>Set your home area</div>
+      <div style={{flex:1,display:'flex',flexDirection:'column'}}>
+        <SquadAreaEditor
+          initialBounds={null}
+          onSave={async(b)=>{
+            if(createdSquadId)await supa.rpc('update_squad_bounds',{p_squad_id:createdSquadId,p_sw_lat:b.swLat,p_sw_lng:b.swLng,p_ne_lat:b.neLat,p_ne_lng:b.neLng});
+            await fetchSquadAndFinish();
+          }}
+          onCancel={fetchSquadAndFinish}
+          saveLabel="Save Home Area"
+          cancelLabel="Skip for now"
+        />
+      </div>
+    </div>;
+  }
+
   return <div style={{minHeight:'100vh',background:t.bg,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'32px 24px',boxSizing:'border-box'}}>
     <div style={{width:'100%',maxWidth:420}}>
       {/* Logo */}
       <div style={{textAlign:'center',marginBottom:32}}>
-        <div style={{width:64,height:64,borderRadius:20,background:t.f700,display:'inline-flex',alignItems:'center',justifyContent:'center',marginBottom:16}}>
-          {Ico.wombat('#fff',30)}
-        </div>
+        <img src="data:image/png;base64,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" style={{width:64,height:64,borderRadius:20,marginBottom:16,display:"inline-block",objectFit:"cover"}}/>
         <div style={{fontSize:24,fontWeight:800,color:t.ink,letterSpacing:-0.5}}>WombatWatch</div>
         <div style={{fontSize:14,color:t.mid,marginTop:6}}>Join or create your monitoring squad</div>
       </div>
@@ -3811,7 +3938,7 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
           <button onClick={()=>setMode('create')}
             style={{padding:'20px 20px',borderRadius:16,border:`2px solid ${t.div}`,background:t.surface,textAlign:'left',cursor:'pointer',display:'flex',alignItems:'center',gap:16}}>
             <div style={{width:44,height:44,borderRadius:12,background:t.sage50,flexShrink:0,display:'flex',alignItems:'center',justifyContent:'center'}}>
-              {Ico.add(t.f700,22)}
+              {Ico.plus(t.f700,22)}
             </div>
             <div>
               <div style={{fontSize:16,fontWeight:700,color:t.ink}}>Create a new squad</div>
@@ -3820,8 +3947,8 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
           </button>
           <button onClick={()=>setMode('join')}
             style={{padding:'20px 20px',borderRadius:16,border:`2px solid ${t.div}`,background:t.surface,textAlign:'left',cursor:'pointer',display:'flex',alignItems:'center',gap:16}}>
-            <div style={{width:44,height:44,borderRadius:12,background:t.sky50,flexShrink:0,display:'flex',alignItems:'center',justifyContent:'center'}}>
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={t.sky700} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+            <div style={{width:44,height:44,borderRadius:12,background:t.lav100,flexShrink:0,display:'flex',alignItems:'center',justifyContent:'center'}}>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={t.lav500} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
             </div>
             <div>
               <div style={{fontSize:16,fontWeight:700,color:t.ink}}>Join with invite link</div>
@@ -3864,7 +3991,7 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
         <div style={{fontSize:13,color:t.mid,marginBottom:20}}>Paste the invite link or token your admin shared with you.</div>
         <textarea value={token} onChange={e=>setToken(e.target.value)}
           placeholder="https://boornewild.github.io/index.html?join=…"
-          rows={3}
+          rows={3} spellCheck={false} autoCorrect="off" autoCapitalize="off"
           style={{width:'100%',padding:'13px 14px',borderRadius:12,border:`1.5px solid ${t.div}`,background:t.surface,color:t.ink,fontSize:14,boxSizing:'border-box',outline:'none',resize:'none',fontFamily:'inherit'}}/>
         {err&&<div style={{fontSize:13,color:t.rose700,background:t.rose50,borderRadius:10,padding:'10px 14px',margin:'12px 0 4px'}}>{err}</div>}
         <div style={{marginTop:14}}><Btn onClick={handleJoin} disabled={busy}>{busy?'Joining…':'Join Squad'}</Btn></div>
@@ -3873,16 +4000,81 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
   </div>;
 }
 
+// ── SQUAD AREA EDITOR MAP ────────────────────────────────────────
+// Shared Leaflet-map overlay for setting a squad's home bounding box.
+// Used inside SquadSetupScreen (set-area mode) and SquadModal (admin edit).
+// Props:
+//   initialBounds  — {swLat,swLng,neLat,neLng} or null (defaults to Macdonald Valley)
+//   onSave(bounds) — called with {swLat,swLng,neLat,neLng} when admin taps Save
+//   onCancel()     — called when admin taps Cancel / Skip
+//   saveLabel      — button label (default "Save Home Area")
+//   cancelLabel    — button label (default "Skip for now")
+function SquadAreaEditor({initialBounds,onSave,onCancel,saveLabel='Save Home Area',cancelLabel='Skip for now'}){
+  const t=useTheme();
+  const mapDivRef=useRef(null);
+  const leafletRef=useRef(null);
+  const [busy,setBusy]=useState(false);
+
+  useEffect(()=>{
+    const tid=setTimeout(()=>{
+      if(!mapDivRef.current||leafletRef.current)return;
+      const map=L.map(mapDivRef.current,{zoomControl:true});
+      if(initialBounds?.swLat!=null&&initialBounds?.neLat!=null){
+        map.fitBounds([[initialBounds.swLat,initialBounds.swLng],[initialBounds.neLat,initialBounds.neLng]],{animate:false});
+      }else{
+        map.setView([-33.22,150.97],9);
+      }
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap contributors',maxZoom:19}).addTo(map);
+      leafletRef.current=map;
+    },80);
+    return()=>{clearTimeout(tid);if(leafletRef.current){leafletRef.current.remove();leafletRef.current=null;}};
+  },[]);
+
+  const handleSave=async()=>{
+    const map=leafletRef.current;
+    if(!map)return;
+    setBusy(true);
+    const b=map.getBounds();
+    await onSave({swLat:b.getSouth(),swLng:b.getWest(),neLat:b.getNorth(),neLng:b.getEast()});
+    setBusy(false);
+  };
+
+  return <div style={{display:'flex',flexDirection:'column',height:'100%'}}>
+    <div style={{fontSize:13,color:t.mid,marginBottom:10,lineHeight:1.5}}>
+      Pan and zoom so the map shows your squad's entire monitoring area, then tap <strong>Save</strong>. You can always update this later in Squad Settings.
+    </div>
+    {/* Map container — needs an explicit height for Leaflet */}
+    <div ref={mapDivRef} style={{flex:1,minHeight:280,borderRadius:14,overflow:'hidden',border:`1.5px solid ${t.div}`}}/>
+    <div style={{display:'flex',gap:10,marginTop:14}}>
+      <button onClick={onCancel} disabled={busy}
+        style={{flex:1,padding:'13px 0',borderRadius:12,border:`1.5px solid ${t.div}`,background:'none',color:t.mid,fontSize:14,fontWeight:600,cursor:busy?'not-allowed':'pointer',opacity:busy?0.6:1}}>
+        {cancelLabel}
+      </button>
+      <button onClick={handleSave} disabled={busy}
+        style={{flex:2,padding:'13px 0',borderRadius:12,border:'none',background:t.f700,color:'#fff',fontSize:14,fontWeight:700,cursor:busy?'not-allowed':'pointer',opacity:busy?0.6:1}}>
+        {busy?'Saving…':saveLabel}
+      </button>
+    </div>
+  </div>;
+}
+
 // ── SQUAD MODAL (settings overlay) ───────────────────────────────
 // Shown from ProfileSheet → "My Squad" row
-function SquadModal({onClose,authSquad,authUser,setAuthSquad,cacheSquad,clearSquadCache}){
+function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,clearSquadCache}){
   const t=useTheme();
   const isAdmin=authSquad?.role==='admin';
+  const [page,setPage]=useState('main'); // 'main'|'contacts'
   const [invites,setInvites]=useState([]);
   const [loadingInvites,setLoadingInvites]=useState(false);
   const [generating,setGenerating]=useState(false);
-  const [leaving,setLeaving]=useState(false);
-  const [copied,setCopied]=useState(null); // invite id that was just copied
+  const [copied,setCopied]=useState(null);
+  const [showAreaEditor,setShowAreaEditor]=useState(false);
+  // contacts editor state
+  const [contacts,setContacts]=useState(authSquad?.emergencyContacts||[]);
+  const [addName,setAddName]=useState('');
+  const [addPhone,setAddPhone]=useState('');
+  const [addDesc,setAddDesc]=useState('');
+  const [savingContacts,setSavingContacts]=useState(false);
   const baseUrl=window.location.origin+window.location.pathname;
 
   // Load existing invites (admin only)
@@ -3917,32 +4109,39 @@ function SquadModal({onClose,authSquad,authUser,setAuthSquad,cacheSquad,clearSqu
     setInvites(prev=>prev.filter(i=>i.id!==inviteId));
   };
 
-  const handleLeave=async()=>{
-    if(!window.confirm(`Leave "${authSquad.name}"? You'll need a new invite link to re-join.`))return;
-    setLeaving(true);
-    const{data:{user}}=await supa.auth.getUser();
-    const{error}=await supa.from('squad_members').delete().eq('squad_id',authSquad.id).eq('user_id',user.id);
-    if(error){alert('Could not leave squad: '+error.message);setLeaving(false);return;}
-    clearSquadCache();
-    setAuthSquad(null);
-    onClose();
-  };
-
   const fmtUses=inv=>{
     if(inv.max_uses===null)return `${inv.use_count} uses`;
     return `${inv.use_count} / ${inv.max_uses} uses`;
   };
 
-  return <div style={{position:'fixed',inset:0,zIndex:1600,background:'rgba(15,25,18,0.5)'}}>
+  const handleSaveContacts=async()=>{
+    setSavingContacts(true);
+    await supa.rpc('update_squad_emergency_contacts',{p_squad_id:authSquad.id,p_contacts:contacts});
+    const updated={...authSquad,emergencyContacts:contacts};
+    setAuthSquad(updated);cacheSquad(updated);
+    setSavingContacts(false);
+    setPage('main');
+  };
+
+  const handleAddContact=()=>{
+    if(!addName.trim()||!addPhone.trim())return;
+    setContacts(prev=>[...prev,{name:addName.trim(),phone:addPhone.trim(),desc:addDesc.trim()}]);
+    setAddName('');setAddPhone('');setAddDesc('');
+  };
+
+  return <><div style={{position:'fixed',inset:0,zIndex:1600,background:'rgba(15,25,18,0.5)'}}>
     <button onClick={onClose} style={{position:'absolute',inset:0,width:'100%',background:'none'}}/>
     <div style={{position:'absolute',left:'50%',transform:'translateX(-50%)',bottom:0,width:'100%',maxWidth:480,background:t.surface,borderTopLeftRadius:28,borderTopRightRadius:28,boxShadow:'0 -10px 40px rgba(0,0,0,0.2)',maxHeight:'90vh',overflowY:'auto'}}>
       <div style={{width:40,height:4,borderRadius:2,background:t.faint,margin:'14px auto 0',opacity:0.5}}/>
-      <div style={{padding:'20px 20px 8px',display:'flex',alignItems:'flex-start',justifyContent:'space-between'}}>
+      <div style={{padding:'16px 20px 8px',display:'flex',alignItems:'flex-start',gap:10}}>
+        <button onClick={onBack||onClose} style={{background:'none',border:'none',color:t.mid,cursor:'pointer',padding:4,display:'flex',alignItems:'center',justifyContent:'center',marginTop:2,flexShrink:0}}>
+          {Ico.back(t.mid,20)}
+        </button>
         <div>
           <div style={{fontSize:20,fontWeight:800,color:t.ink}}>{authSquad?.name}</div>
           <div style={{display:'flex',alignItems:'center',gap:8,marginTop:4}}>
             {isAdmin
-              ?<span style={{fontSize:11,fontWeight:700,color:t.amb700,background:t.amb50,borderRadius:6,padding:'2px 8px',letterSpacing:0.3}}>ADMIN</span>
+              ?<span style={{fontSize:11,fontWeight:700,color:t.lav500,background:t.lav100,borderRadius:6,padding:'2px 8px',letterSpacing:0.3}}>ADMIN</span>
               :<span style={{fontSize:11,fontWeight:700,color:t.f700,background:t.sage50,borderRadius:6,padding:'2px 8px',letterSpacing:0.3}}>MEMBER</span>}
           </div>
         </div>
@@ -3979,21 +4178,137 @@ function SquadModal({onClose,authSquad,authUser,setAuthSquad,cacheSquad,clearSqu
         <div style={{height:1,background:t.div,margin:'12px 20px'}}/>
       </>}
 
-      {/* Leave squad */}
+      {/* Home Area — admin only */}
+      {isAdmin&&<>
+        <div style={{padding:'0 20px 12px'}}>
+          <div style={{fontSize:13,fontWeight:700,color:t.mid,letterSpacing:0.5,textTransform:'uppercase',marginBottom:10}}>Home Area</div>
+          {authSquad?.boundsSwLat!=null
+            ?<div style={{fontSize:13,color:t.mid,marginBottom:10}}>
+                Bounds set — map and weather use your squad's home area.
+              </div>
+            :<div style={{fontSize:13,color:t.mid,marginBottom:10}}>
+                No home area set yet. Set one so your squad's map and weather are centred on your monitoring zone.
+              </div>
+          }
+          <button onClick={()=>setShowAreaEditor(true)}
+            style={{width:'100%',padding:'12px 0',borderRadius:12,border:`1.5px solid ${t.f700}`,background:'none',color:t.f700,fontSize:14,fontWeight:700,cursor:'pointer'}}>
+            {authSquad?.boundsSwLat!=null?'Edit Home Area':'Set Home Area'}
+          </button>
+        </div>
+        <div style={{height:1,background:t.div,margin:'0 20px 12px'}}/>
+      </>}
+
+      {/* Emergency Contacts row — admin only */}
+      {isAdmin&&<>
+        <div style={{padding:'0 20px 12px'}}>
+          <div style={{fontSize:13,fontWeight:700,color:t.mid,letterSpacing:0.5,textTransform:'uppercase',marginBottom:10}}>Emergency Contacts</div>
+          {(authSquad?.emergencyContacts||[]).length===0
+            ?<div style={{fontSize:13,color:t.mid,marginBottom:10}}>No squad contacts added yet. Members will see a prompt to ask you to add some.</div>
+            :<div style={{fontSize:13,color:t.mid,marginBottom:10}}>{(authSquad?.emergencyContacts||[]).length} contact{(authSquad?.emergencyContacts||[]).length!==1?'s':''} set · Emergency Services and Poisons Info are always shown.</div>
+          }
+          <button onClick={()=>{setContacts(authSquad?.emergencyContacts||[]);setPage('contacts');}}
+            style={{width:'100%',padding:'12px 0',borderRadius:12,border:`1.5px solid ${t.f700}`,background:'none',color:t.f700,fontSize:14,fontWeight:700,cursor:'pointer'}}>
+            {(authSquad?.emergencyContacts||[]).length===0?'Add Emergency Contacts':'Edit Emergency Contacts'}
+          </button>
+        </div>
+        <div style={{height:1,background:t.div,margin:'0 20px 12px'}}/>
+      </>}
+
+      {/* Leave / change squad info */}
       <div style={{padding:'8px 20px 20px'}}>
-        <button onClick={handleLeave} disabled={leaving}
-          style={{width:'100%',padding:'13px 0',borderRadius:12,border:'none',background:t.rose50,color:t.rose700,fontSize:14,fontWeight:700,cursor:leaving?'not-allowed':'pointer',opacity:leaving?0.6:1}}>
-          {leaving?'Leaving…':'Leave Squad'}
-        </button>
-        {isAdmin&&<div style={{fontSize:12,color:t.mid,marginTop:8,textAlign:'center'}}>As admin, you should transfer admin rights before leaving.</div>}
+        <div style={{fontSize:13,color:t.mid,textAlign:'center',lineHeight:1.5}}>To leave or change squads, contact your squad admin.</div>
       </div>
       <div style={{height:'calc(var(--sab) + 8px)'}}/>
     </div>
-  </div>;
+  </div>
+
+  {/* Emergency Contacts editor overlay */}
+  {page==='contacts'&&<div style={{position:'fixed',inset:0,zIndex:1800,background:'rgba(15,25,18,0.5)'}}>
+    <div style={{position:'absolute',left:'50%',transform:'translateX(-50%)',top:0,width:'100%',maxWidth:480,height:'100%',background:t.bg,overflowY:'auto'}}>
+    <div style={{padding:'24px 20px 0',flexShrink:0}}>
+      <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
+        <button onClick={()=>setPage('main')} style={{background:'none',border:'none',color:t.mid,cursor:'pointer',padding:4,display:'flex',alignItems:'center',justifyContent:'center'}}>
+          {Ico.back(t.mid,20)}
+        </button>
+        <div style={{fontSize:18,fontWeight:800,color:t.ink}}>Emergency Contacts</div>
+      </div>
+      <div style={{fontSize:13,color:t.mid,marginBottom:16,lineHeight:1.5}}>These appear in the FAQ for all squad members. Emergency Services (000) and Poisons Info (13 11 26) are always included automatically.</div>
+
+      {/* Existing contacts */}
+      {contacts.map((c,i)=><div key={i} style={{background:t.soft,borderRadius:12,padding:'12px 14px',marginBottom:10,display:'flex',alignItems:'flex-start',gap:10}}>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontSize:14,fontWeight:700,color:t.ink}}>{c.name}</div>
+          <div style={{fontSize:13,fontWeight:600,color:t.f700,fontFamily:'monospace',marginTop:2}}>{c.phone}</div>
+          {c.desc&&<div style={{fontSize:12,color:t.mid,marginTop:2}}>{c.desc}</div>}
+        </div>
+        <button onClick={()=>setContacts(prev=>prev.filter((_,j)=>j!==i))}
+          style={{background:'none',border:'none',color:t.rose700,cursor:'pointer',padding:'2px 4px',fontSize:12,fontWeight:700,flexShrink:0}}>
+          Remove
+        </button>
+      </div>)}
+
+      {/* Add contact form */}
+      <div style={{background:t.surface,borderRadius:14,padding:'14px',border:`1.5px solid ${t.div}`,marginBottom:14}}>
+        <div style={{fontSize:12,fontWeight:700,color:t.mid,letterSpacing:0.5,textTransform:'uppercase',marginBottom:10}}>Add contact</div>
+        <input value={addName} onChange={e=>setAddName(e.target.value)} placeholder="Name  e.g. Glenorie Vets"
+          style={{width:'100%',padding:'10px 12px',borderRadius:10,border:`1.5px solid ${t.div}`,background:t.soft,color:t.ink,fontSize:14,marginBottom:8,boxSizing:'border-box'}}/>
+        <input value={addPhone} onChange={e=>setAddPhone(e.target.value)} placeholder="Phone  e.g. (02) 9652 1212" type="tel"
+          style={{width:'100%',padding:'10px 12px',borderRadius:10,border:`1.5px solid ${t.div}`,background:t.soft,color:t.ink,fontSize:14,marginBottom:8,boxSizing:'border-box'}}/>
+        <input value={addDesc} onChange={e=>setAddDesc(e.target.value)} placeholder="Description (optional)"
+          style={{width:'100%',padding:'10px 12px',borderRadius:10,border:`1.5px solid ${t.div}`,background:t.soft,color:t.ink,fontSize:14,marginBottom:10,boxSizing:'border-box'}}/>
+        <button onClick={handleAddContact} disabled={!addName.trim()||!addPhone.trim()}
+          style={{width:'100%',padding:'10px 0',borderRadius:10,border:'none',background:(!addName.trim()||!addPhone.trim())?t.soft:t.f700,color:(!addName.trim()||!addPhone.trim())?t.mid:'#fff',fontSize:14,fontWeight:700,cursor:(!addName.trim()||!addPhone.trim())?'not-allowed':'pointer'}}>
+          + Add
+        </button>
+      </div>
+
+      {/* Fixed contacts preview */}
+      <div style={{fontSize:12,color:t.mid,marginBottom:8,fontWeight:600}}>Always included</div>
+      {FIXED_EMERGENCY_CONTACTS.map((c,i)=><div key={i} style={{background:c.urgent?t.rose50:t.soft,borderRadius:10,padding:'10px 12px',marginBottom:8,opacity:0.7}}>
+        <div style={{fontSize:13,fontWeight:700,color:c.urgent?t.rose700:t.ink}}>{c.name} · <span style={{fontFamily:'monospace'}}>{c.phone}</span></div>
+        <div style={{fontSize:12,color:t.mid}}>{c.desc}</div>
+      </div>)}
+
+      <button onClick={handleSaveContacts} disabled={savingContacts}
+        style={{width:'100%',padding:'14px 0',borderRadius:12,border:'none',background:t.f700,color:'#fff',fontSize:15,fontWeight:700,cursor:savingContacts?'not-allowed':'pointer',opacity:savingContacts?0.6:1,marginTop:4,marginBottom:'calc(var(--sab) + 24px)'}}>
+        {savingContacts?'Saving…':'Save Contacts'}
+      </button>
+    </div>
+    </div>
+  </div>}
+
+  {/* Full-screen Home Area editor overlay */}
+  {showAreaEditor&&<div style={{position:'fixed',inset:0,zIndex:1800,background:'rgba(15,25,18,0.5)'}}>
+    <div style={{position:'absolute',left:'50%',transform:'translateX(-50%)',top:0,width:'100%',maxWidth:480,height:'100%',background:t.bg,display:'flex',flexDirection:'column',padding:'24px 20px',boxSizing:'border-box'}}>
+    <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
+      <button onClick={()=>setShowAreaEditor(false)}
+        style={{background:'none',border:'none',color:t.mid,cursor:'pointer',padding:4,display:'flex',alignItems:'center',justifyContent:'center'}}>
+        {Ico.back(t.mid,20)}
+      </button>
+      <div style={{fontSize:18,fontWeight:800,color:t.ink}}>Home Area</div>
+    </div>
+    <div style={{flex:1,display:'flex',flexDirection:'column'}}>
+      <SquadAreaEditor
+        initialBounds={authSquad?.boundsSwLat!=null?{swLat:authSquad.boundsSwLat,swLng:authSquad.boundsSwLng,neLat:authSquad.boundsNeLat,neLng:authSquad.boundsNeLng}:null}
+        onSave={async(b)=>{
+          await supa.rpc('update_squad_bounds',{p_squad_id:authSquad.id,p_sw_lat:b.swLat,p_sw_lng:b.swLng,p_ne_lat:b.neLat,p_ne_lng:b.neLng});
+          const updated={...authSquad,boundsSwLat:b.swLat,boundsSwLng:b.swLng,boundsNeLat:b.neLat,boundsNeLng:b.neLng};
+          setAuthSquad(updated);cacheSquad(updated);
+          setShowAreaEditor(false);
+        }}
+        onCancel={()=>setShowAreaEditor(false)}
+        saveLabel="Save Home Area"
+        cancelLabel="Cancel"
+      />
+    </div>
+    </div>
+  </div>}
+  </>;
 }
 
 function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,onToggleSignIn,data,onExport,onCSVImport,authUser,authProfile,authSquad,onOpenSquad}){
   const t=useTheme();
+  const [page,setPage]=useState('main'); // 'main' | 'data'
   const userName=(typeof localStorage!=='undefined'&&localStorage.getItem(SK.userName))||(authProfile?.display_name)||'Volunteer';
   const userEmail=authUser?.email||null;
   const isAdmin=authProfile?.role==='admin';
@@ -4009,29 +4324,6 @@ function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,
       {right!==undefined?right:chevR}
     </button>
   );
-
-  const handleExport=()=>{
-    const payload={
-      _version:1,
-      _exportedAt:new Date().toISOString(),
-      _appVersion:'WombatWatch',
-      wombats:data.wombats,
-      burrows:data.burrows,
-      treatments:data.treatments,
-      sightings:data.sightings,
-      burrowLogs:data.burrowLogs,
-      wombatPhotos:data.wombatPhotos,
-      burrowPhotos:data.burrowPhotos,
-    };
-    const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
-    const url=URL.createObjectURL(blob);
-    const a=document.createElement('a');
-    a.href=url;
-    a.download=`wombatwatch-backup-${new Date().toISOString().slice(0,10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    onClose();
-  };
 
   const handleImportFile=e=>{
     const file=e.target.files?.[0];
@@ -4061,38 +4353,56 @@ function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,
   const wCount=data.wombats.length;
   const bCount=data.burrows.length;
 
+  const dataIcon=<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke={t.f700} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>;
+
   return <div style={{position:'fixed',inset:0,zIndex:1500,background:'rgba(15,25,18,0.45)'}}>
     <button onClick={onClose} style={{position:'absolute',inset:0,width:'100%',background:'none'}}/>
     <div style={{position:'absolute',left:'50%',transform:'translateX(-50%)',bottom:0,width:'100%',maxWidth:480,background:t.surface,borderTopLeftRadius:32,borderTopRightRadius:32,boxShadow:'0 -10px 40px rgba(0,0,0,0.2)'}}>
       <div style={{width:40,height:4,borderRadius:2,background:t.faint,margin:'14px auto 0',opacity:0.5}}/>
-      {/* User info */}
-      <div style={{display:'flex',alignItems:'center',gap:14,padding:'20px 20px 16px'}}>
-        <div style={{width:52,height:52,borderRadius:16,background:t.f700,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>{Ico.user('#fff',22)}</div>
-        <div style={{flex:1,minWidth:0}}>
-          <div style={{display:'flex',alignItems:'center',gap:8}}>
-            <div style={{fontSize:17,fontWeight:700,color:t.ink,lineHeight:1.2}}>{userName}</div>
-            {isAdmin&&<span style={{fontSize:10,fontWeight:700,color:t.amb700,background:t.amb50,borderRadius:6,padding:'2px 7px',letterSpacing:0.3}}>ADMIN</span>}
+
+      {page==='main'&&<>
+        {/* User info */}
+        <div style={{display:'flex',alignItems:'center',gap:14,padding:'20px 20px 16px'}}>
+          <div style={{width:52,height:52,borderRadius:16,background:t.f700,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>{Ico.user('#fff',22)}</div>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{display:'flex',alignItems:'center',gap:8}}>
+              <div style={{fontSize:17,fontWeight:700,color:t.ink,lineHeight:1.2}}>{userName}</div>
+              {isAdmin&&<span style={{fontSize:10,fontWeight:700,color:t.lav500,background:t.lav100,borderRadius:6,padding:'2px 7px',letterSpacing:0.3}}>ADMIN</span>}
+            </div>
+            {signedIn&&userEmail
+              ?<div style={{fontSize:12,color:t.mid,marginTop:3,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{userEmail}</div>
+              :<div style={{fontSize:13,color:t.mid,marginTop:3}}>Not signed in · tap to sync data</div>
+            }
           </div>
-          {signedIn&&userEmail
-            ?<div style={{fontSize:12,color:t.mid,marginTop:3,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{userEmail}</div>
-            :<div style={{fontSize:13,color:t.mid,marginTop:3}}>Not signed in · tap to sync data</div>
-          }
         </div>
-      </div>
-      <div style={{height:1,background:t.div,margin:'0 20px 6px'}}/>
-      <Row icon={Ico.edit(t.f700,17)} label="Edit Profile" onClick={()=>{onClose();onEditProfile();}}/>
-      <Row icon={theme==='dark'?Ico.sun(t.f700,17):Ico.moon(t.f700,17)} label={theme==='dark'?'Switch to Light Mode':'Switch to Dark Mode'} right={null} onClick={()=>{onToggleTheme();onClose();}}/>
-      <Row icon={Ico.help(t.f700,17)} label="FAQ" onClick={()=>{onClose();onFAQ();}}/>
-      <div style={{height:8,background:t.soft,margin:'6px 0'}}/>
-      {/* Squad row */}
-      <Row
-        icon={<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke={t.f700} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>}
-        label={authSquad?authSquad.name:'No Squad'}
-        sub={authSquad?(authSquad.role==='admin'?'Admin · tap to manage invites':'Member · tap for invite options'):'Set up or join a monitoring squad'}
-        onClick={()=>{onClose();onOpenSquad();}}
-      />
-      <div style={{height:8,background:t.soft,margin:'6px 0'}}/>
-      {isAdmin&&<>
+        <div style={{height:1,background:t.div,margin:'0 20px 6px'}}/>
+        <Row icon={Ico.edit(t.f700,17)} label="Edit Profile" onClick={()=>{onClose();onEditProfile();}}/>
+        <Row icon={theme==='dark'?Ico.sun(t.f700,17):Ico.moon(t.f700,17)} label={theme==='dark'?'Switch to Light Mode':'Switch to Dark Mode'} right={null} onClick={()=>{onToggleTheme();onClose();}}/>
+        <Row icon={Ico.help(t.f700,17)} label="FAQ" onClick={()=>{onClose();onFAQ();}}/>
+        <div style={{height:8,background:t.soft,margin:'6px 0'}}/>
+        <Row
+          icon={<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke={t.f700} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>}
+          label={authSquad?authSquad.name:'No Squad'}
+          sub={authSquad?(authSquad.role==='admin'?'Admin · tap to manage invites':'Member · tap for invite options'):'Set up or join a monitoring squad'}
+          onClick={()=>{onClose();onOpenSquad();}}
+        />
+        {isAdmin&&<>
+          <div style={{height:8,background:t.soft,margin:'6px 0'}}/>
+          <Row icon={dataIcon} label="Data Management" sub="Export, import &amp; backup" onClick={()=>setPage('data')}/>
+        </>}
+        <div style={{height:8,background:t.soft,margin:'6px 0'}}/>
+        <Row icon={signedIn?Ico.logOut(t.rose700,17):Ico.logIn(t.f700,17)} label={signedIn?'Sign Out':'Sign In'} danger={signedIn} right={null} onClick={()=>{onToggleSignIn();if(signedIn)onClose();}}/>
+        <div style={{height:'calc(var(--sab) + 12px)'}}/>
+      </>}
+
+      {page==='data'&&<>
+        <div style={{display:'flex',alignItems:'center',gap:8,padding:'16px 20px 8px'}}>
+          <button onClick={()=>setPage('main')} style={{background:'none',border:'none',color:t.mid,cursor:'pointer',padding:4,display:'flex',alignItems:'center',justifyContent:'center'}}>
+            {Ico.back(t.mid,20)}
+          </button>
+          <div style={{fontSize:17,fontWeight:700,color:t.ink}}>Data Management</div>
+        </div>
+        <div style={{height:1,background:t.div,margin:'4px 20px 8px'}}/>
         <Row
           icon={Ico.download(t.sky700,17)} iconBg={t.sky50}
           label="Export Data"
@@ -4113,17 +4423,15 @@ function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,
           onClick={()=>{onClose();onCSVImport();}}
         />
         <input ref={importRef} type="file" accept=".json,application/json" style={{display:'none'}} onChange={handleImportFile}/>
+        <div style={{height:'calc(var(--sab) + 16px)'}}/>
       </>}
-      <div style={{height:8,background:t.soft,margin:'6px 0'}}/>
-      <Row icon={signedIn?Ico.logOut(t.rose700,17):Ico.logIn(t.f700,17)} label={signedIn?'Sign Out':'Sign In'} danger={signedIn} right={null} onClick={()=>{onToggleSignIn();if(signedIn)onClose();}}/>
-      <div style={{height:'calc(var(--sab) + 12px)'}}/>
     </div>
   </div>;
 }
 
 /* ── EXPORT SHEET ── */
 /* ── EXPORT SHEET ── */
-function ExportSheet({data,onClose}){
+function ExportSheet({data,onClose,onBack}){
   const t=useTheme();
   const ds=new Date().toISOString().slice(0,10);
   const wCount=data.wombats.length;
@@ -4134,6 +4442,31 @@ function ExportSheet({data,onClose}){
     const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
     const url=URL.createObjectURL(blob);const a=document.createElement('a');
     a.href=url;a.download=`wombatwatch-backup-${ds}.json`;a.click();URL.revokeObjectURL(url);
+    onClose();
+  };
+
+  const exportFullCSV=async()=>{
+    const zip=new JSZip();
+    // Wombats
+    const wHeaders=['WombatID','Code','Name','Status','Sex','AgeClass','Latitude','Longitude','Location','FirstSeen','Notes'];
+    const wRows=data.wombats.map(w=>[w.id,w.code||'',w.name||'',statusLabel(w.status),w.sex==='M'?'Male':w.sex==='F'?'Female':'Unknown',w.ageClass||'',w.lat??'',w.lng??'',w.location||'',w.firstSeen||'',w.notes||'']);
+    zip.file('wombats.csv','﻿'+toCSV(wHeaders,wRows));
+    // Treatments
+    const tHeaders=['TreatmentID','WombatID','WombatName','Date','Product','Dose','Method','Severity','RecordedBy','Note','Latitude','Longitude'];
+    const tRows=data.treatments.map(tr=>{const w=data.wombats.find(x=>x.id===tr.wombatId)||{};return[tr.id,tr.wombatId,w.name||'',tr.at?.slice(0,10)||'',tr.product||'',tr.dose||'',tr.method||'',tr.severity??'',tr.by||'',tr.note||'',tr.location?.lat??'',tr.location?.lng??''];});
+    zip.file('treatments.csv','﻿'+toCSV(tHeaders,tRows));
+    // Burrows
+    const bHeaders=['BurrowID','Code','Name','Status','Latitude','Longitude','Location','EntranceHeightCm','EntranceWidthCm','EntranceOrientation','Substrate','Vegetation','Notes'];
+    const bRows=data.burrows.map(b=>[b.id,b.code||'',b.name||'',b.status||'',b.lat??'',b.lng??'',b.location||'',b.entranceHeight||'',b.entranceWidth||'',b.orientation||'',b.substrate||'',b.vegetation||'',b.notes||'']);
+    zip.file('burrows.csv','﻿'+toCSV(bHeaders,bRows));
+    // Burrow logs
+    const lHeaders=['LogID','BurrowID','BurrowName','Date','Occupation','CheckedBy','Note'];
+    const lRows=(data.burrowLogs||[]).map(l=>{const b=data.burrows.find(x=>x.id===l.burrowId)||{};return[l.id,l.burrowId,b.name||'',l.at?.slice(0,10)||'',l.occupation||'',l.by||'',l.note||''];});
+    zip.file('burrow_logs.csv','﻿'+toCSV(lHeaders,lRows));
+
+    const blob=await zip.generateAsync({type:'blob'});
+    const url=URL.createObjectURL(blob);const a=document.createElement('a');
+    a.href=url;a.download=`wombatwatch-csv-${ds}.zip`;a.click();URL.revokeObjectURL(url);
     onClose();
   };
 
@@ -4216,10 +4549,16 @@ function ExportSheet({data,onClose}){
   return <div style={{position:'fixed',inset:0,zIndex:1500,background:'rgba(15,25,18,0.45)'}}>
     <button onClick={onClose} style={{position:'absolute',inset:0,width:'100%',background:'none'}}/>
     <div style={{position:'absolute',left:'50%',transform:'translateX(-50%)',bottom:0,width:'100%',maxWidth:480,background:t.surface,borderTopLeftRadius:32,borderTopRightRadius:32,boxShadow:'0 -10px 40px rgba(0,0,0,0.2)',maxHeight:'85svh',overflowY:'auto'}}>
-      <div style={{width:40,height:4,borderRadius:2,background:t.faint,margin:'14px auto 6px',opacity:0.5}}/>
-      <div style={{fontSize:18,fontWeight:700,color:t.ink,textAlign:'center',padding:'4px 20px 0'}}>Export Data</div>
+      <div style={{width:40,height:4,borderRadius:2,background:t.faint,margin:'14px auto 0',opacity:0.5}}/>
+      <div style={{display:'flex',alignItems:'center',gap:10,padding:'10px 16px 4px 12px'}}>
+        <button onClick={onBack||onClose} style={{background:'none',border:'none',color:t.mid,cursor:'pointer',padding:4,display:'flex',alignItems:'center',justifyContent:'center'}}>
+          {Ico.back(t.mid,20)}
+        </button>
+        <div style={{fontSize:18,fontWeight:700,color:t.ink}}>Export Data</div>
+      </div>
       <Sec label="Full Backup"/>
       <Btn icon={Ico.download(t.sky700,17)} iconBg={t.sky50} label="WombatWatch Backup" sub={`All data · ${wCount} wombat${wCount!==1?'s':''}, ${bCount} burrow${bCount!==1?'s':''} · JSON`} onClick={exportJSON}/>
+      <Btn icon={<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke={t.sky700} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>} iconBg={t.sky50} label="Full CSV Export" sub={`All records · wombats, treatments, sightings, burrows · ZIP`} onClick={exportFullCSV}/>
       <div style={{height:1,background:t.div,margin:'4px 20px'}}/>
       <Sec label={`Wombat Records (${wCount})`}/>
       <Btn icon={<span style={{fontSize:13,fontWeight:800,color:'#E06B2B'}}>ALA</span>} iconBg={t.amb50} label="ALA / Darwin Core" sub="Occurrence records · CSV" onClick={exportALA}/>
@@ -4401,20 +4740,66 @@ function EditProfileModal({onClose}){
     localStorage.setItem(SK.userName,name.trim());
     onClose();
   }}>
-    <FormField label="Your name" required><FInput value={name} onChange={setName} placeholder="e.g. Sarah M."/></FormField>
+    <FormField label="Your name" required><FInput value={name} onChange={setName} placeholder="e.g. Sarah M." maxLength={24}/></FormField>
     <div style={{fontSize:13,color:t.mid,lineHeight:1.5}}>Your name is used to auto-fill "Applied by" and "Observed by" fields when logging treatments and burrow checks.</div>
   </ModalWrap>;
 }
 
+// ── DISPLAY NAME PROMPT ──────────────────────────────────────────
+// Shown once after squad setup if the user has no display name set.
+// Saves to localStorage + Supabase profiles table.
+function DisplayNamePrompt({authUser,authProfile,setAuthProfile,onDone}){
+  const t=useTheme();
+  const [name,setName]=useState('');
+  const [busy,setBusy]=useState(false);
+
+  const handleSave=async()=>{
+    const trimmed=name.trim();
+    if(!trimmed)return;
+    setBusy(true);
+    localStorage.setItem(SK.userName,trimmed);
+    // Persist to Supabase profiles so it's available across devices
+    try{await supa.from('profiles').update({display_name:trimmed}).eq('id',authUser.id);}catch{}
+    setAuthProfile(prev=>({...(prev||{}),display_name:trimmed}));
+    setBusy(false);
+    onDone();
+  };
+
+  return <div style={{minHeight:'100vh',background:t.bg,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'40px 28px',boxSizing:'border-box'}}>
+    <div style={{width:'100%',maxWidth:380}}>
+      <div style={{fontSize:28,fontWeight:800,color:t.ink,marginBottom:8,lineHeight:1.2}}>What's your name?</div>
+      <div style={{fontSize:15,color:t.mid,marginBottom:32,lineHeight:1.6}}>
+        It'll be auto-filled when you log treatments and burrow checks.
+      </div>
+      <input
+        value={name}
+        onChange={e=>setName(e.target.value)}
+        onKeyDown={e=>{if(e.key==='Enter'&&name.trim())handleSave();}}
+        maxLength={24}
+        placeholder="e.g. Sarah M."
+        autoFocus
+        style={{width:'100%',padding:'15px 16px',borderRadius:14,border:`1.5px solid ${t.div}`,background:t.surface,color:t.ink,fontSize:17,boxSizing:'border-box',outline:'none',marginBottom:6}}
+      />
+      <div style={{fontSize:12,color:t.faint,textAlign:'right',marginBottom:24}}>{name.length}/24</div>
+      <button
+        onClick={handleSave}
+        disabled={!name.trim()||busy}
+        style={{width:'100%',padding:'15px 0',borderRadius:14,border:'none',background:t.f700,color:'#fff',fontSize:16,fontWeight:700,cursor:(!name.trim()||busy)?'not-allowed':'pointer',opacity:(!name.trim()||busy)?0.5:1,transition:'opacity 0.15s'}}>
+        {busy?'Saving…':'Save'}
+      </button>
+      <div style={{fontSize:13,color:t.mid,textAlign:'center',marginTop:16}}>You can change this later in your profile.</div>
+    </div>
+  </div>;
+}
+
 /* ── FAQ SHEET ── */
+// Contacts always shown regardless of squad settings
+const FIXED_EMERGENCY_CONTACTS=[
+  {name:'Emergency Services',phone:'000',desc:'Police, fire & ambulance',urgent:true},
+  {name:'Poisons Information',phone:'13 11 26',desc:'24/7 poisoning advice — human or animal'},
+];
 const FAQ_ITEMS=[
-  {q:'Emergency Contacts',type:'contacts',contacts:[
-    {name:'Glenorie Vets',phone:'(02) 9652 1212',desc:'Local veterinary support for wildlife'},
-    {name:'Program Coordinator',phone:'0450 078 677',desc:'WombatWatch program coordinator'},
-    {name:'WIRES Wildlife Rescue',phone:'1300 094 737',desc:'24/7 wildlife rescue & emergency'},
-    {name:'Emergency Services',phone:'000',desc:'Police, fire & ambulance',urgent:true},
-    {name:'Poisons Information',phone:'13 11 26',desc:'24/7 poisoning advice — human or animal'},
-  ]},
+  {q:'Emergency Contacts',type:'contacts'},
   {q:'How do I add a new wombat?',a:'Tap the + button at the bottom of the screen and select "New wombat". Give them a name, sex, age class and initial status.'},
   {q:'How do I log a treatment?',a:'Open a wombat\'s profile and tap "Add Treatment" under the Treatments tab. Product, dose and applied-by are required.'},
   {q:'What do severity ratings mean?',a:'1 = very mild mange, 5 = severe. Rate based on the proportion of skin affected and thickness of crusting. When in doubt, rate conservatively.'},
@@ -4422,14 +4807,19 @@ const FAQ_ITEMS=[
   {q:'Does WombatWatch work offline?',a:'Yes — all data is stored locally on your device. Records sync when you\'re back online.'},
 ];
 /* ── FAQ SHEET ── */
-function FAQSheet({onClose}){
+function FAQSheet({onClose,onBack,squadContacts=[]}){
   const t=useTheme();
   const [open,setOpen]=useState(null);
   return <div style={{position:'fixed',inset:0,zIndex:1500,background:'rgba(15,25,18,0.45)'}}>
     <button onClick={onClose} style={{position:'absolute',inset:0,width:'100%',background:'none'}}/>
     <div style={{position:'absolute',left:'50%',transform:'translateX(-50%)',bottom:0,width:'100%',maxWidth:480,background:t.surface,borderTopLeftRadius:32,borderTopRightRadius:32,boxShadow:'0 -10px 40px rgba(0,0,0,0.2)',maxHeight:'80svh',display:'flex',flexDirection:'column'}}>
-      <div style={{width:40,height:4,borderRadius:2,background:t.faint,margin:'14px auto 8px',opacity:0.5,flexShrink:0}}/>
-      <div style={{fontSize:20,fontWeight:700,color:t.ink,padding:'8px 20px 12px',flexShrink:0}}>FAQ</div>
+      <div style={{width:40,height:4,borderRadius:2,background:t.faint,margin:'14px auto 0',opacity:0.5,flexShrink:0}}/>
+      <div style={{display:'flex',alignItems:'center',padding:'10px 16px 10px 12px',flexShrink:0}}>
+        <button onClick={onBack||onClose} style={{background:'none',border:'none',color:t.mid,cursor:'pointer',padding:4,display:'flex',alignItems:'center',justifyContent:'center'}}>
+          {Ico.back(t.mid,20)}
+        </button>
+        <div style={{fontSize:20,fontWeight:700,color:t.ink,marginLeft:8}}>FAQ</div>
+      </div>
       <div style={{overflowY:'auto',flex:1,paddingBottom:'calc(var(--sab) + 20px)'}}>
         {FAQ_ITEMS.map((item,i)=><div key={i} style={{borderTop:`1px solid ${t.div}`}}>
           <button onClick={()=>setOpen(open===i?null:i)} style={{display:'flex',alignItems:'center',justifyContent:'space-between',width:'100%',padding:'14px 20px',background:'none',border:'none',textAlign:'left',cursor:'pointer',gap:12}}>
@@ -4441,7 +4831,8 @@ function FAQSheet({onClose}){
           </button>
           {open===i&&(item.type==='contacts'
             ? <div style={{padding:'0 16px 16px',display:'flex',flexDirection:'column',gap:8}}>
-                {item.contacts.map((c,j)=><a key={j} href={`tel:${c.phone.replace(/\s|\(|\)/g,'')}`} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,background:c.urgent?t.rose50:t.soft,borderRadius:14,padding:'12px 14px',textDecoration:'none',border:c.urgent?`1px solid ${t.rose700}22`:`1px solid ${t.div}`}}>
+                {squadContacts.length===0&&<div style={{fontSize:12,color:t.mid,padding:'4px 2px 4px',fontStyle:'italic'}}>No squad contacts set yet — your admin can add them in Squad Settings.</div>}
+                {[...squadContacts,...FIXED_EMERGENCY_CONTACTS].map((c,j)=><a key={j} href={`tel:${c.phone.replace(/\s|\(|\)/g,'')}`} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,background:c.urgent?t.rose50:t.soft,borderRadius:14,padding:'12px 14px',textDecoration:'none',border:c.urgent?`1px solid ${t.rose700}22`:`1px solid ${t.div}`}}>
                   <div style={{flex:1,minWidth:0}}>
                     <div style={{fontSize:13.5,fontWeight:700,color:c.urgent?t.rose700:t.ink,lineHeight:1.2}}>{c.name}</div>
                     <div style={{fontSize:12,color:t.mid,marginTop:2}}>{c.desc}</div>
@@ -5007,7 +5398,7 @@ function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',o
         <div style={{padding:'0 14px',fontSize:14,fontWeight:700,color:'var(--mid)',borderLeft:'1px solid var(--div)',height:44,display:'flex',alignItems:'center',flexShrink:0,userSelect:'none'}}>ml</div>
       </div>
     </FormField>
-    <FormField label="Applied by" required><FInput value={form.by} onChange={v=>set('by',v)} placeholder="Volunteer name"/></FormField>
+    <FormField label="Applied by" required><FInput value={form.by} onChange={v=>set('by',v)} placeholder="Volunteer name" maxLength={24}/></FormField>
     <FormField label="Notes"><FTextarea value={form.note} onChange={v=>set('note',v)} placeholder="Observations, any changes noticed…" rows={2}/></FormField>
     {/* Status toggle — flips meaning based on current wombat health */}
     {(()=>{
@@ -5207,7 +5598,7 @@ function LogStatusModal({burrowId,burrowName,onClose,onSave,wombats=[]}){
     <FormField label="Status" required>
       <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'active',label:'Active'},{value:'inactive',label:'Inactive'},{value:'damaged',label:'Damaged'}]}/>
     </FormField>
-    <FormField label="Observed by"><FInput value={form.by} onChange={v=>set('by',v)} placeholder="Volunteer name"/></FormField>
+    <FormField label="Observed by"><FInput value={form.by} onChange={v=>set('by',v)} placeholder="Volunteer name" maxLength={24}/></FormField>
     <FormField label="Entrance Orientation">
       <CompassField value={form.orientation} onChange={v=>set('orientation',v)}/>
     </FormField>
@@ -5602,6 +5993,11 @@ function reducer(state,action){
     // ── Wombats ──────────────────────────────────────────────────
     case 'ADD_WOMBAT':{const wombats=[...state.wombats,{...action.wombat,_sync:false}];save('w',wombats);return{...state,wombats};}
     case 'UPDATE_WOMBAT':{const wombats=state.wombats.map(w=>w.id===action.id?{...w,...action.patch,_sync:false}:w);save('w',wombats);return{...state,wombats};}
+    // ASSIGNMENT FEATURE — UI hidden pending rollout (search "ASSIGNMENT UI HIDDEN").
+    // Reducer + sync layer fully implemented; syncAction pushes these as wombat upserts
+    // (not RPCs) so they flow through the offline queue correctly.
+    case 'ASSIGN_WOMBAT':{const wombats=state.wombats.map(w=>w.id===action.wombatId?{...w,assignees:[...(w.assignees||[]),{userId:action.userId,name:action.name}],_sync:false}:w);save('w',wombats);return{...state,wombats};}
+    case 'UNASSIGN_WOMBAT':{const wombats=state.wombats.map(w=>w.id===action.wombatId?{...w,assignees:(w.assignees||[]).filter(a=>a.userId!==action.userId),_sync:false}:w);save('w',wombats);return{...state,wombats};}
     // _sync:false ensures local version wins on next supaFullSync merge even if the
     // page is refreshed before the async Supabase push completes (edit never gets lost).
     case 'MARK_WOMBAT_INACTIVE':{
@@ -6069,7 +6465,11 @@ function SignInModal({onClose}){
   const sendReset=async e=>{
     e&&e.preventDefault();setErr('');setLoading(true);
     try{
-      const redirectTo=window.location.href.split('?')[0].split('#')[0];
+      const _base=window.location.href.split('?')[0].split('#')[0];
+      const _isWeb=window.location.protocol==='https:'||window.location.protocol==='http:';
+      const _prod='https://boornewild.github.io/wombatwatch/';
+      const redirectTo=_isWeb?(_base.endsWith('/')?_base:_base+'/'):_prod;
+      // Always use a real https URL — file:// paths are rejected by Supabase.
       const{error}=await supa.auth.resetPasswordForEmail(email,{redirectTo});
       if(error)throw error;
       setResetSent(true);
@@ -6317,6 +6717,10 @@ function App(){
   const [authSquad,setAuthSquad]=useState(()=>getCachedSquad());
   // true once we've completed at least one squad fetch (online or from cache)
   const [squadChecked,setSquadChecked]=useState(()=>!!getCachedSquad());
+  // Midpoint of squad's bounding box — used for weather widget location
+  const squadCenter=authSquad?.boundsSwLat!=null&&authSquad?.boundsNeLat!=null
+    ?{lat:(authSquad.boundsSwLat+authSquad.boundsNeLat)/2,lng:(authSquad.boundsSwLng+authSquad.boundsNeLng)/2}
+    :null;
 
   // Detect an invite token in the URL (e.g. ?join=TOKEN). This is read once on mount;
   // if the user is already signed in we join immediately, otherwise we store it and
@@ -6333,6 +6737,20 @@ function App(){
     const s=window.location.search;
     const h=window.location.hash;
     return s.includes('code=')||h.includes('type=recovery')||h.includes('type=invite');
+  });
+  // Detect an expired/invalid auth link — Supabase redirects back with #error= in the hash.
+  const [linkError]=useState(()=>{
+    try{
+      const h=window.location.hash;
+      if(!h.includes('error='))return null;
+      const params=new URLSearchParams(h.replace(/^#/,''));
+      const code=params.get('error_code')||'';
+      const desc=params.get('error_description')||'';
+      // Clean the hash so refreshing doesn't re-show the error.
+      window.history.replaceState({},'',window.location.pathname+window.location.search);
+      if(code==='otp_expired'||desc.toLowerCase().includes('expired'))return 'expired';
+      return 'invalid';
+    }catch{return null;}
   });
   const explicitSignOut=React.useRef(false);
   const signedIn=!!authUser;
@@ -6423,9 +6841,9 @@ function App(){
               // Clear the token from the URL so refreshing doesn't re-trigger
               try{const u=new URL(window.location.href);u.searchParams.delete('join');window.history.replaceState({},'',u);}catch{}
             }
-            const{data:m,error:me}=await supa.from('squad_members').select('role, squad:squads(id,name)').eq('user_id',user.id).single();
+            const{data:m,error:me}=await supa.from('squad_members').select('role, squad:squads(id,name,bounds_sw_lat,bounds_sw_lng,bounds_ne_lat,bounds_ne_lng,emergency_contacts)').eq('user_id',user.id).single();
             if(m&&!me){
-              const sq={id:m.squad.id,name:m.squad.name,role:m.role};
+              const sq={id:m.squad.id,name:m.squad.name,role:m.role,boundsSwLat:m.squad.bounds_sw_lat,boundsSwLng:m.squad.bounds_sw_lng,boundsNeLat:m.squad.bounds_ne_lat,boundsNeLng:m.squad.bounds_ne_lng,emergencyContacts:m.squad.emergency_contacts||[]};
               cacheSquad(sq);setAuthSquad(sq);
             }else if(me?.code==='PGRST116'||me?.code==='406'){
               // PGRST116 = "0 rows" — user has no squad yet
@@ -6709,10 +7127,35 @@ function App(){
   // Show nothing while we check for an existing session (avoids flash).
   // Also hold here if the URL contains a ?code= (PKCE recovery redirect) — the
   // PASSWORD_RECOVERY event is in-flight and we must not flash the sign-in screen.
-  if(!authChecked||recoveryPending)return <ThemeCtx.Provider value={t}>
+  // If the user IS signed in, also hold until the squad check resolves. Without this,
+  // the full app mounts briefly before squadChecked flips true, then React has to
+  // swap it for SquadSetupScreen — the DOM swap triggers a spurious removeChild error
+  // when browser spell-check or autocorrect has touched any node in the interim.
+  const waitingForSquad=authUser&&!squadChecked;
+  if(!authChecked||recoveryPending||waitingForSquad)return <ThemeCtx.Provider value={t}>
     <div data-theme={theme} className="app" style={{background:t.bg,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:16}}>
       <div style={{fontSize:11,letterSpacing:1.6,textTransform:'uppercase',color:t.f700,fontWeight:600}}>WombatWatch</div>
       <div style={{width:36,height:36,border:`3px solid ${t.sage50}`,borderTopColor:t.f700,borderRadius:'50%',animation:'spin 0.8s linear infinite'}}/>
+    </div>
+  </ThemeCtx.Provider>;
+  // Expired or invalid auth link — show a friendly message with option to request a new one
+  if(linkError&&!authUser)return <ThemeCtx.Provider value={t}>
+    <div data-theme={theme} className="app" style={{background:t.bg,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'0 24px'}}>
+      <div style={{background:t.surface,borderRadius:24,padding:'28px 20px',width:'100%',maxWidth:380,boxShadow:t.shadow,textAlign:'center'}}>
+        <div style={{fontSize:36,marginBottom:12}}>{linkError==='expired'?'⏱️':'🔗'}</div>
+        <div style={{fontSize:17,fontWeight:800,color:t.ink,marginBottom:8}}>
+          {linkError==='expired'?'Link has expired':'Invalid link'}
+        </div>
+        <div style={{fontSize:14,color:t.mid,lineHeight:1.6,marginBottom:20}}>
+          {linkError==='expired'
+            ?'Password reset links expire after a short time for security. You can request a new one from the sign-in screen.'
+            :'This link is no longer valid. You can request a fresh password reset from the sign-in screen.'}
+        </div>
+        <button onClick={()=>window.history.replaceState({},'',window.location.pathname)}
+          style={{width:'100%',padding:'13px 0',borderRadius:12,background:t.f700,color:'#fff',fontSize:15,fontWeight:700,border:'none',cursor:'pointer'}}>
+          Back to sign in
+        </button>
+      </div>
     </div>
   </ThemeCtx.Provider>;
   // Password reset flow — user clicked the email link; let them set a new password
@@ -6733,17 +7176,27 @@ function App(){
     </ThemeCtx.Provider>;
   }
 
+  // Gate: prompt for display name if none is set yet (checked after squad resolves)
+  const needsDisplayName=authUser&&squadChecked&&authSquad&&!authProfile?.display_name?.trim()&&!localStorage.getItem(SK.userName)?.trim();
+  if(needsDisplayName){
+    return <ThemeCtx.Provider value={t}>
+      <div data-theme={theme} className="app" style={{background:t.bg}}>
+        <DisplayNamePrompt authUser={authUser} authProfile={authProfile} setAuthProfile={setAuthProfile} onDone={()=>{/* state update in component triggers re-render, gate clears */}}/>
+      </div>
+    </ThemeCtx.Provider>;
+  }
+
   return <ThemeCtx.Provider value={t}>
     <div data-theme={theme} className="app">
       {/* Supabase sync progress bar */}
       {syncing&&<div style={{position:'fixed',top:0,left:'max(0px,calc(50vw - 240px))',right:'max(0px,calc(50vw - 240px))',height:3,zIndex:9999,background:t.f700,transformOrigin:'left',animation:'syncBar 1.4s ease-in-out infinite'}}/>}
       {/* ── content area: grows to fill space above the tab bar ── */}
       <div className="content-area">
-        {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} queueLen={queueLen} openProfile={openProfile} streak={streak} volunteerCount={volunteerCount}/></div>}
+        {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} queueLen={queueLen} openProfile={openProfile} streak={streak} volunteerCount={volunteerCount} squadLat={squadCenter?.lat} squadLng={squadCenter?.lng}/></div>}
         {screen==='activity'&&<div className="scroll noscroll"><ActivityScreen data={data} nav={nav}/></div>}
-        {screen==='map'&&<MapScreen data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} theme={theme} onAddAt={onAddAt} wombatFilters={mapWombatFilters} setWombatFilters={setMapWombatFilters} burrowFilters={mapBurrowFilters} setBurrowFilters={setMapBurrowFilters} cameraFilter={mapCameraFilter} setCameraFilter={setMapCameraFilter}/>}
+        {screen==='map'&&<MapScreen data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} theme={theme} onAddAt={onAddAt} wombatFilters={mapWombatFilters} setWombatFilters={setMapWombatFilters} burrowFilters={mapBurrowFilters} setBurrowFilters={setMapBurrowFilters} cameraFilter={mapCameraFilter} setCameraFilter={setMapCameraFilter} authSquad={authSquad}/>}
         {screen==='wombats'&&<div className="scroll noscroll"><WombatList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile} filterStatus={wombatFilterStatus} setFilterStatus={setWombatFilterStatus} sortBy={wombatSortBy} setSortBy={setWombatSortBy}/></div>}
-        {screen==='wombat-profile'&&<div className="scroll noscroll"><WombatProfile wombatId={selectedId} data={data} nav={nav} dispatch={syncDispatch} openProfile={openProfile} authProfile={authProfile}/></div>}
+        {screen==='wombat-profile'&&<div className="scroll noscroll"><WombatProfile wombatId={selectedId} data={data} nav={nav} dispatch={syncDispatch} openProfile={openProfile} authProfile={authProfile} authUser={authUser}/></div>}
         {screen==='burrows'&&<div className="scroll noscroll"><BurrowList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile} filterStatus={burrowFilterStatus} setFilterStatus={setBurrowFilterStatus} sortBy={burrowSortBy} setSortBy={setBurrowSortBy}/></div>}
         {screen==='burrow-profile'&&<div className="scroll noscroll"><BurrowProfile burrowId={selectedId} data={data} nav={nav} dispatch={syncDispatch} openProfile={openProfile} authProfile={authProfile}/></div>}
       </div>
@@ -6752,10 +7205,10 @@ function App(){
       <TabBar active={screen} onNav={nav} onFAB={onFAB}/>
 
       {modal==='profile'&&<ProfileSheet onClose={()=>setModal(null)} onToggleTheme={toggleTheme} theme={theme} onEditProfile={()=>setModal('edit-profile')} onFAQ={()=>setModal('faq')} signedIn={signedIn} onToggleSignIn={toggleSignIn} data={data} onExport={()=>setModal('export')} onCSVImport={()=>setModal('csv-import')} authUser={authUser} authProfile={authProfile} authSquad={authSquad} onOpenSquad={()=>setModal('squad')}/>}
-      {modal==='squad'&&authUser&&<SquadModal onClose={()=>setModal(null)} authSquad={authSquad} authUser={authUser} setAuthSquad={setAuthSquad} cacheSquad={cacheSquad} clearSquadCache={clearSquadCache}/>}
+      {modal==='squad'&&authUser&&<SquadModal onClose={()=>setModal(null)} onBack={()=>setModal('profile')} authSquad={authSquad} authUser={authUser} setAuthSquad={setAuthSquad} cacheSquad={cacheSquad} clearSquadCache={clearSquadCache}/>}
       {modal==='edit-profile'&&<EditProfileModal onClose={()=>setModal(null)}/>}
-      {modal==='faq'&&<FAQSheet onClose={()=>setModal(null)}/>}
-      {modal==='export'&&authProfile?.role==='admin'&&<ExportSheet data={data} onClose={()=>setModal(null)}/>}
+      {modal==='faq'&&<FAQSheet onClose={()=>setModal(null)} onBack={()=>setModal('profile')} squadContacts={authSquad?.emergencyContacts||[]}/>}
+      {modal==='export'&&authProfile?.role==='admin'&&<ExportSheet data={data} onClose={()=>setModal(null)} onBack={()=>setModal('profile')}/>}
       {modal==='csv-import'&&authProfile?.role==='admin'&&<CSVImportModal onClose={()=>setModal(null)} onImportWombats={wombats=>{syncDispatch({type:'IMPORT_WOMBATS',wombats});nav('wombats');}} onImportBurrows={burrows=>{syncDispatch({type:'IMPORT_BURROWS',burrows});nav('burrows');}}/>}
       {modal==='fab'&&<FABSheet onClose={()=>setModal(null)} onSelect={fabSelect}/>}
       {modal==='add-wombat'&&<AddWombatModal burrows={data.burrows} initialLocation={addAtLoc} nextCode={nextWombatCode(data.wombats)} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(w,linkedBurrowId,photo)=>{syncDispatch({type:'ADD_WOMBAT',wombat:{...w,squadId:authSquad?.id||null},linkedBurrowId:linkedBurrowId||null});if(linkedBurrowId)syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(photo)syncDispatch({type:'ADD_WOMBAT_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('wombat-profile',w.id);}}/>}
