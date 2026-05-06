@@ -2189,7 +2189,7 @@ function AcknowledgementFooter(){
 // Weather: Open-Meteo (no API key, Access-Control-Allow-Origin:* — works from file://)
 // River:   BOM KISTERS via allorigins CORS proxy (file:// sends null origin, BOM rejects it)
 const WX_CACHE_KEY='ww_weather_cache';
-function WeatherWidget({lat,lng}){
+function WeatherWidget({lat,lng,squadName}){
   const t=useTheme();
   // Initialise from cache so offline visits show last known data immediately
   const [wx,setWx]=useState(()=>{
@@ -2305,6 +2305,9 @@ function WeatherWidget({lat,lng}){
   const loStr=wx?.lo!=null?`${wx.lo}°`:'—';
   const condStr=wx===false?'Unavailable':wx?.cond||'—';
   const rvStr=river!=null&&river!==false?`${Number(river).toFixed(2)}m`:'—';
+  // River section is only relevant near the Macdonald/Hawkesbury gauge at St Albans (-33.12, 150.97).
+  // Hide it for squads whose centre is more than ~80 km away.
+  const showRiver=lat!=null&&lng!=null&&Math.abs(lat-(-33.12))<0.8&&Math.abs(lng-150.97)<0.8;
   const cacheLabel=(()=>{
     if(!cachedAt) return null;
     const mins=Math.round((Date.now()-new Date(cachedAt))/60000);
@@ -2318,7 +2321,7 @@ function WeatherWidget({lat,lng}){
   return <Card padding={20}>
     <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
       <div>
-        <div style={{display:'flex',alignItems:'center',gap:4,fontSize:12.5,color:t.mid,fontWeight:500}}>{Ico.pin(t.mid,12)} Hawkesbury–Macdonald{cacheLabel&&<span style={{marginLeft:6,fontSize:11,color:t.faint,fontWeight:400}}>{fromCache?'cached ':'updated '}{cacheLabel}</span>}</div>
+        <div style={{display:'flex',alignItems:'center',gap:4,fontSize:12.5,color:t.mid,fontWeight:500}}>{Ico.pin(t.mid,12)} {squadName||'Local Area'}{cacheLabel&&<span style={{marginLeft:6,fontSize:11,color:t.faint,fontWeight:400}}>{fromCache?'cached ':'updated '}{cacheLabel}</span>}</div>
         <div style={{display:'flex',alignItems:'baseline',gap:6,marginTop:6}}>
           <span style={{fontSize:30,fontWeight:700,color:t.ink,letterSpacing:-0.6,lineHeight:1}}>{tempStr}</span>
           {wx?.temp!=null&&<span style={{fontSize:13,color:t.mid}}>C</span>}
@@ -2328,10 +2331,10 @@ function WeatherWidget({lat,lng}){
       </div>
       {wxIco(wx?.icon,t.mid,32)}
     </div>
-    <div style={{marginTop:8,background:t.soft,borderRadius:10,padding:'8px 10px',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+    {showRiver&&<div style={{marginTop:8,background:t.soft,borderRadius:10,padding:'8px 10px',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
       <div style={{display:'flex',alignItems:'center',gap:7,fontSize:12.5,color:t.mid,fontWeight:500}}>{Ico.wave(t.mid,14)} Macdonald River</div>
       <span style={{fontSize:13,fontWeight:700,color:t.ink}}>{rvStr}</span>
-    </div>
+    </div>}
   </Card>;
 }
 
@@ -2358,14 +2361,12 @@ function ActivityScreen({data,nav,dispatch}){
       {allActivity.map((a,i)=>{
         if(a.type==='treatment'){
           const w=wombats.find(x=>x.id===a.wombatId);
-          const ab=a.linkedBurrowId?burrows.find(b=>b.id===a.linkedBurrowId):null;
           const wp=data.wombatPhotos?.find(p=>p.wombatId===w?.id&&p.isProfile)||data.wombatPhotos?.find(p=>p.wombatId===w?.id);
           return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
             <WAvatar size={44} photoUrl={wp?.dataUrl} photoId={wp?.id}/>
             <div style={{flex:1,minWidth:0}}>
               <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{w?.name||'Unknown Wombat'}</div>
               <div style={{fontSize:12,color:t.mid,marginTop:2,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>Treatment applied · {fmtDate(a.at)}</div>
-              {ab&&<button onClick={()=>nav('burrow-profile',ab.id)} style={{display:'inline-flex',alignItems:'center',gap:5,marginTop:5,padding:'3px 8px',borderRadius:8,background:t.soft,border:'none',cursor:'pointer'}}>{Ico.burrow(t.f700,12)}<span style={{fontSize:12,fontWeight:600,color:t.f700}}>{ab.name}</span></button>}
             </div>
             <Pill tone={statusTone(w?.status||'healthy')} size="sm">{statusLabel(w?.status||'healthy')}</Pill>
           </Card>;
@@ -2446,7 +2447,7 @@ function RecoveryModal({name,photoUrl,onClose}){
 }
 
 /* ── DASHBOARD ── */
-function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunteerCount='—',squadLat,squadLng}){
+function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunteerCount='—',squadLat,squadLng,squadName}){
   const t=useTheme();
   const wombats=data.wombats.filter(w=>!isInactive(w)); // active only for stats
   const inactiveWombats=data.wombats.filter(isInactive);
@@ -2472,7 +2473,7 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
       </div>
     </Header>
     <div style={{padding:'20px var(--sp) 0'}}>
-      <WeatherWidget lat={squadLat} lng={squadLng}/>
+      <WeatherWidget lat={squadLat} lng={squadLng} squadName={squadName}/>
     </div>
     <div style={{padding:'20px var(--sp) 0'}}>
       <SectionLabel>At a Glance</SectionLabel>
@@ -2493,14 +2494,12 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
         {allActivity.map((a,i)=>{
           if(a.type==='treatment'){
             const w=allWombats.find(x=>x.id===a.wombatId);
-            const ab=a.linkedBurrowId?burrows.find(b=>b.id===a.linkedBurrowId):null;
             const wp=data.wombatPhotos?.find(p=>p.wombatId===w?.id&&p.isProfile)||data.wombatPhotos?.find(p=>p.wombatId===w?.id);
             return <Card key={i} padding={12} style={{display:'flex',alignItems:'center',gap:12}}>
               <WAvatar size={44} photoUrl={wp?.dataUrl} photoId={wp?.id}/>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{w?.name||'Unknown Wombat'}</div>
                 <div style={{fontSize:12,color:t.mid,marginTop:2,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>Treatment applied · {fmtDate(a.at)}</div>
-                {ab&&<button onClick={()=>nav('burrow-profile',ab.id)} style={{display:'inline-flex',alignItems:'center',gap:5,marginTop:5,padding:'3px 8px',borderRadius:8,background:t.soft,border:'none',cursor:'pointer'}}>{Ico.burrow(t.f700,12)}<span style={{fontSize:12,fontWeight:600,color:t.f700}}>{ab.name}</span></button>}
               </div>
               <Pill tone={statusTone(w?.status||'healthy')} size="sm">{statusLabel(w?.status||'healthy')}</Pill>
             </Card>;
@@ -4087,6 +4086,54 @@ function SquadAreaEditor({initialBounds,onSave,onCancel,saveLabel='Save Home Are
   </div>;
 }
 
+// ── SWITCH SQUAD MODAL ───────────────────────────────────────────
+// Shown from ProfileSheet when the user belongs to multiple squads.
+// Lets god-mode admin swap between squads without signing out.
+function SwitchSquadModal({onClose,allSquads,currentSquadId,onSwitch}){
+  const t=useTheme();
+  const [switching,setSwitching]=useState(null); // id of squad being switched to
+  const handleSwitch=async(sq)=>{
+    if(sq.id===currentSquadId)return;
+    setSwitching(sq.id);
+    await onSwitch(sq);
+    setSwitching(null);
+  };
+  return <div style={{position:'fixed',inset:0,zIndex:1600,background:'rgba(15,25,18,0.45)'}}>
+    <button onClick={onClose} style={{position:'absolute',inset:0,width:'100%',background:'none'}}/>
+    <div style={{position:'absolute',left:'50%',transform:'translateX(-50%)',bottom:0,width:'100%',maxWidth:480,background:t.surface,borderTopLeftRadius:32,borderTopRightRadius:32,boxShadow:'0 -10px 40px rgba(0,0,0,0.2)'}}>
+      <div style={{width:40,height:4,borderRadius:2,background:t.faint,margin:'14px auto 0',opacity:0.5}}/>
+      <div style={{display:'flex',alignItems:'center',gap:8,padding:'16px 20px 8px'}}>
+        <button onClick={onClose} style={{background:'none',border:'none',color:t.mid,cursor:'pointer',padding:4,display:'flex',alignItems:'center',justifyContent:'center'}}>
+          {Ico.back(t.mid,20)}
+        </button>
+        <div style={{fontSize:17,fontWeight:700,color:t.ink}}>Switch Squad</div>
+      </div>
+      <div style={{height:1,background:t.div,margin:'4px 20px 8px'}}/>
+      {allSquads.map(sq=>{
+        const active=sq.id===currentSquadId;
+        const loading=switching===sq.id;
+        return <button key={sq.id} onClick={()=>handleSwitch(sq)} disabled={active||!!switching}
+          style={{display:'flex',alignItems:'center',gap:14,width:'100%',padding:'13px 20px',background:'none',border:'none',textAlign:'left',cursor:active?'default':'pointer',opacity:(switching&&!loading)?0.5:1}}>
+          <div style={{width:38,height:38,borderRadius:12,background:active?t.f100:t.soft,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>
+            {loading
+              ?<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={t.f700} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{animation:'spin 0.8s linear infinite'}}><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg>
+              :active
+                ?<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={t.f700} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                :<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={t.mid} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            }
+          </div>
+          <div style={{flex:1}}>
+            <div style={{fontSize:15,fontWeight:600,color:active?t.f700:t.ink}}>{sq.name}</div>
+            <div style={{fontSize:12,color:t.mid,marginTop:1,textTransform:'capitalize'}}>{active?`${sq.role} · active`:sq.role}</div>
+          </div>
+          {active&&<span style={{fontSize:11,fontWeight:700,color:t.f700,background:t.f100,borderRadius:6,padding:'3px 8px',letterSpacing:0.3}}>ACTIVE</span>}
+        </button>;
+      })}
+      <div style={{height:'calc(var(--sab) + 16px)'}}/>
+    </div>
+  </div>;
+}
+
 // ── SQUAD MODAL (settings overlay) ───────────────────────────────
 // Shown from ProfileSheet → "My Squad" row
 function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,clearSquadCache}){
@@ -4209,7 +4256,8 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
       {/* Invite Links — admin only */}
       {isAdmin&&<>
         <div style={{padding:'0 20px 8px'}}>
-          <div style={{fontSize:13,fontWeight:700,color:t.mid,letterSpacing:0.5,textTransform:'uppercase',marginBottom:12}}>Invite Links</div>
+          <div style={{fontSize:13,fontWeight:700,color:t.mid,letterSpacing:0.5,textTransform:'uppercase',marginBottom:8}}>Invite Links</div>
+          <div style={{fontSize:13,color:t.mid,marginBottom:12,lineHeight:1.5}}>Share a link with someone to let them join your squad. Only send it to people you trust — anyone with the link can join.</div>
           {loadingInvites&&<div style={{fontSize:13,color:t.mid,padding:'8px 0'}}>Loading…</div>}
           {invites.length===0&&!loadingInvites&&<div style={{fontSize:13,color:t.mid,padding:'4px 0 8px'}}>No invite links yet.</div>}
           {invites.map(inv=><div key={inv.id} style={{background:t.soft,borderRadius:12,padding:'12px 14px',marginBottom:10}}>
@@ -4274,7 +4322,7 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
 
       {/* Members — visible to all */}
       <div style={{padding:'0 20px 12px'}}>
-        <div style={{fontSize:13,fontWeight:700,color:t.mid,letterSpacing:0.5,textTransform:'uppercase',marginBottom:10}}>Members</div>
+        <div style={{fontSize:13,fontWeight:700,color:t.mid,letterSpacing:0.5,textTransform:'uppercase',marginBottom:10}}>Squad Members</div>
         <div style={{fontSize:13,color:t.mid,marginBottom:10}}>{isAdmin?'See who\'s in your squad and remove members if needed.':'See who else is monitoring with you.'}</div>
         <button onClick={()=>{setPage('members');loadMembers();}}
           style={{width:'100%',padding:'12px 0',borderRadius:12,border:`1.5px solid ${t.f700}`,background:'none',color:t.f700,fontSize:14,fontWeight:700,cursor:'pointer'}}>
@@ -4354,7 +4402,7 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
           <button onClick={()=>setPage('main')} style={{background:'none',border:'none',color:t.mid,cursor:'pointer',padding:4,display:'flex',alignItems:'center',justifyContent:'center'}}>
             {Ico.back(t.mid,20)}
           </button>
-          <div style={{fontSize:18,fontWeight:800,color:t.ink}}>Members</div>
+          <div style={{fontSize:18,fontWeight:800,color:t.ink}}>Squad Members</div>
         </div>
         {loadingMembers&&<div style={{fontSize:13,color:t.mid,padding:'16px 0',textAlign:'center'}}>Loading…</div>}
         {!loadingMembers&&members.length===0&&<div style={{fontSize:13,color:t.mid,padding:'16px 0'}}>No members found.</div>}
@@ -4419,7 +4467,7 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
   </>;
 }
 
-function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,onToggleSignIn,data,onExport,onCSVImport,authUser,authProfile,authSquad,onOpenSquad}){
+function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,onToggleSignIn,data,onExport,onCSVImport,authUser,authProfile,authSquad,onOpenSquad,allSquads,onSwitchSquad}){
   const t=useTheme();
   const [page,setPage]=useState('main'); // 'main' | 'data'
   const userName=(typeof localStorage!=='undefined'&&localStorage.getItem(SK.userName))||(authProfile?.display_name)||'Volunteer';
@@ -4499,6 +4547,12 @@ function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,
           sub={authSquad?(authSquad.role==='admin'?'Admin · tap to manage invites':'Member · tap for invite options'):'Set up or join a monitoring squad'}
           onClick={()=>{onClose();onOpenSquad();}}
         />
+        {allSquads&&allSquads.length>1&&<Row
+          icon={<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke={t.f700} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>}
+          label="Switch Squad"
+          sub={`${allSquads.length} squads available`}
+          onClick={()=>{onClose();onSwitchSquad();}}
+        />}
         {isAdmin&&<>
           <div style={{height:8,background:t.soft,margin:'6px 0'}}/>
           <Row icon={dataIcon} label="Data Management" sub="Export, import &amp; backup" onClick={()=>setPage('data')}/>
@@ -5559,7 +5613,7 @@ function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',o
                   {location.address&&<div style={{fontSize:13,fontWeight:600,color:t.ink,marginBottom:2}}>{location.address}</div>}
                   {location.lat&&<div style={{fontSize:12,color:t.mid,fontFamily:'monospace'}}>{location.lat.toFixed(5)}, {location.lng.toFixed(5)}</div>}
                 </div>
-                <button onClick={()=>{setLocation(null);setShowGeoSearch(false);}} style={{fontSize:12,color:t.mid,background:'none',border:'none',fontWeight:600,cursor:'pointer',flexShrink:0}}>Clear</button>
+                <button onClick={()=>setLocation(null)} style={{fontSize:12,color:t.mid,background:'none',border:'none',fontWeight:600,cursor:'pointer',flexShrink:0}}>Clear</button>
               </div>
             : <div style={{display:'flex',flexDirection:'column',gap:8}}>
                 {showBurrowSearch
@@ -6823,11 +6877,15 @@ function App(){
   const cacheSquad=s=>{try{localStorage.setItem(SQUAD_CACHE,JSON.stringify(s));}catch{}};
   const clearSquadCache=()=>{try{localStorage.removeItem(SQUAD_CACHE);}catch{}};
   const getCachedSquad=()=>{try{return JSON.parse(localStorage.getItem(SQUAD_CACHE)||'null');}catch{return null;}};
+  const ALL_SQUADS_CACHE='ww_all_squads_cache';
+  const cacheAllSquads=list=>{try{localStorage.setItem(ALL_SQUADS_CACHE,JSON.stringify(list));}catch{}};
+  const getCachedAllSquads=()=>{try{return JSON.parse(localStorage.getItem(ALL_SQUADS_CACHE)||'null');}catch{return null;}};
 
   const [authUser,setAuthUser]=useState(null);
   const [authProfile,setAuthProfile]=useState(()=>getCachedProfile());
   // null = no squad (or not yet loaded). Object = squad loaded.
   const [authSquad,setAuthSquad]=useState(()=>getCachedSquad());
+  const [allSquads,setAllSquads]=useState(()=>getCachedAllSquads()||[]);
   // true once we've completed at least one squad fetch (online or from cache)
   const [squadChecked,setSquadChecked]=useState(()=>!!getCachedSquad());
   // Midpoint of squad's bounding box — used for weather widget location
@@ -6964,23 +7022,28 @@ function App(){
               // Clear the token from the URL so refreshing doesn't re-trigger
               try{const u=new URL(window.location.href);u.searchParams.delete('join');window.history.replaceState({},'',u);}catch{}
             }
-            // get_my_squad() is SECURITY DEFINER so it never hits the RLS
-            // circular dependency (squad_members policy subquerying itself).
-            // Returns [] when user has no squad, one row otherwise.
-            const{data:rows,error:me}=await supa.rpc('get_my_squad');
-            const m=rows?.[0];
-            if(m&&!me){
-              const sq={id:m.squad_id,name:m.squad_name,role:m.role,boundsSwLat:m.bounds_sw_lat,boundsSwLng:m.bounds_sw_lng,boundsNeLat:m.bounds_ne_lat,boundsNeLng:m.bounds_ne_lng,emergencyContacts:m.emergency_contacts||[]};
-              cacheSquad(sq);setAuthSquad(sq);
+            // get_all_my_squads() is SECURITY DEFINER so it never hits the RLS
+            // circular dependency. Returns all squads the user belongs to,
+            // supporting god-mode admin who is a member of multiple squads.
+            const{data:rows,error:me}=await supa.rpc('get_all_my_squads');
+            if(rows&&!me&&rows.length>0){
+              const squads=rows.map(m=>({id:m.squad_id,name:m.squad_name,role:m.role,boundsSwLat:m.bounds_sw_lat,boundsSwLng:m.bounds_sw_lng,boundsNeLat:m.bounds_ne_lat,boundsNeLng:m.bounds_ne_lng,emergencyContacts:m.emergency_contacts||[]}));
+              cacheAllSquads(squads);setAllSquads(squads);
+              // Prefer the previously-active cached squad if it's still in the list,
+              // otherwise default to the first squad returned.
+              const cached=getCachedSquad();
+              const active=(cached&&squads.find(s=>s.id===cached.id))||squads[0];
+              cacheSquad(active);setAuthSquad(active);
             }else if(!me&&(!rows||rows.length===0)){
               // Empty result — user genuinely has no squad yet
-              clearSquadCache();setAuthSquad(null);
+              clearSquadCache();setAuthSquad(null);setAllSquads([]);
             }else{
               // RPC error (network?) — fall back to cache
-              if(me)console.warn('[Squad] get_my_squad error:',me.code,me.message);
+              if(me)console.warn('[Squad] get_all_my_squads error:',me.code,me.message);
               const c=getCachedSquad();if(c)setAuthSquad(c);
+              const ca=getCachedAllSquads();if(ca)setAllSquads(ca);
             }
-          }catch{const c=getCachedSquad();if(c)setAuthSquad(c);}
+          }catch{const c=getCachedSquad();if(c)setAuthSquad(c);const ca=getCachedAllSquads();if(ca)setAllSquads(ca);}
           finally{setSquadChecked(true);}
         };
         loadSquad(pendingInviteToken);
@@ -7242,6 +7305,42 @@ function App(){
       setModal('sign-in');
     }
   };
+  // Squad switcher — for god-mode admin who is a member of multiple squads.
+  // Updates the active squad, caches it, clears current data, and re-syncs.
+  const switchSquad=async(sq)=>{
+    if(sq.id===authSquad?.id)return; // already active
+    const prevSquad=authSquad; // keep reference in case we need to revert
+    cacheSquad(sq);
+    setAuthSquad(sq);
+    setModal(null);
+    setSyncing(true);
+    try{
+      const merged=await supaFullSync();
+      if(merged){
+        // Sync succeeded — now safe to wipe old data and replace with new squad's
+        const fresh=await resolveWithCurrentQueue(merged);
+        const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
+        const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
+        const synced={...fresh,wombats,burrows};
+        dispatch({type:'REPLACE_ALL',data:synced});
+        idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
+        cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
+        changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
+        changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
+      }else{
+        // merged===undefined means all requests failed — we're offline.
+        // Revert so the user keeps their cached data for the squad they were on.
+        cacheSquad(prevSquad);
+        setAuthSquad(prevSquad);
+        alert('You\'re offline — squad switching requires an internet connection. Your current squad data is still intact.');
+      }
+    }catch{
+      cacheSquad(prevSquad);
+      setAuthSquad(prevSquad);
+    }finally{
+      setSyncing(false);
+    }
+  };
   const openProfile=()=>setModal('profile');
   const onFAB=()=>setModal('fab');
   const [addAtLoc,setAddAtLoc]=useState(null);
@@ -7320,7 +7419,7 @@ function App(){
       {syncing&&<div style={{position:'fixed',top:0,left:'max(0px,calc(50vw - 240px))',right:'max(0px,calc(50vw - 240px))',height:3,zIndex:9999,background:t.f700,transformOrigin:'left',animation:'syncBar 1.4s ease-in-out infinite'}}/>}
       {/* ── content area: grows to fill space above the tab bar ── */}
       <div className="content-area">
-        {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} queueLen={queueLen} openProfile={openProfile} streak={streak} volunteerCount={volunteerCount} squadLat={squadCenter?.lat} squadLng={squadCenter?.lng}/></div>}
+        {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} queueLen={queueLen} openProfile={openProfile} streak={streak} volunteerCount={volunteerCount} squadLat={squadCenter?.lat} squadLng={squadCenter?.lng} squadName={authSquad?.name}/></div>}
         {screen==='activity'&&<div className="scroll noscroll"><ActivityScreen data={data} nav={nav}/></div>}
         {screen==='map'&&<MapScreen data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} theme={theme} onAddAt={onAddAt} wombatFilters={mapWombatFilters} setWombatFilters={setMapWombatFilters} burrowFilters={mapBurrowFilters} setBurrowFilters={setMapBurrowFilters} cameraFilter={mapCameraFilter} setCameraFilter={setMapCameraFilter} authSquad={authSquad}/>}
         {screen==='wombats'&&<div className="scroll noscroll"><WombatList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile} filterStatus={wombatFilterStatus} setFilterStatus={setWombatFilterStatus} sortBy={wombatSortBy} setSortBy={setWombatSortBy}/></div>}
@@ -7332,8 +7431,9 @@ function App(){
       <div style={{flexShrink:0,height:'62px',background:'var(--tabbar)',borderTop:'1px solid var(--tabborder)'}}/>
       <TabBar active={screen} onNav={nav} onFAB={onFAB}/>
 
-      {modal==='profile'&&<ProfileSheet onClose={()=>setModal(null)} onToggleTheme={toggleTheme} theme={theme} onEditProfile={()=>setModal('edit-profile')} onFAQ={()=>setModal('faq')} signedIn={signedIn} onToggleSignIn={toggleSignIn} data={data} onExport={()=>setModal('export')} onCSVImport={()=>setModal('csv-import')} authUser={authUser} authProfile={authProfile} authSquad={authSquad} onOpenSquad={()=>setModal('squad')}/>}
+      {modal==='profile'&&<ProfileSheet onClose={()=>setModal(null)} onToggleTheme={toggleTheme} theme={theme} onEditProfile={()=>setModal('edit-profile')} onFAQ={()=>setModal('faq')} signedIn={signedIn} onToggleSignIn={toggleSignIn} data={data} onExport={()=>setModal('export')} onCSVImport={()=>setModal('csv-import')} authUser={authUser} authProfile={authProfile} authSquad={authSquad} onOpenSquad={()=>setModal('squad')} allSquads={allSquads} onSwitchSquad={()=>setModal('switch-squad')}/>}
       {modal==='squad'&&authUser&&<SquadModal onClose={()=>setModal(null)} onBack={()=>setModal('profile')} authSquad={authSquad} authUser={authUser} setAuthSquad={setAuthSquad} cacheSquad={cacheSquad} clearSquadCache={clearSquadCache}/>}
+      {modal==='switch-squad'&&allSquads.length>1&&<SwitchSquadModal onClose={()=>setModal(null)} allSquads={allSquads} currentSquadId={authSquad?.id} onSwitch={switchSquad}/>}
       {modal==='edit-profile'&&<EditProfileModal onClose={()=>setModal(null)}/>}
       {modal==='faq'&&<FAQSheet onClose={()=>setModal(null)} onBack={()=>setModal('profile')} squadContacts={authSquad?.emergencyContacts||[]}/>}
       {modal==='export'&&authProfile?.role==='admin'&&<ExportSheet data={data} onClose={()=>setModal(null)} onBack={()=>setModal('profile')}/>}
