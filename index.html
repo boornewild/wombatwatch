@@ -3867,8 +3867,10 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
   const fetchSquadAndFinish=async()=>{
     const{data:{user}}=await supa.auth.getUser();
     if(!user)return;
-    const{data:m}=await supa.from('squad_members').select('role, squad:squads(id,name,bounds_sw_lat,bounds_sw_lng,bounds_ne_lat,bounds_ne_lng,emergency_contacts)').eq('user_id',user.id).single();
-    if(m?.squad)onSquadReady({id:m.squad.id,name:m.squad.name,role:m.role,boundsSwLat:m.squad.bounds_sw_lat,boundsSwLng:m.squad.bounds_sw_lng,boundsNeLat:m.squad.bounds_ne_lat,boundsNeLng:m.squad.bounds_ne_lng,emergencyContacts:m.squad.emergency_contacts||[]});
+    // get_my_squad() is SECURITY DEFINER — avoids RLS circular dependency
+    const{data:rows}=await supa.rpc('get_my_squad');
+    const m=rows?.[0];
+    if(m)onSquadReady({id:m.squad_id,name:m.squad_name,role:m.role,boundsSwLat:m.bounds_sw_lat,boundsSwLng:m.bounds_sw_lng,boundsNeLat:m.bounds_ne_lat,boundsNeLng:m.bounds_ne_lng,emergencyContacts:m.emergency_contacts||[]});
   };
 
   const handleCreate=async()=>{
@@ -6856,15 +6858,20 @@ function App(){
               // Clear the token from the URL so refreshing doesn't re-trigger
               try{const u=new URL(window.location.href);u.searchParams.delete('join');window.history.replaceState({},'',u);}catch{}
             }
-            const{data:m,error:me}=await supa.from('squad_members').select('role, squad:squads(id,name,bounds_sw_lat,bounds_sw_lng,bounds_ne_lat,bounds_ne_lng,emergency_contacts)').eq('user_id',user.id).single();
+            // get_my_squad() is SECURITY DEFINER so it never hits the RLS
+            // circular dependency (squad_members policy subquerying itself).
+            // Returns [] when user has no squad, one row otherwise.
+            const{data:rows,error:me}=await supa.rpc('get_my_squad');
+            const m=rows?.[0];
             if(m&&!me){
-              const sq={id:m.squad.id,name:m.squad.name,role:m.role,boundsSwLat:m.squad.bounds_sw_lat,boundsSwLng:m.squad.bounds_sw_lng,boundsNeLat:m.squad.bounds_ne_lat,boundsNeLng:m.squad.bounds_ne_lng,emergencyContacts:m.squad.emergency_contacts||[]};
+              const sq={id:m.squad_id,name:m.squad_name,role:m.role,boundsSwLat:m.bounds_sw_lat,boundsSwLng:m.bounds_sw_lng,boundsNeLat:m.bounds_ne_lat,boundsNeLng:m.bounds_ne_lng,emergencyContacts:m.emergency_contacts||[]};
               cacheSquad(sq);setAuthSquad(sq);
-            }else if(me?.code==='PGRST116'||me?.code==='406'){
-              // PGRST116 = "0 rows" — user has no squad yet
+            }else if(!me&&(!rows||rows.length===0)){
+              // Empty result — user genuinely has no squad yet
               clearSquadCache();setAuthSquad(null);
             }else{
-              // Other error (network?) — fall back to cache
+              // RPC error (network?) — fall back to cache
+              if(me)console.warn('[Squad] get_my_squad error:',me.code,me.message);
               const c=getCachedSquad();if(c)setAuthSquad(c);
             }
           }catch{const c=getCachedSquad();if(c)setAuthSquad(c);}
