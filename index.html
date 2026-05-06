@@ -3877,6 +3877,7 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
     if(!squadName.trim()){setErr('Please enter a squad name.');return;}
     setBusy(true);setErr(null);
     const{data,error}=await supa.rpc('create_squad',{p_name:squadName.trim(),p_description:squadDesc.trim()||null});
+    if(error?.code==='23505'||error?.message?.toLowerCase().includes('unique')){setErr('A squad with that name already exists — please choose a different name.');setBusy(false);return;}
     if(error||!data?.ok){setErr(error?.message||data?.error||'Could not create squad.');setBusy(false);return;}
     // Squad created — move to the home area picker
     setCreatedSquadId(data.squad_id);
@@ -4021,6 +4022,7 @@ function SquadAreaEditor({initialBounds,onSave,onCancel,saveLabel='Save Home Are
   const mapDivRef=useRef(null);
   const leafletRef=useRef(null);
   const [busy,setBusy]=useState(false);
+  const [locError,setLocError]=useState(false);
 
   useEffect(()=>{
     const tid=setTimeout(()=>{
@@ -4037,6 +4039,20 @@ function SquadAreaEditor({initialBounds,onSave,onCancel,saveLabel='Save Home Are
     return()=>{clearTimeout(tid);if(leafletRef.current){leafletRef.current.remove();leafletRef.current=null;}};
   },[]);
 
+  const handleLocate=()=>{
+    if(!navigator.geolocation){setLocError(true);return;}
+    setLocError(false);
+    navigator.geolocation.getCurrentPosition(
+      pos=>{
+        const{latitude:lat,longitude:lng}=pos.coords;
+        if(typeof lat!=='number'||isNaN(lat)){setLocError(true);return;}
+        if(leafletRef.current)leafletRef.current.flyTo([lat,lng],13,{duration:1.2});
+      },
+      ()=>setLocError(true),
+      {timeout:8000,maximumAge:30000}
+    );
+  };
+
   const handleSave=async()=>{
     const map=leafletRef.current;
     if(!map)return;
@@ -4050,8 +4066,14 @@ function SquadAreaEditor({initialBounds,onSave,onCancel,saveLabel='Save Home Are
     <div style={{fontSize:13,color:t.mid,marginBottom:10,lineHeight:1.5}}>
       Pan and zoom so the map shows your squad's entire monitoring area, then tap <strong>Save</strong>. You can always update this later in Squad Settings.
     </div>
-    {/* Map container — needs an explicit height for Leaflet */}
-    <div ref={mapDivRef} style={{flex:1,minHeight:280,borderRadius:14,overflow:'hidden',border:`1.5px solid ${t.div}`}}/>
+    {/* Map container — position:relative so the locate button can overlay it */}
+    <div style={{flex:1,minHeight:280,position:'relative'}}>
+      <div ref={mapDivRef} style={{position:'absolute',inset:0,borderRadius:14,overflow:'hidden',border:`1.5px solid ${t.div}`}}/>
+      <button onClick={handleLocate} title={locError?'Could not get location':'Go to my location'}
+        style={{position:'absolute',bottom:16,right:16,zIndex:500,width:44,height:44,borderRadius:12,background:locError?t.soft:t.surface,boxShadow:'0 2px 10px rgba(0,0,0,0.2)',border:locError?`1.5px solid ${t.amb700}`:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>
+        {locError?Ico.wifiOff(t.amb700,20):Ico.crosshair(t.f700,20)}
+      </button>
+    </div>
     <div style={{display:'flex',gap:10,marginTop:14}}>
       <button onClick={onCancel} disabled={busy}
         style={{flex:1,padding:'13px 0',borderRadius:12,border:`1.5px solid ${t.div}`,background:'none',color:t.mid,fontSize:14,fontWeight:600,cursor:busy?'not-allowed':'pointer',opacity:busy?0.6:1}}>
@@ -4070,7 +4092,7 @@ function SquadAreaEditor({initialBounds,onSave,onCancel,saveLabel='Save Home Are
 function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,clearSquadCache}){
   const t=useTheme();
   const isAdmin=authSquad?.role==='admin';
-  const [page,setPage]=useState('main'); // 'main'|'contacts'
+  const [page,setPage]=useState('main'); // 'main'|'contacts'|'members'
   const [invites,setInvites]=useState([]);
   const [loadingInvites,setLoadingInvites]=useState(false);
   const [generating,setGenerating]=useState(false);
@@ -4082,6 +4104,10 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
   const [addPhone,setAddPhone]=useState('');
   const [addDesc,setAddDesc]=useState('');
   const [savingContacts,setSavingContacts]=useState(false);
+  // members page state
+  const [members,setMembers]=useState([]);
+  const [loadingMembers,setLoadingMembers]=useState(false);
+  const [removingId,setRemovingId]=useState(null);
   const baseUrl=window.location.origin+window.location.pathname;
 
   // Load existing invites (admin only)
@@ -4092,6 +4118,31 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
       .then(({data})=>{setInvites(data||[]);setLoadingInvites(false);})
       .catch(()=>setLoadingInvites(false));
   },[isAdmin,authSquad?.id]);
+
+  const loadMembers=async()=>{
+    if(!authSquad?.id)return;
+    setLoadingMembers(true);
+    const{data}=await supa.from('squad_members')
+      .select('user_id,role,profile:profiles(display_name)')
+      .eq('squad_id',authSquad.id);
+    // Sort: admins first, then alphabetically by display name
+    const sorted=(data||[]).sort((a,b)=>{
+      if(a.role==='admin'&&b.role!=='admin')return -1;
+      if(b.role==='admin'&&a.role!=='admin')return 1;
+      return(a.profile?.display_name||'').localeCompare(b.profile?.display_name||'');
+    });
+    setMembers(sorted);
+    setLoadingMembers(false);
+  };
+
+  const handleRemoveMember=async(userId,name)=>{
+    if(!window.confirm(`Remove ${name||'this member'} from the squad?`))return;
+    setRemovingId(userId);
+    const{error}=await supa.from('squad_members').delete().eq('user_id',userId).eq('squad_id',authSquad.id);
+    if(error){alert('Could not remove member: '+error.message);setRemovingId(null);return;}
+    setMembers(prev=>prev.filter(m=>m.user_id!==userId));
+    setRemovingId(null);
+  };
 
   const makeLink=token=>`${baseUrl}?join=${token}`;
 
@@ -4221,6 +4272,17 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
         <div style={{height:1,background:t.div,margin:'0 20px 12px'}}/>
       </>}
 
+      {/* Members — visible to all */}
+      <div style={{padding:'0 20px 12px'}}>
+        <div style={{fontSize:13,fontWeight:700,color:t.mid,letterSpacing:0.5,textTransform:'uppercase',marginBottom:10}}>Members</div>
+        <div style={{fontSize:13,color:t.mid,marginBottom:10}}>{isAdmin?'See who\'s in your squad and remove members if needed.':'See who else is monitoring with you.'}</div>
+        <button onClick={()=>{setPage('members');loadMembers();}}
+          style={{width:'100%',padding:'12px 0',borderRadius:12,border:`1.5px solid ${t.f700}`,background:'none',color:t.f700,fontSize:14,fontWeight:700,cursor:'pointer'}}>
+          {isAdmin?'Manage Members':'See Members'}
+        </button>
+      </div>
+      <div style={{height:1,background:t.div,margin:'0 20px 12px'}}/>
+
       {/* Leave / change squad info */}
       <div style={{padding:'8px 20px 20px'}}>
         <div style={{fontSize:13,color:t.mid,textAlign:'center',lineHeight:1.5}}>To leave or change squads, contact your squad admin.</div>
@@ -4281,6 +4343,50 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
         {savingContacts?'Saving…':'Save Contacts'}
       </button>
     </div>
+    </div>
+  </div>}
+
+  {/* Members overlay — view names (all) / manage (admin) */}
+  {page==='members'&&<div style={{position:'fixed',inset:0,zIndex:1800,background:'rgba(15,25,18,0.5)'}}>
+    <div style={{position:'absolute',left:'50%',transform:'translateX(-50%)',top:0,width:'100%',maxWidth:480,height:'100%',background:t.bg,overflowY:'auto'}}>
+      <div style={{padding:'24px 20px 0'}}>
+        <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
+          <button onClick={()=>setPage('main')} style={{background:'none',border:'none',color:t.mid,cursor:'pointer',padding:4,display:'flex',alignItems:'center',justifyContent:'center'}}>
+            {Ico.back(t.mid,20)}
+          </button>
+          <div style={{fontSize:18,fontWeight:800,color:t.ink}}>Members</div>
+        </div>
+        {loadingMembers&&<div style={{fontSize:13,color:t.mid,padding:'16px 0',textAlign:'center'}}>Loading…</div>}
+        {!loadingMembers&&members.length===0&&<div style={{fontSize:13,color:t.mid,padding:'16px 0'}}>No members found.</div>}
+        {members.map(m=>{
+          const name=m.profile?.display_name||'Unknown';
+          const isMe=m.user_id===authUser?.id;
+          const memberIsAdmin=m.role==='admin';
+          // Initial avatar
+          const initials=(name.trim().split(/\s+/).map(w=>w[0]||'').join('').slice(0,2)||'?').toUpperCase();
+          return <div key={m.user_id} style={{display:'flex',alignItems:'center',gap:14,padding:'12px 0',borderBottom:`1px solid ${t.div}`}}>
+            <div style={{width:40,height:40,borderRadius:20,background:memberIsAdmin?t.lav100:t.sage50,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,fontSize:15,fontWeight:800,color:memberIsAdmin?t.lav500:t.f700}}>
+              {initials}
+            </div>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:15,fontWeight:600,color:t.ink}}>{name}{isMe&&<span style={{fontSize:12,color:t.mid,fontWeight:500}}> (you)</span>}</div>
+              <div style={{marginTop:3}}>
+                {memberIsAdmin
+                  ?<span style={{fontSize:11,fontWeight:700,color:t.lav500,background:t.lav100,borderRadius:5,padding:'2px 7px',letterSpacing:0.3}}>ADMIN</span>
+                  :<span style={{fontSize:11,fontWeight:700,color:t.f700,background:t.sage50,borderRadius:5,padding:'2px 7px',letterSpacing:0.3}}>MEMBER</span>}
+              </div>
+            </div>
+            {/* Admins can remove non-admin members (not themselves) */}
+            {isAdmin&&!isMe&&!memberIsAdmin&&<button
+              onClick={()=>handleRemoveMember(m.user_id,name)}
+              disabled={removingId===m.user_id}
+              style={{flexShrink:0,padding:'6px 14px',borderRadius:8,border:'none',background:t.rose50,color:t.rose700,fontSize:12,fontWeight:700,cursor:removingId===m.user_id?'not-allowed':'pointer',opacity:removingId===m.user_id?0.5:1}}>
+              {removingId===m.user_id?'…':'Remove'}
+            </button>}
+          </div>;
+        })}
+        <div style={{height:'calc(var(--sab) + 32px)'}}/>
+      </div>
     </div>
   </div>}
 
