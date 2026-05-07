@@ -896,6 +896,20 @@ async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch,forcedI
         }
         console.info('[Photo] cacheRemote: constructed-URL',res.status,'for',p.id,'(file may not be in Storage yet)');
       }catch(e){console.info('[Photo] cacheRemote: constructed-URL exception for',p.id,e?.message);}
+      // Attempt 4: fetch base64 directly from the DB column (Storage not configured,
+      // or photo predates Storage migration). This is a targeted single-row query —
+      // supaFullSync now excludes data_url to avoid downloading MBs of base64 on
+      // every sync, so we only pull it here, once, for photos not yet in IDB.
+      try{
+        const tbl=p.wombatId?'wombat_photos':'burrow_photos';
+        const{data:row}=await supa.from(tbl).select('data_url').eq('id',p.id).single();
+        if(row?.data_url?.startsWith('data:')){
+          await idbPutPhoto(p.id,row.data_url);
+          newMap[p.id]=row.data_url;
+          console.info('[Photo] cacheRemote: DB base64 ok',p.id);
+          return;
+        }
+      }catch(e){console.info('[Photo] cacheRemote: DB base64 exception for',p.id,e?.message);}
     }));
     const cached=Object.keys(newMap).length;
     console.info('[Photo] cacheRemotePhotosToIdb: cached',cached,'blob(s) into ww_photo_data');
@@ -1050,6 +1064,10 @@ function compressImage(file,maxPx=1200,quality=0.75){
 const SUPA_URL='https://xzfccubfoavpaqphofht.supabase.co';
 const SUPA_ANON='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh6ZmNjdWJmb2F2cGFxcGhvZmh0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY2Nzg0OTQsImV4cCI6MjA5MjI1NDQ5NH0.Fp9we2Y32s81cTPLWx1m4N7vGArFsHc3BdxxljZ1C8s';
 const supa=window.supabase.createClient(SUPA_URL,SUPA_ANON);
+// Tracks the currently active squad ID so supaFullSync can filter its output
+// to just that squad. Updated whenever authSquad changes in the App component.
+// Module-level so supaFullSync doesn't need the ID threaded through every call site.
+let _currentSquadId=null;
 
 // ── camelCase ↔ snake_case mappings ──────────────────────────
 const wombatToDb=(w,uid)=>({id:w.id,created_by:uid||null,squad_id:w.squadId||null,name:w.name,sex:w.sex||null,age_class:w.ageClass||null,status:w.status||null,severity:w.severity||{},burrow_ids:w.burrowIds||[],first_seen:w.firstSeen||null,location:w.location||null,lat:w.lat||null,lng:w.lng||null,notes:w.notes||null,code:w.code||null,location_label:w.locationLabel||null,inactive_at:w.inactiveAt||null,inactive_cause:w.inactiveCause||null,inactive_notes:w.inactiveNotes||null,assignees:w.assignees||[]});
@@ -1585,7 +1603,37 @@ async function syncAction(action,userId){
 // Uses Promise.allSettled so a single failing table (permissions error,
 // timeout, etc.) doesn't abort the entire sync — the app just keeps
 // whatever local data it had for that table.
+// When a user belongs to multiple squads (god-mode admin), supaFullSync fetches
+// data for all of them (RLS allows it). This trims the merged result down to just
+// the active squad so the UI only shows one squad at a time.
+// Wombats + burrows have a direct squadId; child records are filtered by their
+// parent's ID being in the active squad.
+function filterSyncToSquad(data,squadId){
+  console.info('[Squad] filterSyncToSquad called — squadId:',squadId,'_currentSquadId:',_currentSquadId);
+  if(!squadId){console.warn('[Squad] filterSyncToSquad — no squadId, returning unfiltered');return data;}
+  const wombats=data.wombats.filter(w=>w.squadId===squadId);
+  const burrows=data.burrows.filter(b=>b.squadId===squadId);
+  console.info('[Squad] filterSyncToSquad — wombats:',data.wombats.length,'→',wombats.length,'burrows:',data.burrows.length,'→',burrows.length);
+  const wIds=new Set(wombats.map(w=>w.id));
+  const bIds=new Set(burrows.map(b=>b.id));
+  return{
+    ...data,
+    wombats,
+    burrows,
+    treatments:  data.treatments.filter(t=>wIds.has(t.wombatId)),
+    sightings:   data.sightings.filter(s=>wIds.has(s.wombatId)),
+    burrowLogs:  data.burrowLogs.filter(l=>bIds.has(l.burrowId)),
+    wombatPhotos:data.wombatPhotos.filter(p=>wIds.has(p.wombatId)),
+    burrowPhotos:data.burrowPhotos.filter(p=>bIds.has(p.burrowId)),
+  };
+}
+
 async function supaFullSync(){
+  // Snapshot the active squad at the moment this sync starts.
+  // If the user switches squads while fetches are in flight, _currentSquadId will
+  // have changed by the time we filter — so we discard the stale result rather than
+  // dispatching the wrong squad's data.
+  const _squadIdAtStart=_currentSquadId;
   // Record when the fetch started so resolveWithCurrentQueue can distinguish pushes
   // that completed DURING the flight (those pushes should still beat the stale response).
   const _fetchStart=Date.now();
@@ -1595,8 +1643,8 @@ async function supaFullSync(){
     supa.from('treatments').select('*'),
     supa.from('sightings').select('*'),
     supa.from('burrow_logs').select('*'),
-    supa.from('wombat_photos').select('*'),
-    supa.from('burrow_photos').select('*'),
+    supa.from('wombat_photos').select('id,wombat_id,is_profile,at,created_by'),
+    supa.from('burrow_photos').select('id,burrow_id,is_profile,at,created_by'),
   ]);
   const val=(r,key)=>{
     if(r.status==='rejected'){console.warn('[Supa] sync failed for',key,r.reason);return null;}
@@ -1664,12 +1712,22 @@ async function supaFullSync(){
       return local.filter(r=>!deletedIds.has(r.id)&&!recentlyDeleted.has(r.id));
     }
     const map=Object.fromEntries(remote.map(r=>[r.id,conv(r)]));
-    // Local record wins if: never synced to server (!_sync), OR has a pending edit in the queue
-    local.filter(r=>!r._sync||queuedIds.has(r.id)).forEach(r=>{map[r.id]=r;});
+    // Local record wins if: never synced to server (!_sync), OR has a pending edit in the queue.
+    // Also exclude stale local records whose squadId doesn't match the active squad —
+    // these are contamination from the period when multi-squad data was mixed in the IDB.
+    local.filter(r=>(!r._sync||queuedIds.has(r.id))&&(!r.squadId||!_currentSquadId||r.squadId===_currentSquadId)).forEach(r=>{map[r.id]=r;});
     // Strip out anything the user deleted (pending queue op OR recently-completed delete)
     return Object.values(map).filter(r=>!deletedIds.has(r.id)&&!recentlyDeleted.has(r.id));
   };
-  return{
+  // If the squad changed mid-flight (both sides non-null and different), discard —
+  // the caller would dispatch the wrong squad's data. A null start just means the
+  // sync launched before loadSquad finished; use whatever squad is current now.
+  const filterSquadId=_squadIdAtStart||_currentSquadId;
+  if(_squadIdAtStart&&_currentSquadId&&_squadIdAtStart!==_currentSquadId){
+    console.info('[Squad] supaFullSync discarding stale result — squad changed mid-flight');
+    return undefined;
+  }
+  return filterSyncToSquad({
     _fetchStart,  // consumed by resolveWithCurrentQueue to detect in-flight push races
     wombats:     merge(w, 'w',  dbToWombat),
     burrows:     merge(b, 'b',  dbToBurrow),
@@ -1678,7 +1736,7 @@ async function supaFullSync(){
     burrowLogs:  merge(bl,'bl', dbToBurrowLog),
     wombatPhotos:merge(wp,'wp', dbToWombatPhoto),
     burrowPhotos:merge(bp,'bp', dbToBurrowPhoto),
-  };
+  },filterSquadId);
 }
 
 // ── Late-binding queue resolution ─────────────────────────────
@@ -1726,9 +1784,12 @@ async function resolveWithCurrentQueue(merged){
       }
       return r;
     }).filter(r=>!dIds.has(r.id));
-    // Also include new local records created during the fetch (not on server yet)
+    // Also include new local records created during the fetch (not on server yet).
+    // Exclude records from a different squad — they are contamination from a prior squad
+    // session and must not bleed into the current squad's resolved data.
     const outIds=new Set(out.map(r=>r.id));
-    local.filter(r=>(qIds.has(r.id)||!r._sync)&&!outIds.has(r.id)&&!dIds.has(r.id))
+    local.filter(r=>(qIds.has(r.id)||!r._sync)&&!outIds.has(r.id)&&!dIds.has(r.id)
+                  &&(!r.squadId||!_currentSquadId||r.squadId===_currentSquadId))
          .forEach(r=>out.push(r));
     return out;
   };
@@ -4614,17 +4675,30 @@ function ExportSheet({data,onClose,onBack}){
 
   const exportFullCSV=async()=>{
     const zip=new JSZip();
+    // Helper: get Storage public URL for a photo by id
+    const photoStorageUrl=(id)=>supa.storage.from('photos').getPublicUrl(`${id}.jpg`).data?.publicUrl||'';
+    // Helper: build semicolon-separated photo URLs for a wombat/burrow (profile first)
+    const wombatPhotoUrls=(wombatId)=>{
+      const photos=(data.wombatPhotos||[]).filter(p=>p.wombatId===wombatId);
+      const sorted=[...photos.filter(p=>p.isProfile||p.is_profile),...photos.filter(p=>!p.isProfile&&!p.is_profile)];
+      return sorted.map(p=>photoStorageUrl(p.id)).filter(Boolean).join(';');
+    };
+    const burrowPhotoUrls=(burrowId)=>{
+      const photos=(data.burrowPhotos||[]).filter(p=>p.burrowId===burrowId);
+      const sorted=[...photos.filter(p=>p.isProfile||p.is_profile),...photos.filter(p=>!p.isProfile&&!p.is_profile)];
+      return sorted.map(p=>photoStorageUrl(p.id)).filter(Boolean).join(';');
+    };
     // Wombats
-    const wHeaders=['WombatID','Code','Name','Status','Sex','AgeClass','Latitude','Longitude','Location','FirstSeen','Notes'];
-    const wRows=data.wombats.map(w=>[w.id,w.code||'',w.name||'',statusLabel(w.status),w.sex==='M'?'Male':w.sex==='F'?'Female':'Unknown',w.ageClass||'',w.lat??'',w.lng??'',w.location||'',w.firstSeen||'',w.notes||'']);
+    const wHeaders=['WombatID','Code','Name','Status','Sex','AgeClass','Latitude','Longitude','Location','FirstSeen','Notes','PhotoURLs'];
+    const wRows=data.wombats.map(w=>[w.id,w.code||'',w.name||'',statusLabel(w.status),w.sex==='M'?'Male':w.sex==='F'?'Female':'Unknown',w.ageClass||'',w.lat??'',w.lng??'',w.location||'',w.firstSeen||'',w.notes||'',wombatPhotoUrls(w.id)]);
     zip.file('wombats.csv','﻿'+toCSV(wHeaders,wRows));
     // Treatments
     const tHeaders=['TreatmentID','WombatID','WombatName','Date','Product','Dose','Method','Severity','RecordedBy','Note','Latitude','Longitude'];
     const tRows=data.treatments.map(tr=>{const w=data.wombats.find(x=>x.id===tr.wombatId)||{};return[tr.id,tr.wombatId,w.name||'',tr.at?.slice(0,10)||'',tr.product||'',tr.dose||'',tr.method||'',tr.severity??'',tr.by||'',tr.note||'',tr.location?.lat??'',tr.location?.lng??''];});
     zip.file('treatments.csv','﻿'+toCSV(tHeaders,tRows));
     // Burrows
-    const bHeaders=['BurrowID','Code','Name','Status','Latitude','Longitude','Location','EntranceHeightCm','EntranceWidthCm','EntranceOrientation','Substrate','Vegetation','Notes'];
-    const bRows=data.burrows.map(b=>[b.id,b.code||'',b.name||'',b.status||'',b.lat??'',b.lng??'',b.location||'',b.entranceHeight||'',b.entranceWidth||'',b.orientation||'',b.substrate||'',b.vegetation||'',b.notes||'']);
+    const bHeaders=['BurrowID','Code','Name','Status','Latitude','Longitude','Location','EntranceHeightCm','EntranceWidthCm','EntranceOrientation','Substrate','Vegetation','Notes','PhotoURLs'];
+    const bRows=data.burrows.map(b=>[b.id,b.code||'',b.name||'',b.status||'',b.lat??'',b.lng??'',b.location||'',b.entranceHeight||'',b.entranceWidth||'',b.orientation||'',b.substrate||'',b.vegetation||'',b.notes||'',burrowPhotoUrls(b.id)]);
     zip.file('burrows.csv','﻿'+toCSV(bHeaders,bRows));
     // Burrow logs
     const lHeaders=['LogID','BurrowID','BurrowName','Date','Occupation','CheckedBy','Note'];
@@ -6884,7 +6958,9 @@ function App(){
   const [authUser,setAuthUser]=useState(null);
   const [authProfile,setAuthProfile]=useState(()=>getCachedProfile());
   // null = no squad (or not yet loaded). Object = squad loaded.
-  const [authSquad,setAuthSquad]=useState(()=>getCachedSquad());
+  // Also prime _currentSquadId eagerly from cache so supaFullSync filters
+  // correctly on the very first run (before any useEffect fires).
+  const [authSquad,setAuthSquad]=useState(()=>{const c=getCachedSquad();if(c)_currentSquadId=c.id;return c;});
   const [allSquads,setAllSquads]=useState(()=>getCachedAllSquads()||[]);
   // true once we've completed at least one squad fetch (online or from cache)
   const [squadChecked,setSquadChecked]=useState(()=>!!getCachedSquad());
@@ -7033,6 +7109,8 @@ function App(){
               // otherwise default to the first squad returned.
               const cached=getCachedSquad();
               const active=(cached&&squads.find(s=>s.id===cached.id))||squads[0];
+              _currentSquadId=active.id; // set before supaFullSync below uses it
+              console.info('[Squad] loadSquad — set _currentSquadId:',_currentSquadId);
               cacheSquad(active);setAuthSquad(active);
             }else if(!me&&(!rows||rows.length===0)){
               // Empty result — user genuinely has no squad yet
@@ -7164,11 +7242,10 @@ function App(){
         const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
         const synced2={...fresh,wombats,burrows};
         dispatch({type:'REPLACE_ALL',data:synced2});
+        // Photos are stable between syncs — only hydrate from IDB, don't re-fetch from Storage
         idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
-        cacheRemotePhotosToIdb(synced2.wombatPhotos,synced2.burrowPhotos,dispatch).catch(()=>{});
-        recoverBlankPhotos(synced2.wombatPhotos,synced2.burrowPhotos,dispatch).catch(()=>{});
       }).catch(()=>{});
-    },120000); // every 2 minutes
+    },300000); // every 5 minutes
     return()=>{
       window.removeEventListener('online',on);
       window.removeEventListener('offline',off);
@@ -7293,6 +7370,8 @@ function App(){
   const toggleTheme=()=>{const nt=theme==='dark'?'light':'dark';setTheme(nt);localStorage.setItem(SK.theme,nt);};
   // Keep <html> data-theme in sync so CSS variables (including body background) work outside .app
   useEffect(()=>{document.documentElement.setAttribute('data-theme',theme);},[theme]);
+  // Keep the module-level squad ID in sync so supaFullSync always filters correctly
+  useEffect(()=>{_currentSquadId=authSquad?.id||null;},[authSquad]);
   const toggleSignIn=async()=>{
     if(signedIn){
       explicitSignOut.current=true;
@@ -7310,9 +7389,11 @@ function App(){
   const switchSquad=async(sq)=>{
     if(sq.id===authSquad?.id)return; // already active
     const prevSquad=authSquad; // keep reference in case we need to revert
+    _currentSquadId=sq.id; // set eagerly so supaFullSync filters correctly
     cacheSquad(sq);
     setAuthSquad(sq);
     setModal(null);
+    nav('dashboard'); // always land on dashboard so stale page data isn't visible during switch
     setSyncing(true);
     try{
       const merged=await supaFullSync();
@@ -7321,7 +7402,9 @@ function App(){
         const fresh=await resolveWithCurrentQueue(merged);
         const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
         const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
-        const synced={...fresh,wombats,burrows};
+        // Final belt-and-suspenders filter: guarantee only the target squad's records
+        // are dispatched regardless of any leak from resolveWithCurrentQueue or dedup.
+        const synced=filterSyncToSquad({...fresh,wombats,burrows},sq.id);
         dispatch({type:'REPLACE_ALL',data:synced});
         idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
         cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
