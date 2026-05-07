@@ -2398,15 +2398,16 @@ function WeatherWidget({lat,lng,squadName}){
   return <Card padding={20}>
     <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
       <div>
-        <div style={{display:'flex',alignItems:'center',gap:4,fontSize:12.5,color:t.mid,fontWeight:500}}>{Ico.pin(t.mid,12)} {squadName||'Local Area'}{cacheLabel&&<span style={{marginLeft:6,fontSize:11,color:t.faint,fontWeight:400}}>{fromCache?'cached ':'updated '}{cacheLabel}</span>}</div>
+        <div style={{display:'flex',alignItems:'center',gap:4,fontSize:12.5,color:t.mid,fontWeight:500}}>{Ico.pin(t.mid,12)} {squadName||'Local Area'}</div>
         <div style={{display:'flex',alignItems:'baseline',gap:6,marginTop:6}}>
           <span style={{fontSize:30,fontWeight:700,color:t.ink,letterSpacing:-0.6,lineHeight:1}}>{tempStr}</span>
           {wx?.temp!=null&&<span style={{fontSize:13,color:t.mid}}>C</span>}
           <span style={{fontSize:14,color:t.mid,marginLeft:4}}>{condStr}</span>
         </div>
         <div style={{fontSize:11.5,color:t.softInk,marginTop:3}}>H: {hiStr}  L: {loStr}</div>
+        {cacheLabel&&<div style={{fontSize:10,color:t.faint,marginTop:5}}>{fromCache?'Cached ':'Updated '}{cacheLabel}</div>}
       </div>
-      {wxIco(wx?.icon,t.mid,32)}
+      {wxIco(wx?.icon,t.mid,42)}
     </div>
     {showRiver&&<div style={{marginTop:8,background:t.soft,borderRadius:10,padding:'8px 10px',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
       <div style={{display:'flex',alignItems:'center',gap:7,fontSize:12.5,color:t.mid,fontWeight:500}}>{Ico.wave(t.mid,14)} Macdonald River</div>
@@ -2560,7 +2561,7 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
       </div>
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:14,marginTop:14}}>
         <GlanceTile icon={Ico.pulse(lav,18)} value={yearTreatments.length} label={<span>Treatments<br/>({year})</span>}/>
-        <GlanceTile icon={Ico.team(lav,20)} value={volunteerCount} label="Active Volunteers"/>
+        <GlanceTile icon={Ico.team(lav,20)} value={volunteerCount} label="Squad Members"/>
         <GlanceTile icon={Ico.award(lav,20)} value={topContrib} label="Top Contributor"/>
       </div>
     </div>
@@ -2841,28 +2842,53 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
     leafletRef.current=map;
     // Tile layer is created by the satellite effect below (runs after this effect on mount)
     // Long press detection
+    // Desktop: use Leaflet mousedown/mouseup — e.latlng is always populated for mouse events.
+    // Mobile: use native DOM touchstart on the container and convert coords manually.
+    // Leaflet 1.9.x deprecated its internal Tap plugin so map.on('touchstart') no longer
+    // reliably provides e.latlng on iOS, causing the if(!e.latlng)return guard to silently bail.
     let pressTimer=null;
     let hasMoved=false;
-    const startPress=e=>{
+    const fireLongPress=(latlng)=>{
+      if(longPressMarkerRef.current){longPressMarkerRef.current.remove();}
+      const dotIcon=L.divIcon({html:`<div style="width:22px;height:22px;background:#2E5536;border:3px solid #fff;border-radius:50%;box-shadow:0 2px 10px rgba(46,85,54,0.5)"></div>`,className:'',iconSize:[22,22],iconAnchor:[11,11]});
+      longPressMarkerRef.current=L.marker([latlng.lat,latlng.lng],{icon:dotIcon,zIndexOffset:1000}).addTo(map);
+      setLongPressMenu({lat:latlng.lat,lng:latlng.lng});
+    };
+    // Desktop mouse long-press (600 ms hold)
+    const onMouseDown=e=>{
       hasMoved=false;
       if(!e.latlng)return;
       const latlng=e.latlng;
-      pressTimer=setTimeout(()=>{
-        if(!hasMoved){
-          if(longPressMarkerRef.current){longPressMarkerRef.current.remove();}
-          const dotIcon=L.divIcon({html:`<div style="width:22px;height:22px;background:#2E5536;border:3px solid #fff;border-radius:50%;box-shadow:0 2px 10px rgba(46,85,54,0.5)"></div>`,className:'',iconSize:[22,22],iconAnchor:[11,11]});
-          longPressMarkerRef.current=L.marker([latlng.lat,latlng.lng],{icon:dotIcon,zIndexOffset:1000}).addTo(map);
-          setLongPressMenu({lat:latlng.lat,lng:latlng.lng});
-        }
-      },600);
+      pressTimer=setTimeout(()=>{if(!hasMoved)fireLongPress(latlng);},600);
     };
     const cancelPress=()=>{clearTimeout(pressTimer);};
     const moveCancel=()=>{hasMoved=true;clearTimeout(pressTimer);};
-    map.on('mousedown',startPress);
-    map.on('touchstart',startPress);
-    map.on('mouseup touchend',cancelPress);
-    map.on('mousemove touchmove',moveCancel);
-    return()=>{map.remove();leafletRef.current=null;};
+    map.on('mousedown',onMouseDown);
+    map.on('mouseup',cancelPress);
+    map.on('mousemove',moveCancel);
+    // Native touch long-press — bypasses Leaflet's event layer so latlng conversion
+    // is done manually via containerPointToLatLng.
+    const container=map.getContainer();
+    const onTouchStart=e=>{
+      if(e.touches.length!==1)return; // ignore multi-touch
+      hasMoved=false;
+      const touch=e.touches[0];
+      const rect=container.getBoundingClientRect();
+      const pt=L.point(touch.clientX-rect.left,touch.clientY-rect.top);
+      const latlng=map.containerPointToLatLng(pt);
+      pressTimer=setTimeout(()=>{if(!hasMoved)fireLongPress(latlng);},600);
+    };
+    const onTouchMove=()=>{hasMoved=true;clearTimeout(pressTimer);};
+    const onTouchEnd=()=>clearTimeout(pressTimer);
+    container.addEventListener('touchstart',onTouchStart,{passive:true});
+    container.addEventListener('touchmove',onTouchMove,{passive:true});
+    container.addEventListener('touchend',onTouchEnd,{passive:true});
+    return()=>{
+      container.removeEventListener('touchstart',onTouchStart);
+      container.removeEventListener('touchmove',onTouchMove);
+      container.removeEventListener('touchend',onTouchEnd);
+      map.remove();leafletRef.current=null;
+    };
   },[]);
 
   // Tile layer effect — runs on mount (after init effect) and on satellite toggle.
@@ -3117,6 +3143,8 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
   const [search,setSearch]=useState('');
   const [pendingDelete,setPendingDelete]=useState(null); // wombat awaiting confirm
   const [editingWombat,setEditingWombat]=useState(null); // wombat being edited
+  const PAGE_SIZE=20;
+  const [visibleCount,setVisibleCount]=useState(PAGE_SIZE);
   const activeWombats=data.wombats.filter(w=>!isInactive(w));
   const inactiveWombats=data.wombats.filter(isInactive);
   const myId=authUser?.id;
@@ -3146,6 +3174,10 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
   // canAct: admins can act on any record; volunteers can act on their own records
   // or on unowned records (created offline before auth was set up).
   const canAct=w=>isAdmin||!w._createdBy||w._createdBy===authUser?.id;
+  // Reset pagination whenever the visible set changes
+  useEffect(()=>{setVisibleCount(PAGE_SIZE);},[search,filterStatus,sortBy]);
+  const visible=filtered.slice(0,visibleCount);
+  const hasMore=visibleCount<filtered.length;
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
     <Header title="All Wombats" subtitle={`Monitoring ${activeWombats.length} active wombat${activeWombats.length!==1?'s':''}`} showAvatar onAvatarClick={openProfile}>
       <SearchInHeader value={search} onChange={setSearch} placeholder="Search wombats…"/>
@@ -3176,7 +3208,7 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
     <div style={{padding:'0 var(--sp)',display:'flex',flexDirection:'column',gap:10}}>
       {filtered.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'40px 0',fontSize:14}}>No wombats found.</div>}
       {/* Active wombats */}
-      {filtered.filter(w=>!isInactive(w)).map(w=>{
+      {visible.filter(w=>!isInactive(w)).map(w=>{
         const lastTreat=data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0];
         const lastSight=data.sightings.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0];
         const lastT=(!lastTreat&&!lastSight)?null:(!lastTreat?lastSight:(!lastSight?lastTreat:(new Date(lastSight.at)>=new Date(lastTreat.at)?lastSight:lastTreat)));
@@ -3207,7 +3239,7 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
         </SwipeActions>;
       })}
       {/* Inactive wombats — shown in Inactive filter view */}
-      {filterStatus==='inactive'&&filtered.filter(isInactive).map(w=>{
+      {filterStatus==='inactive'&&visible.filter(isInactive).map(w=>{
         const profilePhoto=(data.wombatPhotos||[]).find(p=>p.wombatId===w.id&&p.isProfile);
         const isMissing=w.status==='missing';
         return <button key={w.id} onClick={()=>nav('wombat-profile',w.id)} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
@@ -3229,6 +3261,7 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
           </Card>
         </button>;
       })}
+      {hasMore&&<button onClick={()=>setVisibleCount(c=>Math.min(c+PAGE_SIZE,filtered.length))} style={{width:'100%',marginTop:4,padding:'13px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,color:t.mid,fontSize:13,fontWeight:600,cursor:'pointer'}}>Load {Math.min(PAGE_SIZE,filtered.length-visibleCount)} more…</button>}
     </div>
     <AcknowledgementFooter/>
     {pendingDelete&&<ConfirmModal
@@ -3638,7 +3671,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
       </>}
     </div>
     <AcknowledgementFooter/>
-    {showAddTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} onClose={()=>setShowAddTreatment(false)} onSave={(tr,photos=[],linkedBurrowId=null,statusChange=null)=>{dispatch({type:'ADD_TREATMENT',treatment:{...tr,markedRecovered:statusChange==='healthy'}});photos.forEach((p,i)=>dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+Date.now()+'_'+i,wombatId:w.id,dataUrl:p.dataUrl,isProfile:false,at:new Date().toISOString()}}));if(linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(statusChange)dispatch({type:'UPDATE_WOMBAT',id:w.id,patch:{status:statusChange}});setShowAddTreatment(false);}}/>}
+    {showAddTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} defaultBy={authProfile?.display_name||''} onClose={()=>setShowAddTreatment(false)} onSave={(tr,photos=[],linkedBurrowId=null,statusChange=null)=>{dispatch({type:'ADD_TREATMENT',treatment:{...tr,markedRecovered:statusChange==='healthy'}});photos.forEach((p,i)=>dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+Date.now()+'_'+i,wombatId:w.id,dataUrl:p.dataUrl,isProfile:false,at:new Date().toISOString()}}));if(linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(statusChange)dispatch({type:'UPDATE_WOMBAT',id:w.id,patch:{status:statusChange}});setShowAddTreatment(false);}}/>}
     {showMarkDeceased&&<MarkDeceasedModal wombat={w} onClose={()=>setShowMarkDeceased(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_INACTIVE',id:w.id,...patch});setShowMarkDeceased(false);}}/>}
     {showMarkMissing&&<MarkMissingModal wombat={w} lastTreatmentAt={data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0]?.at||null} onClose={()=>setShowMarkMissing(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_INACTIVE',id:w.id,...patch});setShowMarkMissing(false);}}/>}
     {showMarkActive&&<MarkActiveModal wombat={w} onClose={()=>setShowMarkActive(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_ACTIVE',id:w.id,...patch});setShowMarkActive(false);}}/>}
@@ -3657,6 +3690,8 @@ function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
   const [search,setSearch]=useState('');
   const [pendingDelete,setPendingDelete]=useState(null);
   const [editingBurrow,setEditingBurrow]=useState(null);
+  const PAGE_SIZE=20;
+  const [visibleCount,setVisibleCount]=useState(PAGE_SIZE);
   const filtered=data.burrows.filter(b=>{
     const ms=filterStatus==='all'||b.status===filterStatus;
     const mq=!search||b.name.toLowerCase().includes(search.toLowerCase());
@@ -3674,6 +3709,10 @@ function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
     return parseInt((b.code||'').slice(1)||'0')-parseInt((a.code||'').slice(1)||'0');
   });
   const canAct=b=>isAdmin||!b._createdBy||b._createdBy===authUser?.id;
+  // Reset pagination whenever the visible set changes
+  useEffect(()=>{setVisibleCount(PAGE_SIZE);},[search,filterStatus,sortBy]);
+  const visible=filtered.slice(0,visibleCount);
+  const hasMore=visibleCount<filtered.length;
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
     <Header title="Burrow Tracker" subtitle={`Monitoring ${data.burrows.length} burrows in your area`} showAvatar onAvatarClick={openProfile}>
       <SearchInHeader value={search} onChange={setSearch} placeholder="Search burrows…"/>
@@ -3696,7 +3735,7 @@ function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
     </div>
     <div style={{padding:'0 var(--sp)',display:'flex',flexDirection:'column',gap:10}}>
       {filtered.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'40px 0',fontSize:14}}>No burrows found.</div>}
-      {filtered.map(b=>{
+      {visible.map(b=>{
         const allowed=canAct(b);
         return <SwipeActions key={b.id}
           onEdit={allowed?()=>setEditingBurrow(b):null}
@@ -3717,6 +3756,7 @@ function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
           </button>
         </SwipeActions>;
       })}
+      {hasMore&&<button onClick={()=>setVisibleCount(c=>Math.min(c+PAGE_SIZE,filtered.length))} style={{width:'100%',marginTop:4,padding:'13px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,color:t.mid,fontSize:13,fontWeight:600,cursor:'pointer'}}>Load {Math.min(PAGE_SIZE,filtered.length-visibleCount)} more…</button>}
     </div>
     <AcknowledgementFooter/>
     {pendingDelete&&<ConfirmModal
@@ -3949,8 +3989,10 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
     if(m)onSquadReady({id:m.squad_id,name:m.squad_name,role:m.role,boundsSwLat:m.bounds_sw_lat,boundsSwLng:m.bounds_sw_lng,boundsNeLat:m.bounds_ne_lat,boundsNeLng:m.bounds_ne_lng,emergencyContacts:m.emergency_contacts||[]});
   };
 
+  const SQUAD_NAME_MAX=30;
   const handleCreate=async()=>{
     if(!squadName.trim()){setErr('Please enter a squad name.');return;}
+    if(squadName.trim().length>SQUAD_NAME_MAX){setErr(`Squad name must be ${SQUAD_NAME_MAX} characters or less.`);return;}
     setBusy(true);setErr(null);
     const{data,error}=await supa.rpc('create_squad',{p_name:squadName.trim(),p_description:squadDesc.trim()||null});
     if(error?.code==='23505'||error?.message?.toLowerCase().includes('unique')){setErr('A squad with that name already exists — please choose a different name.');setBusy(false);return;}
@@ -4050,10 +4092,14 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
         <div style={{fontSize:20,fontWeight:800,color:t.ink,marginBottom:20}}>Create your squad</div>
         <div style={{display:'flex',flexDirection:'column',gap:12,marginBottom:20}}>
           <div>
-            <div style={{fontSize:13,fontWeight:600,color:t.mid,marginBottom:6}}>Squad name *</div>
-            <input value={squadName} onChange={e=>setSquadName(e.target.value)}
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:6}}>
+              <div style={{fontSize:13,fontWeight:600,color:t.mid}}>Squad name *</div>
+              <div style={{fontSize:11,color:squadName.length>SQUAD_NAME_MAX?t.red||'#B95C4A':t.faint}}>{squadName.length}/{SQUAD_NAME_MAX}</div>
+            </div>
+            <input value={squadName} onChange={e=>setSquadName(e.target.value.slice(0,SQUAD_NAME_MAX))}
               placeholder="e.g. Macedon Ranges Wombat Watch"
-              style={{width:'100%',padding:'13px 14px',borderRadius:12,border:`1.5px solid ${t.div}`,background:t.surface,color:t.ink,fontSize:15,boxSizing:'border-box',outline:'none'}}/>
+              maxLength={SQUAD_NAME_MAX}
+              style={{width:'100%',padding:'13px 14px',borderRadius:12,border:`1.5px solid ${squadName.length>=SQUAD_NAME_MAX?t.red||'#B95C4A':t.div}`,background:t.surface,color:t.ink,fontSize:15,boxSizing:'border-box',outline:'none'}}/>
           </div>
           <div>
             <div style={{fontSize:13,fontWeight:600,color:t.mid,marginBottom:6}}>Description (optional)</div>
@@ -5607,9 +5653,9 @@ function MarkActiveModal({wombat,onClose,onSave}){
     </FormField>
   </ModalWrap>;
 }
-function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',onClose,onSave,burrows=[]}){
+function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',onClose,onSave,burrows=[],defaultBy=''}){
   const t=useTheme();
-  const savedUser=typeof localStorage!=='undefined'?localStorage.getItem(SK.userName)||'':'';
+  const savedUser=typeof localStorage!=='undefined'?localStorage.getItem(SK.userName)||defaultBy:'';
   const [form,setForm]=useState({at:today(),product:'cydectin',dose:'',method:'',severity:null,regions:{},by:savedUser,note:''});
   const [markRecovered,setMarkRecovered]=useState(false);
   const [attachedPhotos,setAttachedPhotos]=useState([]);
@@ -6952,6 +6998,12 @@ function App(){
   const [burrowSortBy,setBurrowSortBy]=useState('date_added');
   const [queueLen,setQueueLen]=useState(0);
   const refreshQueue=()=>{idbQueueCount().then(n=>setQueueLen(n)).catch(()=>{});};
+  // Heartbeat: re-read the IDB queue count every 3 s so the pending pill stays
+  // accurate even when a flush path doesn't explicitly call refreshQueue.
+  React.useEffect(()=>{
+    const id=setInterval(refreshQueue,3000);
+    return()=>clearInterval(id);
+  },[]);
   // Volunteer count — fetched once when online, cached in localStorage so the last
   // known value shows immediately on mount and when the device is offline. Lifted to
   // App level so it isn't reset to '—' every time the Dashboard tab is re-entered.
@@ -7290,19 +7342,20 @@ function App(){
     };
   },[authUser]);
 
-  // ── Volunteer count ───────────────────────────────────────────
-  // Fetched once on mount and re-fetched whenever online status changes to true.
-  // Result is cached in localStorage so the last known value shows immediately
-  // on startup and while offline (no flash to '—' on tab switch).
+  // ── Squad member count ───────────────────────────────────────
+  // Counts rows in squad_members for the current squad — re-fetched whenever the
+  // squad changes (squad switch) or we come back online. Cached so the last known
+  // value shows immediately on startup / while offline.
   React.useEffect(()=>{
-    if(!online||!authUser)return;
-    supa.rpc('volunteer_count').then(({data,error})=>{
-      if(!error&&data!=null){
-        setVolunteerCount(data);
-        try{localStorage.setItem(VOL_COUNT_KEY,String(data));}catch{}
-      }
-    });
-  },[online,authUser]);
+    if(!online||!authUser||!authSquad?.id)return;
+    supa.from('squad_members').select('user_id',{count:'exact',head:true}).eq('squad_id',authSquad.id)
+      .then(({count,error})=>{
+        if(!error&&count!=null){
+          setVolunteerCount(count);
+          try{localStorage.setItem(VOL_COUNT_KEY,String(count));}catch{}
+        }
+      });
+  },[online,authUser,authSquad?.id]);
 
   // ── Tab visibility re-sync ────────────────────────────────────
   // When the user switches back to this tab (e.g. after editing on their phone),
