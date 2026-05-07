@@ -1068,6 +1068,10 @@ const supa=window.supabase.createClient(SUPA_URL,SUPA_ANON);
 // to just that squad. Updated whenever authSquad changes in the App component.
 // Module-level so supaFullSync doesn't need the ID threaded through every call site.
 let _currentSquadId=null;
+// Monotonically-increasing counter — incremented at the start of every supaFullSync call.
+// If a newer sync starts while this one is in-flight, this sync becomes stale and returns
+// undefined rather than dispatching out-of-order data.
+let _syncSeq=0;
 
 // ── camelCase ↔ snake_case mappings ──────────────────────────
 const wombatToDb=(w,uid)=>({id:w.id,created_by:uid||null,squad_id:w.squadId||null,name:w.name,sex:w.sex||null,age_class:w.ageClass||null,status:w.status||null,severity:w.severity||{},burrow_ids:w.burrowIds||[],first_seen:w.firstSeen||null,location:w.location||null,lat:w.lat||null,lng:w.lng||null,notes:w.notes||null,code:w.code||null,location_label:w.locationLabel||null,inactive_at:w.inactiveAt||null,inactive_cause:w.inactiveCause||null,inactive_notes:w.inactiveNotes||null,assignees:w.assignees||[]});
@@ -1270,6 +1274,7 @@ async function flushQueue(userId){
   // polluting _lastSupaError with a network error before networkAbort kicks in.
   if(!navigator.onLine)return new Set();
   const uploadedPhotoIds=new Set(); // track photo IDs whose Storage upload succeeded
+  const lostPhotoIds=new Set();     // photo ops whose IDB blob was evicted before upload
   try{
     const q=await idbGetQueue();
     if(!q.length)return new Set();
@@ -1338,7 +1343,9 @@ async function flushQueue(userId){
         netErr=true; // uncaught exceptions are almost always network issues
       }
       if(skip){
-        // Discard — blob gone, nothing to push
+        // Discard — blob evicted from IDB before upload could happen. Record the loss
+        // so the caller can surface a user-facing warning.
+        lostPhotoIds.add(op.row?.id);
         await idbDequeueOp(op._qid);
       }else if(ok){
         // Mark successfully-pushed records as _sync:true in IDB so that future full syncs
@@ -1379,7 +1386,7 @@ async function flushQueue(userId){
       }
     }
   }catch(e){console.warn('[Queue] flush error',e);}
-  return uploadedPhotoIds;
+  return{uploadedPhotoIds,lostPhotoIds};
 }
 
 // ── Sync single action → Supabase ─────────────────────────────
@@ -1629,6 +1636,9 @@ function filterSyncToSquad(data,squadId){
 }
 
 async function supaFullSync(){
+  // Claim a sequence number. If another supaFullSync starts AFTER us, our result is stale
+  // and we return undefined rather than dispatching out-of-order data.
+  const _thisSeq=++_syncSeq;
   // Snapshot the active squad at the moment this sync starts.
   // If the user switches squads while fetches are in flight, _currentSquadId will
   // have changed by the time we filter — so we discard the stale result rather than
@@ -1725,6 +1735,12 @@ async function supaFullSync(){
   const filterSquadId=_squadIdAtStart||_currentSquadId;
   if(_squadIdAtStart&&_currentSquadId&&_squadIdAtStart!==_currentSquadId){
     console.info('[Squad] supaFullSync discarding stale result — squad changed mid-flight');
+    return undefined;
+  }
+  // If a newer supaFullSync started while we were fetching, our result is stale —
+  // the newer sync will dispatch fresher data so there is no value in dispatching ours.
+  if(_thisSeq!==_syncSeq){
+    console.info('[Sync] supaFullSync discarding stale result — newer sync in progress');
     return undefined;
   }
   return filterSyncToSquad({
@@ -4150,11 +4166,11 @@ function SquadAreaEditor({initialBounds,onSave,onCancel,saveLabel='Save Home Are
 // ── SWITCH SQUAD MODAL ───────────────────────────────────────────
 // Shown from ProfileSheet when the user belongs to multiple squads.
 // Lets god-mode admin swap between squads without signing out.
-function SwitchSquadModal({onClose,allSquads,currentSquadId,onSwitch}){
+function SwitchSquadModal({onClose,allSquads,currentSquadId,onSwitch,online}){
   const t=useTheme();
   const [switching,setSwitching]=useState(null); // id of squad being switched to
   const handleSwitch=async(sq)=>{
-    if(sq.id===currentSquadId)return;
+    if(sq.id===currentSquadId||!online)return;
     setSwitching(sq.id);
     await onSwitch(sq);
     setSwitching(null);
@@ -4169,12 +4185,16 @@ function SwitchSquadModal({onClose,allSquads,currentSquadId,onSwitch}){
         </button>
         <div style={{fontSize:17,fontWeight:700,color:t.ink}}>Switch Squad</div>
       </div>
+      {!online&&<div style={{margin:'0 16px 8px',padding:'8px 12px',background:t.amb50,borderRadius:10,display:'flex',alignItems:'center',gap:8,fontSize:12,color:t.amb700,fontWeight:600}}>
+        {Ico.wifiOff(t.amb700,13)} Switching squads requires an internet connection
+      </div>}
       <div style={{height:1,background:t.div,margin:'4px 20px 8px'}}/>
       {allSquads.map(sq=>{
         const active=sq.id===currentSquadId;
         const loading=switching===sq.id;
-        return <button key={sq.id} onClick={()=>handleSwitch(sq)} disabled={active||!!switching}
-          style={{display:'flex',alignItems:'center',gap:14,width:'100%',padding:'13px 20px',background:'none',border:'none',textAlign:'left',cursor:active?'default':'pointer',opacity:(switching&&!loading)?0.5:1}}>
+        const disabledBtn=active||!!switching||(!online&&!active);
+        return <button key={sq.id} onClick={()=>handleSwitch(sq)} disabled={disabledBtn}
+          style={{display:'flex',alignItems:'center',gap:14,width:'100%',padding:'13px 20px',background:'none',border:'none',textAlign:'left',cursor:(active||!online)?'default':'pointer',opacity:(switching&&!loading)?0.5:(!online&&!active)?0.45:1}}>
           <div style={{width:38,height:38,borderRadius:12,background:active?t.f100:t.soft,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>
             {loading
               ?<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={t.f700} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{animation:'spin 0.8s linear infinite'}}><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg>
@@ -4676,17 +4696,27 @@ function ExportSheet({data,onClose,onBack}){
   const exportFullCSV=async()=>{
     const zip=new JSZip();
     // Helper: get Storage public URL for a photo by id
-    const photoStorageUrl=(id)=>supa.storage.from('photos').getPublicUrl(`${id}.jpg`).data?.publicUrl||'';
+    // Returns the public Storage URL for a photo, or empty string if the photo hasn't
+    // been uploaded yet (offline/unsynced). Avoids broken links in the CSV.
+    const photoStorageUrl=(p)=>{
+      // If the record still has _sync:false the blob hasn't reached Supabase Storage yet —
+      // omit the URL so the CSV doesn't contain a link to a non-existent file.
+      if(p._sync===false)return '';
+      // If state already has a live https:// URL (post-migration or already uploaded), use it.
+      if(p.dataUrl?.startsWith('https://'))return p.dataUrl;
+      // Otherwise derive the standard Storage path from the photo ID.
+      return supa.storage.from('photos').getPublicUrl(`${p.id}.jpg`).data?.publicUrl||'';
+    };
     // Helper: build semicolon-separated photo URLs for a wombat/burrow (profile first)
     const wombatPhotoUrls=(wombatId)=>{
       const photos=(data.wombatPhotos||[]).filter(p=>p.wombatId===wombatId);
       const sorted=[...photos.filter(p=>p.isProfile||p.is_profile),...photos.filter(p=>!p.isProfile&&!p.is_profile)];
-      return sorted.map(p=>photoStorageUrl(p.id)).filter(Boolean).join(';');
+      return sorted.map(p=>photoStorageUrl(p)).filter(Boolean).join(';');
     };
     const burrowPhotoUrls=(burrowId)=>{
       const photos=(data.burrowPhotos||[]).filter(p=>p.burrowId===burrowId);
       const sorted=[...photos.filter(p=>p.isProfile||p.is_profile),...photos.filter(p=>!p.isProfile&&!p.is_profile)];
-      return sorted.map(p=>photoStorageUrl(p.id)).filter(Boolean).join(';');
+      return sorted.map(p=>photoStorageUrl(p)).filter(Boolean).join(';');
     };
     // Wombats
     const wHeaders=['WombatID','Code','Name','Status','Sex','AgeClass','Latitude','Longitude','Location','FirstSeen','Notes','PhotoURLs'];
@@ -7136,7 +7166,7 @@ function App(){
             const fresh=await resolveWithCurrentQueue(merged);
             const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
             const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
-            const synced={...fresh,wombats,burrows};
+            const synced=filterSyncToSquad({...fresh,wombats,burrows},_currentSquadId);
             dispatch({type:'REPLACE_ALL',data:synced});
             // Re-hydrate IDB photo data after the sync wipes dataUrls from state
             idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
@@ -7153,7 +7183,7 @@ function App(){
             dispatch({type:'REPLACE_ALL',data:{wombats:[],burrows:[],treatments:[],sightings:[],burrowLogs:[],wombatPhotos:[],burrowPhotos:[]}});
           }
           // merged===undefined means all queries failed (offline) — local state untouched
-          flushQueue(user.id).catch(()=>{});
+          flushQueue(user.id).then(r=>{if(r?.lostPhotoIds?.size)console.error('[Queue] Lost photos on login flush:',Array.from(r.lostPhotoIds));}).catch(()=>{});
         }).catch(e=>console.warn('[Supa] full sync error',e));
       }else{
         clearUserCache();
@@ -7178,11 +7208,11 @@ function App(){
           const fresh=await resolveWithCurrentQueue(merged);
           const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
           const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
-          const synced={...fresh,wombats,burrows};
+          const synced=filterSyncToSquad({...fresh,wombats,burrows},_currentSquadId);
           dispatch({type:'REPLACE_ALL',data:synced});
           idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
           cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
-            recoverBlankPhotos(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
+          recoverBlankPhotos(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
           changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
           changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
           geocodeBackfill(synced,dispatch);
@@ -7194,7 +7224,13 @@ function App(){
       // Capture uploaded photo IDs from flush so the post-flush sync can force-recache them
       let _uploadedPhotoIds=new Set();
       flushQueue(authUser.id)
-        .then(ids=>{if(ids instanceof Set)_uploadedPhotoIds=ids;})
+        .then(result=>{
+          if(result?.uploadedPhotoIds instanceof Set)_uploadedPhotoIds=result.uploadedPhotoIds;
+          if(result?.lostPhotoIds?.size){
+            console.error('[Queue] Photo blobs lost from device storage before upload:',Array.from(result.lostPhotoIds));
+            alert(`⚠️ ${result.lostPhotoIds.size} photo(s) could not be synced because the image data was removed from your device before uploading.\n\nThis can happen when your device storage is nearly full. Please re-take or re-add the affected photos.`);
+          }
+        })
         .catch(()=>{})
         .finally(()=>{
         refreshQueue();
@@ -7203,7 +7239,7 @@ function App(){
             const fresh=await resolveWithCurrentQueue(merged);
             const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
             const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
-            const synced={...fresh,wombats,burrows};
+            const synced=filterSyncToSquad({...fresh,wombats,burrows},_currentSquadId);
             dispatch({type:'REPLACE_ALL',data:synced});
             idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
             // Pass _uploadedPhotoIds so just-synced photos are force-recached into ww_photo_data
@@ -7225,7 +7261,7 @@ function App(){
     const drainInterval=setInterval(()=>{
       if(navigator.onLine&&authUser){
         idbQueueCount().then(n=>{
-          if(n>0)flushQueue(authUser.id).catch(()=>{}).finally(refreshQueue);
+          if(n>0)flushQueue(authUser.id).then(r=>{if(r?.lostPhotoIds?.size)console.error('[Queue] Lost photos on drain flush:',Array.from(r.lostPhotoIds));}).catch(()=>{}).finally(refreshQueue);
         }).catch(()=>{});
       }
     },30000); // every 30 seconds
@@ -7240,7 +7276,7 @@ function App(){
         const fresh=await resolveWithCurrentQueue(merged);
         const{records:wombats}=deduplicateCodes(fresh.wombats,'W');
         const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
-        const synced2={...fresh,wombats,burrows};
+        const synced2=filterSyncToSquad({...fresh,wombats,burrows},_currentSquadId);
         dispatch({type:'REPLACE_ALL',data:synced2});
         // Photos are stable between syncs — only hydrate from IDB, don't re-fetch from Storage
         idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
@@ -7309,7 +7345,7 @@ function App(){
     if(!navigator.serviceWorker)return;
     const handler=e=>{
       if(e.data?.type==='WW_FLUSH_QUEUE'&&authUser){
-        flushQueue(authUser.id).catch(()=>{}).finally(refreshQueue);
+        flushQueue(authUser.id).then(r=>{if(r?.lostPhotoIds?.size)console.error('[Queue] Lost photos on SW flush:',Array.from(r.lostPhotoIds));}).catch(()=>{}).finally(refreshQueue);
       }
     };
     navigator.serviceWorker.addEventListener('message',handler);
@@ -7413,11 +7449,13 @@ function App(){
       }else{
         // merged===undefined means all requests failed — we're offline.
         // Revert so the user keeps their cached data for the squad they were on.
+        _currentSquadId=prevSquad?.id||null; // must revert eagerly — useEffect fires too late
         cacheSquad(prevSquad);
         setAuthSquad(prevSquad);
         alert('You\'re offline — squad switching requires an internet connection. Your current squad data is still intact.');
       }
     }catch{
+      _currentSquadId=prevSquad?.id||null; // same — revert eagerly on error too
       cacheSquad(prevSquad);
       setAuthSquad(prevSquad);
     }finally{
@@ -7516,11 +7554,11 @@ function App(){
 
       {modal==='profile'&&<ProfileSheet onClose={()=>setModal(null)} onToggleTheme={toggleTheme} theme={theme} onEditProfile={()=>setModal('edit-profile')} onFAQ={()=>setModal('faq')} signedIn={signedIn} onToggleSignIn={toggleSignIn} data={data} onExport={()=>setModal('export')} onCSVImport={()=>setModal('csv-import')} authUser={authUser} authProfile={authProfile} authSquad={authSquad} onOpenSquad={()=>setModal('squad')} allSquads={allSquads} onSwitchSquad={()=>setModal('switch-squad')}/>}
       {modal==='squad'&&authUser&&<SquadModal onClose={()=>setModal(null)} onBack={()=>setModal('profile')} authSquad={authSquad} authUser={authUser} setAuthSquad={setAuthSquad} cacheSquad={cacheSquad} clearSquadCache={clearSquadCache}/>}
-      {modal==='switch-squad'&&allSquads.length>1&&<SwitchSquadModal onClose={()=>setModal(null)} allSquads={allSquads} currentSquadId={authSquad?.id} onSwitch={switchSquad}/>}
+      {modal==='switch-squad'&&allSquads.length>1&&<SwitchSquadModal onClose={()=>setModal(null)} allSquads={allSquads} currentSquadId={authSquad?.id} onSwitch={switchSquad} online={online}/>}
       {modal==='edit-profile'&&<EditProfileModal onClose={()=>setModal(null)}/>}
       {modal==='faq'&&<FAQSheet onClose={()=>setModal(null)} onBack={()=>setModal('profile')} squadContacts={authSquad?.emergencyContacts||[]}/>}
       {modal==='export'&&authProfile?.role==='admin'&&<ExportSheet data={data} onClose={()=>setModal(null)} onBack={()=>setModal('profile')}/>}
-      {modal==='csv-import'&&authProfile?.role==='admin'&&<CSVImportModal onClose={()=>setModal(null)} onImportWombats={wombats=>{syncDispatch({type:'IMPORT_WOMBATS',wombats});nav('wombats');}} onImportBurrows={burrows=>{syncDispatch({type:'IMPORT_BURROWS',burrows});nav('burrows');}}/>}
+      {modal==='csv-import'&&authProfile?.role==='admin'&&<CSVImportModal onClose={()=>setModal(null)} onImportWombats={wombats=>{syncDispatch({type:'IMPORT_WOMBATS',wombats:wombats.map(w=>({...w,squadId:authSquad?.id||null}))});nav('wombats');}} onImportBurrows={burrows=>{syncDispatch({type:'IMPORT_BURROWS',burrows:burrows.map(b=>({...b,squadId:authSquad?.id||null}))});nav('burrows');}}/>}
       {modal==='fab'&&<FABSheet onClose={()=>setModal(null)} onSelect={fabSelect}/>}
       {modal==='add-wombat'&&<AddWombatModal burrows={data.burrows} initialLocation={addAtLoc} nextCode={nextWombatCode(data.wombats)} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(w,linkedBurrowId,photo)=>{syncDispatch({type:'ADD_WOMBAT',wombat:{...w,squadId:authSquad?.id||null},linkedBurrowId:linkedBurrowId||null});if(linkedBurrowId)syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(photo)syncDispatch({type:'ADD_WOMBAT_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('wombat-profile',w.id);}}/>}
       {modal==='add-burrow'&&<AddBurrowModal initialLocation={addAtLoc} nextCode={nextBurrowCode(data.burrows)} wombats={data.wombats} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(b,photo)=>{syncDispatch({type:'ADD_BURROW',burrow:{...b,squadId:authSquad?.id||null}});(b.wombatIds||[]).forEach(wId=>syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:wId,burrowId:b.id}));if(photo)syncDispatch({type:'ADD_BURROW_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('burrow-profile',b.id);}}/>}
