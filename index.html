@@ -533,6 +533,7 @@ const SK={
   signedIn:     'ww_signed_in',    // boolean — was user signed in at last launch
   offlineSaved: 'ww_offlineSaved', // boolean — offline-mode intro seen
   streak:       'ww_streak',       // { count: number, weekKey: string } — volunteer streak
+  wombatOrder:  'ww_wombat_order', // string[] — custom wombat sort order (IDs)
 };
 const load=()=>{try{return{
   wombats:JSON.parse(localStorage.getItem(SK.w))||[],
@@ -1068,6 +1069,11 @@ const supa=window.supabase.createClient(SUPA_URL,SUPA_ANON);
 // to just that squad. Updated whenever authSquad changes in the App component.
 // Module-level so supaFullSync doesn't need the ID threaded through every call site.
 let _currentSquadId=null;
+// Midpoint of the active squad's bounding box — used as the default map centre in
+// MapPickerModal when no existing coordinates are pre-filled. Updated alongside
+// _currentSquadId so every modal opens at the right place without prop-threading.
+let _squadCenter=null; // {lat,lng} or null
+const _computeSquadCenter=sq=>(sq?.boundsSwLat!=null&&sq?.boundsNeLat!=null?{lat:(sq.boundsSwLat+sq.boundsNeLat)/2,lng:(sq.boundsSwLng+sq.boundsNeLng)/2}:null);
 // Monotonically-increasing counter — incremented at the start of every supaFullSync call.
 // If a newer sync starts while this one is in-flight, this sync becomes stale and returns
 // undefined rather than dispatching out-of-order data.
@@ -1500,6 +1506,7 @@ async function syncAction(action,userId){
         break;
       }
       case'ADD_TREATMENT':  await push('treatments', treatmentToDb(action.treatment,userId)); break;
+      case'EDIT_TREATMENT': await push('treatments', treatmentToDb(action.treatment,userId)); break;
       case'DELETE_TREATMENT': await del('treatments',action.treatmentId); break;
       // Sightings are not an active UI feature — no volunteer-facing flow creates them.
       // These cases are kept so existing sighting seed data syncs correctly if it
@@ -1598,6 +1605,13 @@ async function syncAction(action,userId){
         if(w)await push('wombats',wombatToDb({...w,burrowIds:[...(w.burrowIds||[]).filter(id=>id!==action.burrowId),action.burrowId]},userId));
         const b=await fromIdb('b',action.burrowId);
         if(b)await push('burrows',burrowToDb({...b,wombatIds:[...(b.wombatIds||[]).filter(id=>id!==action.wombatId),action.wombatId]},userId));
+        break;
+      }
+      case'UNLINK_WOMBAT_BURROW': {
+        const w=await fromIdb('w',action.wombatId);
+        if(w)await push('wombats',wombatToDb({...w,burrowIds:(w.burrowIds||[]).filter(id=>id!==action.burrowId)},userId));
+        const b=await fromIdb('b',action.burrowId);
+        if(b)await push('burrows',burrowToDb({...b,wombatIds:(b.wombatIds||[]).filter(id=>id!==action.wombatId)},userId));
         break;
       }
       default:break;
@@ -2258,7 +2272,7 @@ function ModalWrap({title,subtitle,onClose,onSave,saveLabel='Save',saveStyle={},
 function AcknowledgementFooter(){
   const t=useTheme();
   return <div style={{marginTop:24,padding:'0 var(--sp) 8px',textAlign:'center',fontSize:11.5,color:t.softInk,lineHeight:1.6,fontStyle:'italic'}}>
-    WombatWatch acknowledges the Dharug and Darkinjung peoples as the Traditional Custodians of the Country on which we live, work and care for Country's creatures.
+    WombatWatch acknowledges the Traditional Custodians of the Country on which we live, work and care for Country's creatures. Always was, always will be Aboriginal Land.
   </div>;
 }
 
@@ -3112,7 +3126,7 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
     {selected&&!longPressMenu&&<div style={{position:'absolute',left:20,right:20,zIndex:1000,bottom:'var(--screen-pb)',display:'flex',justifyContent:'center'}}>
       <Card padding={14} style={{width:'100%',maxWidth:300}}>
         <div style={{display:'flex',gap:12,alignItems:'center'}}>
-          {selected._type==='wombat'?<WAvatar size={50}/>:<BurrowAvatar size={50}/>}
+          {(()=>{if(selected._type!=='wombat')return <BurrowAvatar size={50}/>;const ph=data.wombatPhotos.find(p=>p.wombatId===selected.id&&p.isProfile);return <WAvatar size={50} photoUrl={ph?.dataUrl||null} photoId={ph?.id||null}/>;})()}
           <div style={{flex:1,minWidth:0}}>
             <div style={{display:'flex',alignItems:'center',gap:8}}>
               <span style={{fontSize:17,fontWeight:700,color:t.ink}}>{selected.name}</span>
@@ -3137,29 +3151,38 @@ const selStyle=(t)=>({flex:1,height:38,borderRadius:19,background:t.surface,boxS
    WombatList:    searchable list of all wombats.
    WombatProfile: detail view — health, treatments, sightings, photos.
 ════════════════════════════════════════════════════════════════ */
-function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,filterStatus,setFilterStatus,sortBy,setSortBy}){
+function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,filterStatus,setFilterStatus,sortBy,setSortBy,customOrder=[],onSaveOrder}){
   const t=useTheme();
   const isAdmin=authProfile?.role==='admin';
   const [search,setSearch]=useState('');
-  const [pendingDelete,setPendingDelete]=useState(null); // wombat awaiting confirm
-  const [editingWombat,setEditingWombat]=useState(null); // wombat being edited
-  const PAGE_SIZE=20;
-  const [visibleCount,setVisibleCount]=useState(PAGE_SIZE);
+  const [pendingDelete,setPendingDelete]=useState(null);
+  const [editingWombat,setEditingWombat]=useState(null);
+  const [reordering,setReordering]=useState(false);
   const activeWombats=data.wombats.filter(w=>!isInactive(w));
   const inactiveWombats=data.wombats.filter(isInactive);
   const myId=authUser?.id;
-  // mineCount and the 'mine' filter case are kept ready for when the assignment UI
-  // is re-enabled (search "ASSIGNMENT UI HIDDEN"). Harmless while toggle is hidden.
   const mineCount=data.wombats.filter(w=>!isInactive(w)&&(w.assignees||[]).some(a=>a.userId===myId)).length;
+
+  const saveOrder=ids=>{if(onSaveOrder)onSaveOrder(ids);};
+
+  const customSort=(list)=>[...list].sort((a,b)=>{
+    const oa=customOrder.indexOf(a.id),ob=customOrder.indexOf(b.id);
+    if(oa===-1&&ob===-1)return 0;
+    if(oa===-1)return 1;
+    if(ob===-1)return -1;
+    return oa-ob;
+  });
+
   const filtered=data.wombats.filter(w=>{
     const active=!isInactive(w);
     if(filterStatus==='mine') return (w.assignees||[]).some(a=>a.userId===myId);
     if(filterStatus==='inactive') return !active;
     if(filterStatus!=='active'&&w.status!==filterStatus) return false;
-    if(!active) return false; // default active-only views exclude inactive
+    if(!active) return false;
     const mq=!search||w.name.toLowerCase().includes(search.toLowerCase());
     return mq;
   }).slice().sort((a,b)=>{
+    if(sortBy==='custom'){const oa=customOrder.indexOf(a.id),ob=customOrder.indexOf(b.id);if(oa===-1&&ob===-1)return 0;if(oa===-1)return 1;if(ob===-1)return -1;return oa-ob;}
     if(sortBy==='location') return (a.location||'').localeCompare(b.location||'');
     if(sortBy==='last_treated'){
       const at=data.treatments.filter(x=>x.wombatId===a.id).sort((p,q)=>new Date(q.at)-new Date(p.at))[0]?.at||'';
@@ -3168,57 +3191,108 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
     }
     const dd=new Date(b.firstSeen||0)-new Date(a.firstSeen||0);
     if(dd!==0)return dd;
-    // Tiebreak by code number descending so same-day additions show newest first
     return parseInt((b.code||'').slice(1)||'0')-parseInt((a.code||'').slice(1)||'0');
   });
-  // canAct: admins can act on any record; volunteers can act on their own records
-  // or on unowned records (created offline before auth was set up).
+
+  // Reorder list = all active wombats in current custom order (filters/search ignored)
+  const reorderList=customSort(activeWombats);
+
+  const moveUp=id=>{
+    const ids=reorderList.map(w=>w.id);
+    const i=ids.indexOf(id);
+    if(i<=0)return;
+    const n=[...ids];[n[i-1],n[i]]=[n[i],n[i-1]];saveOrder(n);
+  };
+  const moveDown=id=>{
+    const ids=reorderList.map(w=>w.id);
+    const i=ids.indexOf(id);
+    if(i>=ids.length-1)return;
+    const n=[...ids];[n[i],n[i+1]]=[n[i+1],n[i]];saveOrder(n);
+  };
+  const enterReorder=()=>{
+    if(customOrder.length===0)saveOrder(activeWombats.map(w=>w.id));
+    setReordering(true);
+  };
+
   const canAct=w=>isAdmin||!w._createdBy||w._createdBy===authUser?.id;
-  // Reset pagination whenever the visible set changes
-  useEffect(()=>{setVisibleCount(PAGE_SIZE);},[search,filterStatus,sortBy]);
-  const visible=filtered.slice(0,visibleCount);
-  const hasMore=visibleCount<filtered.length;
+
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
     <Header title="All Wombats" subtitle={`Monitoring ${activeWombats.length} active wombat${activeWombats.length!==1?'s':''}`} showAvatar onAvatarClick={openProfile}>
-      <SearchInHeader value={search} onChange={setSearch} placeholder="Search wombats…"/>
+      {!reordering&&<SearchInHeader value={search} onChange={setSearch} placeholder="Search wombats…"/>}
     </Header>
-    <div style={{padding:'16px var(--sp) 0'}}>
+    {!reordering&&<div style={{padding:'16px var(--sp) 0'}}>
       <div style={{display:'flex',gap:8}}>
         <StatChip count={activeWombats.filter(w=>w.status==='healthy').length} label="Healthy" tone="sage" active={filterStatus==='healthy'} onClick={()=>setFilterStatus('healthy')}/>
         <StatChip count={activeWombats.filter(w=>w.status==='under_treatment').length} label="Treatment" tone="amber" active={filterStatus==='under_treatment'} onClick={()=>setFilterStatus('under_treatment')}/>
         <StatChip count={inactiveWombats.length} label="Inactive" tone="rose" active={filterStatus==='inactive'} onClick={()=>setFilterStatus('inactive')}/>
         <StatChip count={activeWombats.length} label="All Active" tone="pearl" active={filterStatus==='active'} onClick={()=>setFilterStatus('active')}/>
       </div>
-    </div>
+    </div>}
     <div style={{padding:'12px var(--sp) 10px',display:'flex',alignItems:'center',gap:8}}>
-      {Ico.sort(t.mid,17)}
-      <select value={sortBy} onChange={e=>setSortBy(e.target.value)} style={selStyle(t)}>
+      {!reordering&&<>{Ico.sort(t.mid,17)}
+      <select value={sortBy} onChange={e=>{setSortBy(e.target.value);setReordering(false);}} style={selStyle(t)}>
         <option value="date_added">Date Added</option>
         <option value="location">Location</option>
         <option value="last_treated">Last Treated</option>
-      </select>
-      {/* ASSIGNMENT UI HIDDEN — re-enable when rolling out volunteer assignment feature
-      <button onClick={()=>setFilterStatus(filterStatus==='mine'?'active':'mine')}
-        style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:5,padding:'6px 12px',borderRadius:999,border:`1.5px solid ${filterStatus==='mine'?t.lav500:t.div}`,background:filterStatus==='mine'?t.lav100:'none',color:filterStatus==='mine'?t.lav500:t.mid,fontSize:12.5,fontWeight:600,cursor:'pointer',whiteSpace:'nowrap',transition:'all 0.15s'}}>
-        {Ico.person(filterStatus==='mine'?t.lav500:t.mid,13)}
-        My wombats{mineCount>0?` · ${mineCount}`:''}
-      </button>
-      */}
+        <option value="custom">Custom</option>
+      </select></>}
+      {reordering&&<div style={{fontSize:13,color:t.mid,fontWeight:500}}>Drag wombats into your preferred order</div>}
+      {sortBy==='custom'&&!reordering&&<button onClick={enterReorder} style={{marginLeft:'auto',padding:'6px 14px',borderRadius:8,border:`1.5px solid ${t.div}`,background:'none',color:t.mid,fontSize:12.5,fontWeight:600,cursor:'pointer'}}>Reorder</button>}
+      {reordering&&<button onClick={()=>setReordering(false)} style={{marginLeft:'auto',padding:'6px 14px',borderRadius:8,border:`1.5px solid ${t.f700}`,background:t.f700,color:'#fff',fontSize:12.5,fontWeight:700,cursor:'pointer'}}>Done</button>}
+      {/* ASSIGNMENT UI HIDDEN */}
     </div>
-    <div style={{padding:'0 var(--sp)',display:'flex',flexDirection:'column',gap:10}}>
-      {filtered.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'40px 0',fontSize:14}}>No wombats found.</div>}
-      {/* Active wombats */}
-      {visible.filter(w=>!isInactive(w)).map(w=>{
-        const lastTreat=data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0];
-        const lastSight=data.sightings.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0];
-        const lastT=(!lastTreat&&!lastSight)?null:(!lastTreat?lastSight:(!lastSight?lastTreat:(new Date(lastSight.at)>=new Date(lastTreat.at)?lastSight:lastTreat)));
-        const profilePhoto=(data.wombatPhotos||[]).find(p=>p.wombatId===w.id&&p.isProfile);
-        const allowed=canAct(w);
-        return <SwipeActions key={w.id}
-          onEdit={allowed?()=>setEditingWombat(w):null}
-          onDelete={allowed?()=>setPendingDelete(w):null}
-        >
-          <button onClick={()=>nav('wombat-profile',w.id)} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
+    <div style={{padding:'0 var(--sp)',display:'flex',flexDirection:'column',gap:reordering?0:10}}>
+      {reordering?(
+        reorderList.map((w,idx)=>(
+          <div key={w.id} style={{display:'flex',alignItems:'center',gap:10,padding:'11px 0',borderBottom:`1px solid ${t.div}`}}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:15,fontWeight:700,color:t.ink,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{w.name}</div>
+              {w.code&&<div style={{fontSize:11,color:t.softInk,fontFamily:'monospace',letterSpacing:0.5,marginTop:1}}>{w.code}</div>}
+            </div>
+            <Pill tone={statusTone(w.status)} size="sm">{statusLabel(w.status)}</Pill>
+            <button onClick={()=>moveUp(w.id)} disabled={idx===0}
+              style={{width:34,height:34,borderRadius:8,border:`1.5px solid ${t.div}`,background:'none',color:idx===0?t.faint:t.mid,fontSize:17,cursor:idx===0?'default':'pointer',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>↑</button>
+            <button onClick={()=>moveDown(w.id)} disabled={idx===reorderList.length-1}
+              style={{width:34,height:34,borderRadius:8,border:`1.5px solid ${t.div}`,background:'none',color:idx===reorderList.length-1?t.faint:t.mid,fontSize:17,cursor:idx===reorderList.length-1?'default':'pointer',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>↓</button>
+          </div>
+        ))
+      ):(
+        <>
+        {filtered.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'40px 0',fontSize:14}}>No wombats found.</div>}
+        {filtered.filter(w=>!isInactive(w)).map(w=>{
+          const lastTreat=data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0];
+          const lastSight=data.sightings.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0];
+          const lastT=(!lastTreat&&!lastSight)?null:(!lastTreat?lastSight:(!lastSight?lastTreat:(new Date(lastSight.at)>=new Date(lastTreat.at)?lastSight:lastTreat)));
+          const profilePhoto=(data.wombatPhotos||[]).find(p=>p.wombatId===w.id&&p.isProfile);
+          const allowed=canAct(w);
+          return <SwipeActions key={w.id}
+            onEdit={allowed?()=>setEditingWombat(w):null}
+            onDelete={allowed?()=>setPendingDelete(w):null}
+          >
+            <button onClick={()=>nav('wombat-profile',w.id)} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
+              <Card padding={16} style={{border:`1px solid rgba(45,95,63,0.1)`}}>
+                <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
+                  <WAvatar size={72} photoUrl={profilePhoto?.dataUrl} photoId={profilePhoto?.id}/>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:8}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:17,fontWeight:700,color:t.ink,lineHeight:1.2,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{w.name}</div>
+                        {w.code&&<div style={{fontSize:11,fontWeight:600,color:t.softInk,fontFamily:'monospace',letterSpacing:0.6,marginTop:1}}>{w.code}</div>}
+                      </div>
+                      <Pill tone={statusTone(w.status)} size="sm">{statusLabel(w.status)}</Pill>
+                    </div>
+                    <div style={{marginTop:7}}><LocPill>{w.locationLabel||(isCodeLike(w.location)?null:w.location)||data.burrows.find(b=>w.burrowIds?.includes(b.id)&&b.location)?.location||'Unknown location'}</LocPill></div>
+                    <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12.5,color:t.mid,marginTop:7}}>{Ico.cal(t.mid,13)} Last seen {lastT?fmtDate(lastT.at):'—'}</div>
+                  </div>
+                </div>
+              </Card>
+            </button>
+          </SwipeActions>;
+        })}
+        {filterStatus==='inactive'&&filtered.filter(isInactive).map(w=>{
+          const profilePhoto=(data.wombatPhotos||[]).find(p=>p.wombatId===w.id&&p.isProfile);
+          const isMissing=w.status==='missing';
+          return <button key={w.id} onClick={()=>nav('wombat-profile',w.id)} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
             <Card padding={16} style={{border:`1px solid rgba(45,95,63,0.1)`}}>
               <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
                 <WAvatar size={72} photoUrl={profilePhoto?.dataUrl} photoId={profilePhoto?.id}/>
@@ -3231,37 +3305,14 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
                     <Pill tone={statusTone(w.status)} size="sm">{statusLabel(w.status)}</Pill>
                   </div>
                   <div style={{marginTop:7}}><LocPill>{w.locationLabel||(isCodeLike(w.location)?null:w.location)||data.burrows.find(b=>w.burrowIds?.includes(b.id)&&b.location)?.location||'Unknown location'}</LocPill></div>
-                  <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12.5,color:t.mid,marginTop:7}}>{Ico.cal(t.mid,13)} Last seen {lastT?fmtDate(lastT.at):'—'}</div>
+                  <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12.5,color:t.mid,marginTop:7}}>{Ico.cal(t.mid,13)} {isMissing?'Last seen':'Deceased'}: {fmtDate(w.inactiveAt)||'—'}</div>
                 </div>
               </div>
             </Card>
-          </button>
-        </SwipeActions>;
-      })}
-      {/* Inactive wombats — shown in Inactive filter view */}
-      {filterStatus==='inactive'&&visible.filter(isInactive).map(w=>{
-        const profilePhoto=(data.wombatPhotos||[]).find(p=>p.wombatId===w.id&&p.isProfile);
-        const isMissing=w.status==='missing';
-        return <button key={w.id} onClick={()=>nav('wombat-profile',w.id)} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
-          <Card padding={16} style={{border:`1px solid rgba(45,95,63,0.1)`}}>
-            <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
-              <WAvatar size={72} photoUrl={profilePhoto?.dataUrl} photoId={profilePhoto?.id}/>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:8}}>
-                  <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontSize:17,fontWeight:700,color:t.ink,lineHeight:1.2,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{w.name}</div>
-                    {w.code&&<div style={{fontSize:11,fontWeight:600,color:t.softInk,fontFamily:'monospace',letterSpacing:0.6,marginTop:1}}>{w.code}</div>}
-                  </div>
-                  <Pill tone={statusTone(w.status)} size="sm">{statusLabel(w.status)}</Pill>
-                </div>
-                <div style={{marginTop:7}}><LocPill>{w.locationLabel||(isCodeLike(w.location)?null:w.location)||data.burrows.find(b=>w.burrowIds?.includes(b.id)&&b.location)?.location||'Unknown location'}</LocPill></div>
-                <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12.5,color:t.mid,marginTop:7}}>{Ico.cal(t.mid,13)} {isMissing?'Last seen':'Deceased'}: {fmtDate(w.inactiveAt)||'—'}</div>
-              </div>
-            </div>
-          </Card>
-        </button>;
-      })}
-      {hasMore&&<button onClick={()=>setVisibleCount(c=>Math.min(c+PAGE_SIZE,filtered.length))} style={{width:'100%',marginTop:4,padding:'13px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,color:t.mid,fontSize:13,fontWeight:600,cursor:'pointer'}}>Load {Math.min(PAGE_SIZE,filtered.length-visibleCount)} more…</button>}
+          </button>;
+        })}
+        </>
+      )}
     </div>
     <AcknowledgementFooter/>
     {pendingDelete&&<ConfirmModal
@@ -3298,6 +3349,7 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
 function PhotoCell({photo,onReplace,onDelete,onSetProfile,labelDelete='Delete',setProfileLabel='Set profile',isProfile=false,newIdPrefix='ph_',t}){
   const [errored,setErrored]=React.useState(false);
   const [recoveredSrc,setRecoveredSrc]=React.useState(null);
+  const [viewing,setViewing]=React.useState(false);
   React.useEffect(()=>{
     setErrored(false);
     setRecoveredSrc(null);
@@ -3321,10 +3373,10 @@ function PhotoCell({photo,onReplace,onDelete,onSetProfile,labelDelete='Delete',s
     }).catch(()=>setErrored(true));
   },[photo.id]);
   const src=recoveredSrc||photo.dataUrl;
-  const cellStyle={width:'100%',height:'100%',objectFit:'cover',display:'block'};
+  const cellStyle={width:'100%',height:'100%',objectFit:'cover',display:'block',cursor:'zoom-in'};
   let inner;
   if(src&&!errored){
-    inner=<img src={src} style={cellStyle} alt="" onError={handleError}/>;
+    inner=<img src={src} style={cellStyle} alt="" onError={handleError} onClick={()=>setViewing(true)}/>;
   }else if(errored){
     // Photo exists on server but not cached locally — don't invite replacement
     inner=<div style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:6,padding:12,boxSizing:'border-box'}}>
@@ -3342,7 +3394,7 @@ function PhotoCell({photo,onReplace,onDelete,onSetProfile,labelDelete='Delete',s
       }}/>
     </label>;
   }
-  return <div style={{borderRadius:16,overflow:'hidden',position:'relative',background:t.soft,aspectRatio:'1'}}>
+  return <><div style={{borderRadius:16,overflow:'hidden',position:'relative',background:t.soft,aspectRatio:'1'}}>
     {inner}
     <div style={{position:'absolute',bottom:0,left:0,right:0,padding:'8px 8px 7px',background:'linear-gradient(transparent,rgba(0,0,0,0.72))',display:'flex',flexDirection:'column',gap:4}}>
       {photo.at&&<div style={{fontSize:10.5,color:'rgba(255,255,255,0.75)',fontWeight:500}}>{fmtDate(photo.at.slice(0,10))}</div>}
@@ -3354,7 +3406,14 @@ function PhotoCell({photo,onReplace,onDelete,onSetProfile,labelDelete='Delete',s
         <button onClick={onDelete} style={{width:26,height:26,borderRadius:13,background:'rgba(255,255,255,0.2)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>{Ico.trash('#fff',13)}</button>
       </div>
     </div>
-  </div>;
+  </div>
+  {viewing&&src&&<div onClick={()=>setViewing(false)} style={{position:'fixed',inset:0,zIndex:9000,background:'rgba(0,0,0,0.92)',display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+    <img src={src} style={{maxWidth:'100%',maxHeight:'100%',objectFit:'contain',borderRadius:8}} alt=""/>
+    <button onClick={()=>setViewing(false)} style={{position:'absolute',top:'max(20px,calc(var(--sat) + 12px))',right:20,width:36,height:36,borderRadius:18,background:'rgba(255,255,255,0.15)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+    </button>
+  </div>}
+  </>;
 }
 
 /* ── WOMBAT PROFILE ── */
@@ -3363,6 +3422,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
   const isAdmin=authProfile?.role==='admin';
   const [activeTab,setActiveTab]=useState(0);
   const [showAddTreatment,setShowAddTreatment]=useState(false);
+  const [editingTreatment,setEditingTreatment]=useState(null);
   const [expandedNotes,setExpandedNotes]=useState(new Set());
   const [editingNotes,setEditingNotes]=useState(false);
   const [noteDraft,setNoteDraft]=useState('');
@@ -3504,7 +3564,11 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
             const toggleNote=()=>setExpandedNotes(prev=>{const s=new Set(prev);s.has(tr.id)?s.delete(tr.id):s.add(tr.id);return s;});
             const noteLong=tr.note&&(tr.note.length>100||tr.note.includes('\n'));
             const trBurrow=tr.linkedBurrowId?data.burrows.find(b=>b.id===tr.linkedBurrowId):null;
-            return <SwipeToDelete key={i} onDelete={()=>dispatch({type:'DELETE_TREATMENT',treatmentId:tr.id})}>
+            const canEditTr=isAdmin||tr._createdBy===authUser?.id;
+            return <SwipeActions key={tr.id}
+              onEdit={canEditTr?()=>setEditingTreatment(tr):null}
+              onDelete={canEditTr?()=>dispatch({type:'DELETE_TREATMENT',treatmentId:tr.id}):null}
+            >
               <Card padding={16}>
                 <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:10}}>
                   <div style={{flex:1,minWidth:0}}>
@@ -3532,7 +3596,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
                   : <div style={{fontSize:13,color:t.mid,lineHeight:1.5}}>{tr.note}</div>
                 )}
               </Card>
-            </SwipeToDelete>;
+            </SwipeActions>;
           })}
         </div>
       </>}
@@ -3576,7 +3640,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
         <div style={{marginTop:14}}>
           {editingLocLabel
             ? <div style={{display:'flex',gap:8}}>
-                <input autoFocus value={locLabelDraft} onChange={e=>setLocLabelDraft(e.target.value)} placeholder="e.g. Jane's Place" style={{flex:1,height:42,borderRadius:12,background:t.soft,border:`1.5px solid ${t.div}`,padding:'0 12px',fontSize:14,color:t.ink,outline:'none'}}/>
+                <input autoFocus value={locLabelDraft} onChange={e=>setLocLabelDraft(e.target.value)} placeholder="e.g. Jane's Place" maxLength={40} style={{flex:1,height:42,borderRadius:12,background:t.soft,border:`1.5px solid ${t.div}`,padding:'0 12px',fontSize:14,color:t.ink,outline:'none'}}/>
                 <button onClick={()=>{dispatch({type:'UPDATE_WOMBAT',id:w.id,patch:{locationLabel:locLabelDraft.trim()||null}});setEditingLocLabel(false);}} style={{height:42,padding:'0 14px',borderRadius:12,background:t.f700,color:'#fff',fontSize:13,fontWeight:700,border:'none',cursor:'pointer'}}>Save</button>
                 <button onClick={()=>setEditingLocLabel(false)} style={{height:42,padding:'0 12px',borderRadius:12,background:t.soft,color:t.mid,fontSize:13,fontWeight:600,border:'none',cursor:'pointer'}}>Cancel</button>
               </div>
@@ -3616,8 +3680,8 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
                       }} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'10px 12px',background:'transparent',border:'none',textAlign:'left',borderBottom:`1px solid ${t.div}`,cursor:'pointer'}}>
                         <div style={{width:34,height:34,borderRadius:10,background:t.lav100,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>{Ico.burrow(t.lav500,16)}</div>
                         <div style={{flex:1,minWidth:0}}>
-                          <div style={{fontSize:13.5,fontWeight:600,color:t.ink}}>{b.name}</div>
-                          {b.location&&<div style={{fontSize:12,color:t.mid,marginTop:1}}>{b.location}</div>}
+                          <div style={{fontSize:13.5,fontWeight:600,color:t.ink,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{b.name}</div>
+                          {b.location&&<div style={{fontSize:12,color:t.mid,marginTop:1,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{b.location}</div>}
                         </div>
                         {w.burrowIds?.includes(b.id)&&<span style={{fontSize:11,fontWeight:600,color:t.f700,background:t.sage50,borderRadius:999,padding:'2px 8px',flexShrink:0}}>linked</span>}
                       </button>);
@@ -3653,25 +3717,31 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
           {burrows.length===0
             ? <div style={{fontSize:13,color:t.faint,paddingLeft:2}}>No burrows linked yet — add one via a treatment location.</div>
             : <div style={{display:'flex',flexDirection:'column',gap:8}}>
-                {burrows.map(b=><button key={b.id} onClick={()=>nav('burrow-profile',b.id)} style={{textAlign:'left',background:'none',border:'none',padding:0}}>
-                  <Card padding={14} style={{border:`1px solid ${t.div}`}}>
-                    <div style={{display:'flex',alignItems:'center',gap:10}}>
-                      <BurrowAvatar size={36}/>
-                      <div style={{flex:1,minWidth:0}}>
-                        <div style={{fontSize:14,fontWeight:700,color:t.ink,lineHeight:1.2}}>{b.name}</div>
-                        {b.location&&<div style={{fontSize:12,color:t.mid,marginTop:2}}>{b.location}</div>}
-                      </div>
-                      <Pill tone={burrowTone(b.status)} size="sm">{burrowStatusLabel(b.status)}</Pill>
-                    </div>
-                  </Card>
-                </button>)}
+                {burrows.map(b=>{
+                  const canUnlink=isAdmin||!w._createdBy||w._createdBy===authUser?.id;
+                  return <SwipeToDelete key={b.id} onDelete={canUnlink?()=>dispatch({type:'UNLINK_WOMBAT_BURROW',wombatId:w.id,burrowId:b.id}):null}>
+                    <button onClick={()=>nav('burrow-profile',b.id)} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
+                      <Card padding={14} style={{border:`1px solid ${t.div}`}}>
+                        <div style={{display:'flex',alignItems:'center',gap:10}}>
+                          <BurrowAvatar size={36}/>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontSize:14,fontWeight:700,color:t.ink,lineHeight:1.2,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{b.name}</div>
+                            {b.location&&<div style={{fontSize:12,color:t.mid,marginTop:2,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{b.location}</div>}
+                          </div>
+                          <Pill tone={burrowTone(b.status)} size="sm">{burrowStatusLabel(b.status)}</Pill>
+                        </div>
+                      </Card>
+                    </button>
+                  </SwipeToDelete>;
+                })}
               </div>
           }
         </div>
       </>}
     </div>
     <AcknowledgementFooter/>
-    {showAddTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} defaultBy={authProfile?.display_name||''} onClose={()=>setShowAddTreatment(false)} onSave={(tr,photos=[],linkedBurrowId=null,statusChange=null)=>{dispatch({type:'ADD_TREATMENT',treatment:{...tr,markedRecovered:statusChange==='healthy'}});photos.forEach((p,i)=>dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+Date.now()+'_'+i,wombatId:w.id,dataUrl:p.dataUrl,isProfile:false,at:new Date().toISOString()}}));if(linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(statusChange)dispatch({type:'UPDATE_WOMBAT',id:w.id,patch:{status:statusChange}});setShowAddTreatment(false);}}/>}
+    {showAddTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} defaultBy={authProfile?.display_name||''} onClose={()=>setShowAddTreatment(false)} onSave={(tr,photos=[],linkedBurrowId=null,statusChange=null)=>{dispatch({type:'ADD_TREATMENT',treatment:{...tr,markedRecovered:statusChange==='healthy'}});photos.forEach((p,i)=>dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+Date.now()+'_'+i,wombatId:w.id,dataUrl:p.dataUrl,isProfile:false,at:tr.at?new Date(tr.at).toISOString():new Date().toISOString()}}));if(linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(statusChange)dispatch({type:'UPDATE_WOMBAT',id:w.id,patch:{status:statusChange}});setShowAddTreatment(false);}}/>}
+    {editingTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} defaultBy={authProfile?.display_name||''} initialTreatment={editingTreatment} onClose={()=>setEditingTreatment(null)} onSave={(tr)=>{dispatch({type:'EDIT_TREATMENT',treatment:tr});if(tr.linkedBurrowId&&tr.linkedBurrowId!==editingTreatment.linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:tr.linkedBurrowId});setEditingTreatment(null);}}/>}
     {showMarkDeceased&&<MarkDeceasedModal wombat={w} onClose={()=>setShowMarkDeceased(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_INACTIVE',id:w.id,...patch});setShowMarkDeceased(false);}}/>}
     {showMarkMissing&&<MarkMissingModal wombat={w} lastTreatmentAt={data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0]?.at||null} onClose={()=>setShowMarkMissing(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_INACTIVE',id:w.id,...patch});setShowMarkMissing(false);}}/>}
     {showMarkActive&&<MarkActiveModal wombat={w} onClose={()=>setShowMarkActive(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_ACTIVE',id:w.id,...patch});setShowMarkActive(false);}}/>}
@@ -5416,14 +5486,11 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
     };
     if(initialLat){
       initMap(initialLat,initialLng,14);
-    }else if(navigator.geolocation){
-      initMap(-33.22,150.87,11); // operational area default
-      navigator.geolocation.getCurrentPosition(
-        pos=>{ if(leafRef.current)leafRef.current.setView([pos.coords.latitude,pos.coords.longitude],14); },
-        ()=>{},{timeout:4000,maximumAge:30000}
-      );
     }else{
-      initMap(-33.22,150.87,11);
+      // Use the squad's operational area centre if available, otherwise fall back to a
+      // sensible Australian default.  GPS auto-detect removed — use the GPS button instead.
+      const c=_squadCenter;
+      initMap(c?.lat??-33.22,c?.lng??150.87,11);
     }
     return()=>{if(leafRef.current){leafRef.current.remove();leafRef.current=null;}};
   },[]);
@@ -5653,14 +5720,15 @@ function MarkActiveModal({wombat,onClose,onSave}){
     </FormField>
   </ModalWrap>;
 }
-function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',onClose,onSave,burrows=[],defaultBy=''}){
+function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',onClose,onSave,burrows=[],defaultBy='',initialTreatment=null}){
   const t=useTheme();
+  const isEdit=!!initialTreatment;
   const savedUser=typeof localStorage!=='undefined'?localStorage.getItem(SK.userName)||defaultBy:'';
-  const [form,setForm]=useState({at:today(),product:'cydectin',dose:'',method:'',severity:null,regions:{},by:savedUser,note:''});
+  const [form,setForm]=useState(isEdit?{at:initialTreatment.at||today(),product:initialTreatment.product||'cydectin',dose:initialTreatment.dose||'',method:initialTreatment.method||'',severity:initialTreatment.severity||null,regions:initialTreatment.regions||{},by:initialTreatment.by||savedUser,note:initialTreatment.note||''}:{at:today(),product:'cydectin',dose:'',method:'',severity:null,regions:{},by:savedUser,note:''});
   const [markRecovered,setMarkRecovered]=useState(false);
   const [attachedPhotos,setAttachedPhotos]=useState([]);
-  const [location,setLocation]=useState(null);
-  const [linkedBurrow,setLinkedBurrow]=useState(null);
+  const [location,setLocation]=useState(isEdit?(initialTreatment.location||null):null);
+  const [linkedBurrow,setLinkedBurrow]=useState(()=>isEdit&&initialTreatment.linkedBurrowId?burrows.find(b=>b.id===initialTreatment.linkedBurrowId)||null:null);
   const [showMore,setShowMore]=useState(false);
   const [showMapPicker,setShowMapPicker]=useState(false);
   const [showAddressInput,setShowAddressInput]=useState(false);
@@ -5699,13 +5767,17 @@ function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',o
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={t.faint} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{transform:showMore?'rotate(180deg)':'none',transition:'transform 0.18s',flexShrink:0}}><path d="M6 9l6 6 6-6"/></svg>
     <div style={{flex:1,height:1,background:t.div}}/>
   </button>;
-  return <ModalWrap title="Add Treatment" subtitle={`Recording for ${wombatName||'wombat'}`} onClose={onClose} saveLabel="Save" onSave={()=>{
+  return <ModalWrap title={isEdit?'Edit Treatment':'Add Treatment'} subtitle={`${isEdit?'Editing':'Recording'} for ${wombatName||'wombat'}`} onClose={onClose} saveLabel="Save" onSave={()=>{
     if(!form.product)return alert('Please select a product.');
     if(!form.dose.trim())return alert('Please enter the dose or amount.');
     if(!form.by.trim())return alert('Please enter who applied the treatment.');
     localStorage.setItem(SK.userName,form.by.trim());
-    const statusChange=markRecovered?(wombatStatus==='healthy'?'under_treatment':'healthy'):null;
-    onSave({id:uid(),wombatId,...form,location:location||null,linkedBurrowId:linkedBurrow?.id||null,_sync:false},attachedPhotos,linkedBurrow?.id||null,statusChange);
+    if(isEdit){
+      onSave({...initialTreatment,...form,location:location||null,linkedBurrowId:linkedBurrow?.id||null,_sync:false},null,linkedBurrow?.id||null,null);
+    }else{
+      const statusChange=markRecovered?(wombatStatus==='healthy'?'under_treatment':'healthy'):null;
+      onSave({id:uid(),wombatId,...form,location:location||null,linkedBurrowId:linkedBurrow?.id||null,_sync:false},attachedPhotos,linkedBurrow?.id||null,statusChange);
+    }
   }}>
     <FormField label="Date" required><FInput type="date" value={form.at} onChange={v=>set('at',v)}/></FormField>
     <FormField label="Product" required><ChipPicker value={form.product} onChange={v=>set('product',v)} options={[{value:'cydectin',label:'Cydectin'},{value:'bravecto',label:'Bravecto'},{value:'other',label:'Other'}]}/></FormField>
@@ -5717,8 +5789,8 @@ function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',o
     </FormField>
     <FormField label="Applied by" required><FInput value={form.by} onChange={v=>set('by',v)} placeholder="Volunteer name" maxLength={24}/></FormField>
     <FormField label="Notes"><FTextarea value={form.note} onChange={v=>set('note',v)} placeholder="Observations, any changes noticed…" rows={2}/></FormField>
-    {/* Status toggle — flips meaning based on current wombat health */}
-    {(()=>{
+    {/* Status toggle — only shown when creating, not editing */}
+    {!isEdit&&(()=>{
       const isHealthy=wombatStatus==='healthy';
       const activeColor=isHealthy?'#A26B1E':'#3A6A42';
       const activeBg=isHealthy?'rgba(162,107,30,0.10)':'rgba(42,76,53,0.12)';
@@ -6362,6 +6434,7 @@ function reducer(state,action){
 
     // ── Treatments ───────────────────────────────────────────────
     case 'ADD_TREATMENT':{const treatments=[...state.treatments,{...action.treatment,_sync:false}];save('t',treatments);return{...state,treatments};}
+    case 'EDIT_TREATMENT':{const treatments=state.treatments.map(tr=>tr.id===action.treatment.id?{...action.treatment,_sync:false}:tr);save('t',treatments);return{...state,treatments};}
     case 'DELETE_TREATMENT':{const treatments=state.treatments.filter(tr=>tr.id!==action.treatmentId);save('t',treatments);return{...state,treatments};}
 
     // ── Sightings ────────────────────────────────────────────────
@@ -6442,6 +6515,13 @@ function reducer(state,action){
       const{wombatId,burrowId}=action;
       const wombats=state.wombats.map(w=>w.id===wombatId?{...w,burrowIds:[...(w.burrowIds||[]).filter(id=>id!==burrowId),burrowId],_sync:false}:w);
       const burrows=state.burrows.map(b=>b.id===burrowId?{...b,wombatIds:[...(b.wombatIds||[]).filter(id=>id!==wombatId),wombatId],_sync:false}:b);
+      save('w',wombats);save('b',burrows);
+      return{...state,wombats,burrows};
+    }
+    case 'UNLINK_WOMBAT_BURROW':{
+      const{wombatId,burrowId}=action;
+      const wombats=state.wombats.map(w=>w.id===wombatId?{...w,burrowIds:(w.burrowIds||[]).filter(id=>id!==burrowId),_sync:false}:w);
+      const burrows=state.burrows.map(b=>b.id===burrowId?{...b,wombatIds:(b.wombatIds||[]).filter(id=>id!==wombatId),_sync:false}:b);
       save('w',wombats);save('b',burrows);
       return{...state,wombats,burrows};
     }
@@ -6540,7 +6620,7 @@ function EditWombatModal({wombat,onClose,onSave}){
       {showMapPicker&&<MapPickerModal initialLat={location?.lat} initialLng={location?.lng} onClose={()=>setShowMapPicker(false)} onConfirm={async pos=>{setLocation(pos);setShowMapPicker(false);const loc=await reverseGeocode(pos.lat,pos.lng);if(loc)setLocation({...pos,address:loc});}}/>}
     </FormField>
     <FormField label="Location Nickname" hint="Optional friendly name shown instead of the GPS address (e.g. Jane's Place).">
-      <FInput value={form.locationLabel} onChange={v=>set('locationLabel',v)} placeholder="e.g. Jane's Place"/>
+      <FInput value={form.locationLabel} onChange={v=>set('locationLabel',v)} placeholder="e.g. Jane's Place" maxLength={40}/>
     </FormField>
     <FormField label="Notes"><FTextarea value={form.notes} onChange={v=>set('notes',v)} placeholder="Field observations…"/></FormField>
   </ModalWrap>;
@@ -6992,7 +7072,14 @@ function App(){
   const [mapCameraFilter,setMapCameraFilter]=useState(false);
   // Wombat list filter/sort state — survives tab switches, resets on page reload
   const [wombatFilterStatus,setWombatFilterStatus]=useState('active');
-  const [wombatSortBy,setWombatSortBy]=useState('date_added');
+  const [wombatSortBy,setWombatSortBy]=useState(()=>{try{return localStorage.getItem(SK.wombatOrder)?'custom':'date_added';}catch{return 'date_added';}});
+  // Custom wombat order — lifted here so it can be synced to/from Supabase profiles (account-level)
+  const [wombatCustomOrder,setWombatCustomOrder]=useState(()=>{try{return JSON.parse(localStorage.getItem(SK.wombatOrder))||[];}catch{return [];}});
+  const saveWombatOrder=(ids,userId=authUser?.id)=>{
+    setWombatCustomOrder(ids);
+    try{localStorage.setItem(SK.wombatOrder,JSON.stringify(ids));}catch{}
+    if(userId)supa.from('profiles').update({wombat_order:ids}).eq('id',userId).catch(()=>{});
+  };
   // Burrow list filter/sort state — survives tab switches, resets on page reload
   const [burrowFilterStatus,setBurrowFilterStatus]=useState('all');
   const [burrowSortBy,setBurrowSortBy]=useState('date_added');
@@ -7042,7 +7129,7 @@ function App(){
   // null = no squad (or not yet loaded). Object = squad loaded.
   // Also prime _currentSquadId eagerly from cache so supaFullSync filters
   // correctly on the very first run (before any useEffect fires).
-  const [authSquad,setAuthSquad]=useState(()=>{const c=getCachedSquad();if(c)_currentSquadId=c.id;return c;});
+  const [authSquad,setAuthSquad]=useState(()=>{const c=getCachedSquad();if(c){_currentSquadId=c.id;_squadCenter=_computeSquadCenter(c);}return c;});
   const [allSquads,setAllSquads]=useState(()=>getCachedAllSquads()||[]);
   // true once we've completed at least one squad fetch (online or from cache)
   const [squadChecked,setSquadChecked]=useState(()=>!!getCachedSquad());
@@ -7165,8 +7252,15 @@ function App(){
         // admin controls (delete buttons etc.) remain visible in the field.
         supa.from('profiles').select('*').eq('id',user.id).single()
           .then(({data:p,error})=>{
-            if(p&&!error){cacheProfile(p);setAuthProfile(p);}
-            else{const c=getCachedProfile();if(c)setAuthProfile(c);}
+            if(p&&!error){
+              cacheProfile(p);setAuthProfile(p);
+              // Sync account-level wombat sort order — Supabase is the source of truth
+              if(p.wombat_order?.length){
+                setWombatCustomOrder(p.wombat_order);
+                try{localStorage.setItem(SK.wombatOrder,JSON.stringify(p.wombat_order));}catch{}
+                setWombatSortBy(prev=>prev==='date_added'?'custom':prev);
+              }
+            }else{const c=getCachedProfile();if(c)setAuthProfile(c);}
           })
           .catch(()=>{const c=getCachedProfile();if(c)setAuthProfile(c);});
         // Load the user's squad (role + squad name). Falls back to cache when offline.
@@ -7459,8 +7553,8 @@ function App(){
   const toggleTheme=()=>{const nt=theme==='dark'?'light':'dark';setTheme(nt);localStorage.setItem(SK.theme,nt);};
   // Keep <html> data-theme in sync so CSS variables (including body background) work outside .app
   useEffect(()=>{document.documentElement.setAttribute('data-theme',theme);},[theme]);
-  // Keep the module-level squad ID in sync so supaFullSync always filters correctly
-  useEffect(()=>{_currentSquadId=authSquad?.id||null;},[authSquad]);
+  // Keep the module-level squad ID and centre in sync
+  useEffect(()=>{_currentSquadId=authSquad?.id||null;_squadCenter=_computeSquadCenter(authSquad);},[authSquad]);
   const toggleSignIn=async()=>{
     if(signedIn){
       explicitSignOut.current=true;
@@ -7479,6 +7573,7 @@ function App(){
     if(sq.id===authSquad?.id)return; // already active
     const prevSquad=authSquad; // keep reference in case we need to revert
     _currentSquadId=sq.id; // set eagerly so supaFullSync filters correctly
+    _squadCenter=_computeSquadCenter(sq);
     cacheSquad(sq);
     setAuthSquad(sq);
     setModal(null);
@@ -7503,12 +7598,14 @@ function App(){
         // merged===undefined means all requests failed — we're offline.
         // Revert so the user keeps their cached data for the squad they were on.
         _currentSquadId=prevSquad?.id||null; // must revert eagerly — useEffect fires too late
+        _squadCenter=_computeSquadCenter(prevSquad);
         cacheSquad(prevSquad);
         setAuthSquad(prevSquad);
         alert('You\'re offline — squad switching requires an internet connection. Your current squad data is still intact.');
       }
     }catch{
       _currentSquadId=prevSquad?.id||null; // same — revert eagerly on error too
+      _squadCenter=_computeSquadCenter(prevSquad);
       cacheSquad(prevSquad);
       setAuthSquad(prevSquad);
     }finally{
@@ -7590,15 +7687,18 @@ function App(){
   return <ThemeCtx.Provider value={t}>
     <div data-theme={theme} className="app">
       {/* Supabase sync progress bar */}
-      {syncing&&<div style={{position:'fixed',top:0,left:'max(0px,calc(50vw - 240px))',right:'max(0px,calc(50vw - 240px))',height:3,zIndex:9999,background:t.f700,transformOrigin:'left',animation:'syncBar 1.4s ease-in-out infinite'}}/>}
+      {syncing&&<div style={{position:'fixed',top:0,left:'max(0px,calc(50vw - 240px))',right:'max(0px,calc(50vw - 240px))',height:3,zIndex:9999,overflow:'hidden'}}>
+        <div style={{position:'absolute',top:0,left:0,right:0,bottom:0,background:'#fff',transformOrigin:'left',animation:'syncBar 1.4s ease-in-out infinite'}}/>
+      </div>}
       {/* ── content area: grows to fill space above the tab bar ── */}
       <div className="content-area">
         {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} queueLen={queueLen} openProfile={openProfile} streak={streak} volunteerCount={volunteerCount} squadLat={squadCenter?.lat} squadLng={squadCenter?.lng} squadName={authSquad?.name}/></div>}
         {screen==='activity'&&<div className="scroll noscroll"><ActivityScreen data={data} nav={nav}/></div>}
         {screen==='map'&&<MapScreen data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} theme={theme} onAddAt={onAddAt} wombatFilters={mapWombatFilters} setWombatFilters={setMapWombatFilters} burrowFilters={mapBurrowFilters} setBurrowFilters={setMapBurrowFilters} cameraFilter={mapCameraFilter} setCameraFilter={setMapCameraFilter} authSquad={authSquad}/>}
-        {screen==='wombats'&&<div className="scroll noscroll"><WombatList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile} filterStatus={wombatFilterStatus} setFilterStatus={setWombatFilterStatus} sortBy={wombatSortBy} setSortBy={setWombatSortBy}/></div>}
+        {/* Keep list mounted while profile is open so scroll position is preserved on back */}
+        {(screen==='wombats'||screen==='wombat-profile')&&<div className="scroll noscroll" style={{display:screen==='wombats'?'block':'none'}}><WombatList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile} filterStatus={wombatFilterStatus} setFilterStatus={setWombatFilterStatus} sortBy={wombatSortBy} setSortBy={setWombatSortBy} customOrder={wombatCustomOrder} onSaveOrder={saveWombatOrder}/></div>}
         {screen==='wombat-profile'&&<div className="scroll noscroll"><WombatProfile wombatId={selectedId} data={data} nav={nav} dispatch={syncDispatch} openProfile={openProfile} authProfile={authProfile} authUser={authUser}/></div>}
-        {screen==='burrows'&&<div className="scroll noscroll"><BurrowList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile} filterStatus={burrowFilterStatus} setFilterStatus={setBurrowFilterStatus} sortBy={burrowSortBy} setSortBy={setBurrowSortBy}/></div>}
+        {(screen==='burrows'||screen==='burrow-profile')&&<div className="scroll noscroll" style={{display:screen==='burrows'?'block':'none'}}><BurrowList data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} dispatch={syncDispatch} authUser={authUser} authProfile={authProfile} filterStatus={burrowFilterStatus} setFilterStatus={setBurrowFilterStatus} sortBy={burrowSortBy} setSortBy={setBurrowSortBy}/></div>}
         {screen==='burrow-profile'&&<div className="scroll noscroll"><BurrowProfile burrowId={selectedId} data={data} nav={nav} dispatch={syncDispatch} openProfile={openProfile} authProfile={authProfile}/></div>}
       </div>
       {/* ── single tab bar, pinned below content, never overlapping ── */}
