@@ -253,9 +253,9 @@ const uid=()=>{
   // Fallback for older browsers
   return'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==='x'?r:(r&0x3|0x8)).toString(16);});
 };
-const fmtDate=s=>{if(!s)return'—';const d=new Date(s);return`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;};
+const fmtDate=s=>{if(!s)return'—';const d=new Date(s);if(isNaN(d.getTime()))return'—';return`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;};
 // Like fmtDate but also shows time (h:mm AM/PM) when the string includes a time component.
-const fmtDateTime=s=>{if(!s)return'—';const hasTime=s.length>10&&s.includes('T')||s.includes(' ')&&s.split(' ')[1]?.includes(':');const d=new Date(s);const date=`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;if(!hasTime)return date;const h=d.getHours(),m=String(d.getMinutes()).padStart(2,'0');return`${date} ${h%12||12}:${m} ${h<12?'AM':'PM'}`;};
+const fmtDateTime=s=>{if(!s)return'—';const hasTime=s.length>10&&s.includes('T')||s.includes(' ')&&s.split(' ')[1]?.includes(':');const d=new Date(s);if(isNaN(d.getTime()))return'—';const date=`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;if(!hasTime)return date;const h=d.getHours(),m=String(d.getMinutes()).padStart(2,'0');return`${date} ${h%12||12}:${m} ${h<12?'AM':'PM'}`;};
 const timeAgo=s=>{if(!s)return'';const h=Math.floor((Date.now()-new Date(s))/36e5);if(h<1)return'Just now';if(h<24)return`${h}h ago`;const d=Math.floor(h/24);return d===1?'Yesterday':`${d}d ago`;};
 const today=()=>new Date().toISOString().slice(0,10);
 const statusTone=s=>({healthy:'sage',under_treatment:'amber',missing:'pearl',deceased:'rose'}[s]||'pearl');
@@ -625,7 +625,8 @@ async function idbDeletePhoto(id){
     const db=await openPhotoIdb();
     const tx=db.transaction('p','readwrite');
     tx.objectStore('p').delete(id);
-  }catch(e){}
+    await new Promise((res,rej)=>{tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);});
+  }catch(e){console.warn('[IDB] delete photo failed:',id,e);}
 }
 // Strip base64 dataUrls before saving to localStorage (they live in IDB instead).
 // Supabase Storage URLs (https://...) are small and safe to keep.
@@ -890,7 +891,7 @@ async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch,forcedI
           // (belt-and-suspenders alongside flushQueue/syncAction upsert paths)
           try{
             const tbl=p.wombatId?'wombat_photos':'burrow_photos';
-            supa.from(tbl).update({data_url:publicUrl}).eq('id',p.id).then(null,()=>{});
+            Promise.resolve(supa.from(tbl).update({data_url:publicUrl}).eq('id',p.id)).catch(e=>console.warn('[sync] photo url patch failed',e));
           }catch{}
           console.info('[Photo] cacheRemote: constructed-URL ok',p.id,'→',publicUrl.substring(0,60));
           return;
@@ -962,7 +963,7 @@ async function recoverBlankPhotos(wombatPhotos,burrowPhotos,dispatch){
         await idbPutPhoto(p.id,dataUrl);
         recovered[p.id]=dataUrl;
         // Patch the Supabase table row so future syncs don't re-introduce the blank
-        supa.from(p._table).update({data_url:publicUrl}).eq('id',p.id).then(null,()=>{});
+        Promise.resolve(supa.from(p._table).update({data_url:publicUrl}).eq('id',p.id)).catch(e=>console.warn('[sync] photo url patch failed',e));
         // Patch IDB so the recovered URL survives future syncs
         try{
           const rec=await idbGetOne(STORE[p._lk],p.id);
@@ -1033,10 +1034,12 @@ function touchStreak(){
 
 /* Compress an image File to a JPEG dataUrl ≤ maxPx wide/tall at the given quality */
 function compressImage(file,maxPx=1200,quality=0.75){
-  return new Promise(resolve=>{
+  return new Promise((resolve,reject)=>{
     const reader=new FileReader();
+    reader.onerror=e=>reject(e.target?.error||new Error('FileReader failed'));
     reader.onload=ev=>{
       const img=new Image();
+      img.onerror=e=>reject(new Error('Image decode failed'));
       img.onload=()=>{
         let{width:w,height:h}=img;
         if(w>maxPx||h>maxPx){const s=maxPx/Math.max(w,h);w=Math.round(w*s);h=Math.round(h*s);}
@@ -2352,7 +2355,7 @@ function WeatherWidget({lat,lng,squadName}){
           icon: info.icon,
         };
         if(!dead){setWx(freshWx);setFromCache(false);}
-      }catch(e){ if(!dead&&!wx) setWx(false); }
+      }catch(e){ if(!dead) setWx(v=>v||false); }
     };
 
     // ── River height: BOM FWO JSON for St Albans at Espie St (061353) ──
@@ -2472,7 +2475,7 @@ function ActivityScreen({data,nav,dispatch}){
               <div style={{fontSize:15,fontWeight:700,color:t.ink}}>{b?.name||'Unknown Burrow'}</div>
               <div style={{fontSize:12,color:t.mid,marginTop:2}}>Status change · {fmtDate(a.at)}</div>
             </div>
-            <Pill tone={burrowTone(a.status)} size="sm">{a.status.charAt(0).toUpperCase()+a.status.slice(1)}</Pill>
+            <Pill tone={burrowTone(a.status)} size="sm">{(a.status||'').charAt(0).toUpperCase()+(a.status||'').slice(1)}</Pill>
           </Card>;
         }
         if(a.type==='wombat_added'){
@@ -2549,7 +2552,7 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
   const yearTreatments=treatments.filter(x=>x.at&&x.at.startsWith(String(year)));
   const allByEntries=[...treatments,...data.burrowLogs].map(x=>x.by).filter(Boolean);
   const byContributor=allByEntries.reduce((acc,name)=>{acc[name]=(acc[name]||0)+1;return acc;},{});
-  const topContrib=Object.entries(byContributor).sort((a,b)=>b[1]-a[1])[0]?.[0]||'—';
+  const topContrib=(Object.entries(byContributor).sort((a,b)=>b[1]-a[1])[0]?.[0]||'—').split(' ')[0];
   const lav=t.lav500;
   const allWombats=data.wombats; // all wombats (incl. inactive) for activity lookups
   const allActivity=[
@@ -3175,8 +3178,14 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
 
   const filtered=data.wombats.filter(w=>{
     const active=!isInactive(w);
-    if(filterStatus==='mine') return (w.assignees||[]).some(a=>a.userId===myId);
-    if(filterStatus==='inactive') return !active;
+    if(filterStatus==='mine'){
+      if(!(w.assignees||[]).some(a=>a.userId===myId))return false;
+      return !search||w.name.toLowerCase().includes(search.toLowerCase());
+    }
+    if(filterStatus==='inactive'){
+      if(active)return false;
+      return !search||w.name.toLowerCase().includes(search.toLowerCase());
+    }
     if(filterStatus!=='active'&&w.status!==filterStatus) return false;
     if(!active) return false;
     const mq=!search||w.name.toLowerCase().includes(search.toLowerCase());
@@ -3448,7 +3457,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
     const file=e.target.files?.[0];if(!file)return;
     e.target.value='';
     compressImage(file).then(dataUrl=>{
-      const photo={id:'ph_'+Date.now(),wombatId:w.id,dataUrl,isProfile:photos.length===0,at:new Date().toISOString()};
+      const photo={id:'ph_'+uid(),wombatId:w.id,dataUrl,isProfile:photos.length===0,at:new Date().toISOString()};
       dispatch({type:'ADD_WOMBAT_PHOTO',photo});
     });
   };
@@ -3610,7 +3619,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
             isProfile={p.isProfile}
             onReplace={dataUrl=>{
               dispatch({type:'DELETE_WOMBAT_PHOTO',photoId:p.id});
-              dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+Date.now(),wombatId:w.id,dataUrl,isProfile:p.isProfile,at:new Date().toISOString()}});
+              dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+uid(),wombatId:w.id,dataUrl,isProfile:p.isProfile,at:new Date().toISOString()}});
             }}
             onSetProfile={()=>dispatch({type:'SET_PROFILE_PHOTO',photoId:p.id,wombatId:w.id})}
             onDelete={()=>dispatch({type:'DELETE_WOMBAT_PHOTO',photoId:p.id})}
@@ -3740,7 +3749,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
       </>}
     </div>
     <AcknowledgementFooter/>
-    {showAddTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} defaultBy={authProfile?.display_name||''} onClose={()=>setShowAddTreatment(false)} onSave={(tr,photos=[],linkedBurrowId=null,statusChange=null)=>{dispatch({type:'ADD_TREATMENT',treatment:{...tr,markedRecovered:statusChange==='healthy'}});photos.forEach((p,i)=>dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+Date.now()+'_'+i,wombatId:w.id,dataUrl:p.dataUrl,isProfile:false,at:tr.at?new Date(tr.at).toISOString():new Date().toISOString()}}));if(linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(statusChange)dispatch({type:'UPDATE_WOMBAT',id:w.id,patch:{status:statusChange}});setShowAddTreatment(false);}}/>}
+    {showAddTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} defaultBy={authProfile?.display_name||''} onClose={()=>setShowAddTreatment(false)} onSave={(tr,photos=[],linkedBurrowId=null,statusChange=null)=>{dispatch({type:'ADD_TREATMENT',treatment:{...tr,markedRecovered:statusChange==='healthy'}});photos.forEach((p,i)=>dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+uid()+'_'+i,wombatId:w.id,dataUrl:p.dataUrl,isProfile:false,at:tr.at?new Date(tr.at).toISOString():new Date().toISOString()}}));if(linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(statusChange)dispatch({type:'UPDATE_WOMBAT',id:w.id,patch:{status:statusChange}});setShowAddTreatment(false);}}/>}
     {editingTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} defaultBy={authProfile?.display_name||''} initialTreatment={editingTreatment} onClose={()=>setEditingTreatment(null)} onSave={(tr)=>{dispatch({type:'EDIT_TREATMENT',treatment:tr});if(tr.linkedBurrowId&&tr.linkedBurrowId!==editingTreatment.linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:tr.linkedBurrowId});setEditingTreatment(null);}}/>}
     {showMarkDeceased&&<MarkDeceasedModal wombat={w} onClose={()=>setShowMarkDeceased(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_INACTIVE',id:w.id,...patch});setShowMarkDeceased(false);}}/>}
     {showMarkMissing&&<MarkMissingModal wombat={w} lastTreatmentAt={data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0]?.at||null} onClose={()=>setShowMarkMissing(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_INACTIVE',id:w.id,...patch});setShowMarkMissing(false);}}/>}
@@ -3885,7 +3894,7 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
     const file=e.target.files?.[0];if(!file)return;
     e.target.value='';
     compressImage(file).then(dataUrl=>{
-      const photo={id:'bph_'+Date.now(),burrowId:b.id,dataUrl,isProfile:bPhotos.length===0,at:new Date().toISOString()};
+      const photo={id:'bph_'+uid(),burrowId:b.id,dataUrl,isProfile:bPhotos.length===0,at:new Date().toISOString()};
       dispatch({type:'ADD_BURROW_PHOTO',photo});
     });
   };
@@ -4008,7 +4017,7 @@ function BurrowProfile({burrowId,data,nav,dispatch,authProfile}){
             isProfile={p.isProfile}
             onReplace={dataUrl=>{
               dispatch({type:'DELETE_BURROW_PHOTO',photoId:p.id});
-              dispatch({type:'ADD_BURROW_PHOTO',photo:{id:'bph_'+Date.now(),burrowId:b.id,dataUrl,isProfile:p.isProfile,at:new Date().toISOString()}});
+              dispatch({type:'ADD_BURROW_PHOTO',photo:{id:'bph_'+uid(),burrowId:b.id,dataUrl,isProfile:p.isProfile,at:new Date().toISOString()}});
             }}
             onSetProfile={()=>dispatch({type:'SET_BURROW_PROFILE_PHOTO',photoId:p.id,burrowId:b.id})}
             onDelete={()=>dispatch({type:'DELETE_BURROW_PHOTO',photoId:p.id})}
@@ -4051,12 +4060,19 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
   const [createdSquadId,setCreatedSquadId]=useState(null);
 
   const fetchSquadAndFinish=async()=>{
-    const{data:{user}}=await supa.auth.getUser();
-    if(!user)return;
-    // get_my_squad() is SECURITY DEFINER — avoids RLS circular dependency
-    const{data:rows}=await supa.rpc('get_my_squad');
-    const m=rows?.[0];
-    if(m)onSquadReady({id:m.squad_id,name:m.squad_name,role:m.role,boundsSwLat:m.bounds_sw_lat,boundsSwLng:m.bounds_sw_lng,boundsNeLat:m.bounds_ne_lat,boundsNeLng:m.bounds_ne_lng,emergencyContacts:m.emergency_contacts||[]});
+    try{
+      const{data:authData,error:authError}=await supa.auth.getUser();
+      if(authError)throw authError;
+      const user=authData?.user;
+      if(!user)return;
+      // get_my_squad() is SECURITY DEFINER — avoids RLS circular dependency
+      const{data:rows,error:squadError}=await supa.rpc('get_my_squad');
+      if(squadError)throw squadError;
+      const m=rows?.[0];
+      if(m)onSquadReady({id:m.squad_id,name:m.squad_name,role:m.role,boundsSwLat:m.bounds_sw_lat,boundsSwLng:m.bounds_sw_lng,boundsNeLat:m.bounds_ne_lat,boundsNeLng:m.bounds_ne_lng,emergencyContacts:m.emergency_contacts||[]});
+    }catch(e){
+      setErr('Could not load squad: '+(e?.message||'Unknown error'));
+    }
   };
 
   const SQUAD_NAME_MAX=30;
@@ -4358,7 +4374,7 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
   useEffect(()=>{
     if(!isAdmin||!authSquad?.id)return;
     setLoadingInvites(true);
-    supa.from('squad_invites').select('*').eq('squad_id',authSquad.id).order('created_at',{ascending:false})
+    Promise.resolve(supa.from('squad_invites').select('*').eq('squad_id',authSquad.id).order('created_at',{ascending:false}))
       .then(({data})=>{setInvites(data||[]);setLoadingInvites(false);})
       .catch(()=>setLoadingInvites(false));
   },[isAdmin,authSquad?.id]);
@@ -4366,17 +4382,23 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
   const loadMembers=async()=>{
     if(!authSquad?.id)return;
     setLoadingMembers(true);
-    const{data}=await supa.from('squad_members')
-      .select('user_id,role,profile:profiles(display_name)')
-      .eq('squad_id',authSquad.id);
-    // Sort: admins first, then alphabetically by display name
-    const sorted=(data||[]).sort((a,b)=>{
-      if(a.role==='admin'&&b.role!=='admin')return -1;
-      if(b.role==='admin'&&a.role!=='admin')return 1;
-      return(a.profile?.display_name||'').localeCompare(b.profile?.display_name||'');
-    });
-    setMembers(sorted);
-    setLoadingMembers(false);
+    try{
+      const{data,error}=await supa.from('squad_members')
+        .select('user_id,role,profile:profiles(display_name)')
+        .eq('squad_id',authSquad.id);
+      if(error)throw error;
+      // Sort: admins first, then alphabetically by display name
+      const sorted=(data||[]).sort((a,b)=>{
+        if(a.role==='admin'&&b.role!=='admin')return -1;
+        if(b.role==='admin'&&a.role!=='admin')return 1;
+        return(a.profile?.display_name||'').localeCompare(b.profile?.display_name||'');
+      });
+      setMembers(sorted);
+    }catch(e){
+      console.warn('[Squad] loadMembers failed',e);
+    }finally{
+      setLoadingMembers(false);
+    }
   };
 
   const handleRemoveMember=async(userId,name)=>{
@@ -4407,7 +4429,8 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
 
   const handleRevoke=async(inviteId)=>{
     if(!window.confirm('Revoke this invite link? Anyone who has the link will no longer be able to join.'))return;
-    await supa.from('squad_invites').delete().eq('id',inviteId);
+    const{error}=await supa.from('squad_invites').delete().eq('id',inviteId);
+    if(error){alert('Could not revoke invite: '+error.message);return;}
     setInvites(prev=>prev.filter(i=>i.id!==inviteId));
   };
 
@@ -4418,11 +4441,17 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
 
   const handleSaveContacts=async()=>{
     setSavingContacts(true);
-    await supa.rpc('update_squad_emergency_contacts',{p_squad_id:authSquad.id,p_contacts:contacts});
-    const updated={...authSquad,emergencyContacts:contacts};
-    setAuthSquad(updated);cacheSquad(updated);
-    setSavingContacts(false);
-    setPage('main');
+    try{
+      const{error}=await supa.rpc('update_squad_emergency_contacts',{p_squad_id:authSquad.id,p_contacts:contacts});
+      if(error)throw error;
+      const updated={...authSquad,emergencyContacts:contacts};
+      setAuthSquad(updated);cacheSquad(updated);
+      setPage('main');
+    }catch(e){
+      alert('Could not save contacts: '+(e?.message||'Unknown error'));
+    }finally{
+      setSavingContacts(false);
+    }
   };
 
   const handleAddContact=()=>{
@@ -4649,7 +4678,8 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
       <SquadAreaEditor
         initialBounds={authSquad?.boundsSwLat!=null?{swLat:authSquad.boundsSwLat,swLng:authSquad.boundsSwLng,neLat:authSquad.boundsNeLat,neLng:authSquad.boundsNeLng}:null}
         onSave={async(b)=>{
-          await supa.rpc('update_squad_bounds',{p_squad_id:authSquad.id,p_sw_lat:b.swLat,p_sw_lng:b.swLng,p_ne_lat:b.neLat,p_ne_lng:b.neLng});
+          const{error}=await supa.rpc('update_squad_bounds',{p_squad_id:authSquad.id,p_sw_lat:b.swLat,p_sw_lng:b.swLng,p_ne_lat:b.neLat,p_ne_lng:b.neLng});
+          if(error){alert('Could not save home area: '+error.message);return;}
           const updated={...authSquad,boundsSwLat:b.swLat,boundsSwLng:b.swLng,boundsNeLat:b.neLat,boundsNeLng:b.neLng};
           setAuthSquad(updated);cacheSquad(updated);
           setShowAreaEditor(false);
@@ -5750,9 +5780,7 @@ function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',o
   const set=(k,v)=>setForm(f=>({...f,[k]:v}));
   const handleAttach=e=>{
     Array.from(e.target.files||[]).forEach(file=>{
-      const r=new FileReader();
-      r.onload=ev=>setAttachedPhotos(ps=>[...ps,{dataUrl:ev.target.result}]);
-      r.readAsDataURL(file);
+      compressImage(file).then(dataUrl=>setAttachedPhotos(ps=>[...ps,{dataUrl}])).catch(()=>alert('Could not attach photo — please try a different image.'));
     });
     e.target.value='';
   };
@@ -6082,10 +6110,10 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
     const lng=linkedBurrow?linkedBurrow.lng:location?.lng??null;
     const locationStr=linkedBurrow?linkedBurrow.location:(location?.locality||location?.address||null);
     const wId=uid();
-    const photo=photoDataUrl?{id:'ph_'+Date.now(),wombatId:wId,dataUrl:photoDataUrl,isProfile:true,at:new Date().toISOString()}:null;
+    const photo=photoDataUrl?{id:'ph_'+uid(),wombatId:wId,dataUrl:photoDataUrl,isProfile:true,at:new Date().toISOString()}:null;
     onSave({id:wId,code:nextCode,...form,severity:{},lat,lng,location:locationStr,burrowIds:linkedBurrow?[linkedBurrow.id]:[],_sync:false},linkedBurrow?.id||null,photo);
   }}>
-    <FormField label="Name" required><FInput value={form.name} onChange={v=>set('name',v)} placeholder="e.g. Walter"/></FormField>
+    <FormField label="Name" required><FInput value={form.name} onChange={v=>set('name',v)} placeholder="e.g. Walter" maxLength={40}/></FormField>
     <FormField label="Sex">
       <ChipPicker value={form.sex} onChange={v=>set('sex',v)} options={[{value:'M',label:'Male'},{value:'F',label:'Female'},{value:'unknown',label:'Unknown'}]}/>
     </FormField>
@@ -6183,6 +6211,7 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
   const filteredW=wombats.filter(w=>w.name.toLowerCase().includes(wSearch.toLowerCase()));
   const toggleWombat=id=>setForm(f=>({...f,wombatIds:f.wombatIds.includes(id)?f.wombatIds.filter(x=>x!==id):[...f.wombatIds,id]}));
   const [location,setLocation]=useState(initialLocation);
+  const [locFailed,setLocFailed]=useState(false);
   const [showMapPicker,setShowMapPicker]=useState(false);
   const [showGeoSearch,setShowGeoSearch]=useState(false);
   const [showMore,setShowMore]=useState(false);
@@ -6190,26 +6219,29 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
   const set=(k,v)=>setForm(f=>({...f,[k]:v}));
   const useCurrentLocation=()=>{
     if(!navigator.geolocation)return alert('Geolocation is not available on this device.');
+    setLocFailed(false);
     navigator.geolocation.getCurrentPosition(
       async pos=>{
+        setLocFailed(false);
         const lat=pos.coords.latitude,lng=pos.coords.longitude;
         setLocation({lat,lng});
         const locality=await reverseGeocode(lat,lng);
         if(locality)setLocation({lat,lng,address:locality});
       },
-      ()=>alert('Could not get your location. Please check permissions.')
+      ()=>{setLocFailed(true);alert('Could not get your location. Please check permissions.');}
     );
   };
   useEffect(()=>{
     if(!initialLocation&&navigator.geolocation){
       navigator.geolocation.getCurrentPosition(
         async pos=>{
+          setLocFailed(false);
           const lat=pos.coords.latitude,lng=pos.coords.longitude;
           setLocation({lat,lng});
           const locality=await reverseGeocode(lat,lng);
           if(locality)setLocation({lat,lng,address:locality});
         },
-        ()=>{}
+        ()=>setLocFailed(true)
       );
     }
   },[]);
@@ -6219,10 +6251,10 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
     if(!location)return alert('Please add a location.');
     const{substrate,vegetation,notes,trailCamera,orientation,entranceHeightCm,entranceWidthCm,...rest}=form;
     const bId=uid();
-    const photo=photoDataUrl?{id:'ph_'+Date.now(),burrowId:bId,dataUrl:photoDataUrl,isProfile:true,at:new Date().toISOString()}:null;
+    const photo=photoDataUrl?{id:'ph_'+uid(),burrowId:bId,dataUrl:photoDataUrl,isProfile:true,at:new Date().toISOString()}:null;
     onSave({id:bId,code:nextCode,...rest,orientation:orientation||undefined,entranceHeightCm:entranceHeightCm?Number(entranceHeightCm):undefined,entranceWidthCm:entranceWidthCm?Number(entranceWidthCm):undefined,lat:location.lat??null,lng:location.lng??null,location:location.locality||location.address||null,habitat:{substrate,vegetation,notes,trailCamera},wombatIds:form.wombatIds||[],_sync:false},photo);
   }}>
-    <FormField label="Name" required><FInput value={form.name} onChange={v=>set('name',v)} placeholder="e.g. Burrow Zeta"/></FormField>
+    <FormField label="Name" required><FInput value={form.name} onChange={v=>set('name',v)} placeholder="e.g. Burrow Zeta" maxLength={40}/></FormField>
     <FormField label="Status" required>
       <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'active',label:'Active'},{value:'inactive',label:'Inactive'},{value:'damaged',label:'Damaged'}]}/>
     </FormField>
@@ -6254,6 +6286,7 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
                   </button>
                 </div>
             }
+            {locFailed&&!location&&<div style={{fontSize:12,color:'#B95C4A',marginTop:2}}>📍 GPS unavailable — please use Map or Address to add a location.</div>}
           </div>
       }
       {showMapPicker&&<MapPickerModal initialLat={location?.lat} initialLng={location?.lng} onClose={()=>setShowMapPicker(false)} onConfirm={async pos=>{setLocation(pos);setShowMapPicker(false);const locality=await reverseGeocode(pos.lat,pos.lng);if(locality)setLocation({...pos,address:locality});}}/>}
@@ -6385,7 +6418,7 @@ function reducer(state,action){
     // ASSIGNMENT FEATURE — UI hidden pending rollout (search "ASSIGNMENT UI HIDDEN").
     // Reducer + sync layer fully implemented; syncAction pushes these as wombat upserts
     // (not RPCs) so they flow through the offline queue correctly.
-    case 'ASSIGN_WOMBAT':{const wombats=state.wombats.map(w=>w.id===action.wombatId?{...w,assignees:[...(w.assignees||[]),{userId:action.userId,name:action.name}],_sync:false}:w);save('w',wombats);return{...state,wombats};}
+    case 'ASSIGN_WOMBAT':{const wombats=state.wombats.map(w=>w.id===action.wombatId?{...w,assignees:[...(w.assignees||[]).filter(a=>a.userId!==action.userId),{userId:action.userId,name:action.name}],_sync:false}:w);save('w',wombats);return{...state,wombats};}
     case 'UNASSIGN_WOMBAT':{const wombats=state.wombats.map(w=>w.id===action.wombatId?{...w,assignees:(w.assignees||[]).filter(a=>a.userId!==action.userId),_sync:false}:w);save('w',wombats);return{...state,wombats};}
     // _sync:false ensures local version wins on next supaFullSync merge even if the
     // page is refreshed before the async Supabase push completes (edit never gets lost).
@@ -6580,7 +6613,7 @@ function EditWombatModal({wombat,onClose,onSave}){
       locationLabel:form.locationLabel.trim()||null,
     });
   }}>
-    <FormField label="Name" required><FInput value={form.name} onChange={v=>set('name',v)} placeholder="e.g. Walter"/></FormField>
+    <FormField label="Name" required><FInput value={form.name} onChange={v=>set('name',v)} placeholder="e.g. Walter" maxLength={40}/></FormField>
     <FormField label="Sex">
       <ChipPicker value={form.sex} onChange={v=>set('sex',v)} options={[{value:'M',label:'Male'},{value:'F',label:'Female'},{value:'unknown',label:'Unknown'}]}/>
     </FormField>
@@ -6666,7 +6699,7 @@ function EditBurrowModal({burrow,wombats=[],onClose,onSave}){
       habitat:{substrate,vegetation,notes:habitatNotes,trailCamera},
     });
   }}>
-    <FormField label="Name" required><FInput value={form.name} onChange={v=>set('name',v)} placeholder="e.g. Burrow Zeta"/></FormField>
+    <FormField label="Name" required><FInput value={form.name} onChange={v=>set('name',v)} placeholder="e.g. Burrow Zeta" maxLength={40}/></FormField>
     <FormField label="Status" required>
       <ChipPicker value={form.status} onChange={v=>set('status',v)} options={[{value:'active',label:'Active'},{value:'inactive',label:'Inactive'},{value:'damaged',label:'Damaged'}]}/>
     </FormField>
@@ -6942,11 +6975,16 @@ function SignInModal({onClose}){
    APP
 ════════════════════════════════════════════════════════════════ */
 function App(){
-  const init=load();
-  const [data,dispatch]=React.useReducer(reducer,{
-    wombats:init.wombats,burrows:init.burrows,treatments:init.treatments,
-    sightings:init.sightings||[],burrowLogs:init.burrowLogs||[],wombatPhotos:init.wombatPhotos||[],burrowPhotos:init.burrowPhotos||[],
+  // Lazy initialisers: load() reads localStorage — runs once on mount, not on every re-render.
+  const [data,dispatch]=React.useReducer(reducer,null,()=>{
+    const init=load();
+    return{wombats:init.wombats,burrows:init.burrows,treatments:init.treatments,
+      sightings:init.sightings||[],burrowLogs:init.burrowLogs||[],wombatPhotos:init.wombatPhotos||[],burrowPhotos:init.burrowPhotos||[]};
   });
+  // Live ref so async callbacks (e.g. syncDispatch called from reconnect handlers)
+  // always read current data rather than a stale closure snapshot.
+  const dataRef=React.useRef(data);
+  React.useEffect(()=>{dataRef.current=data;},[data]);
   // ── IDB bootstrap + photo hydration (single sequential effect) ──────────────
   // IMPORTANT: These must stay in ONE effect. Previously two separate useEffect([])
   // hooks ran concurrently — hydratePhotos could complete first and dispatch
@@ -7063,7 +7101,7 @@ function App(){
 
   const [screen,setScreen]=useState('dashboard');
   const [selectedId,setSelectedId]=useState(null);
-  const [theme,setTheme]=useState(init.theme);
+  const [theme,setTheme]=useState(()=>load().theme);
   const [modal,setModal]=useState(null);
   const [online,setOnline]=useState(navigator.onLine);
   // Map filter state lifted here so it survives tab switches (resets on page reload)
@@ -7078,7 +7116,7 @@ function App(){
   const saveWombatOrder=(ids,userId=authUser?.id)=>{
     setWombatCustomOrder(ids);
     try{localStorage.setItem(SK.wombatOrder,JSON.stringify(ids));}catch{}
-    if(userId)supa.from('profiles').update({wombat_order:ids}).eq('id',userId).catch(()=>{});
+    if(userId)Promise.resolve(supa.from('profiles').update({wombat_order:ids}).eq('id',userId)).catch(()=>{});
   };
   // Burrow list filter/sort state — survives tab switches, resets on page reload
   const [burrowFilterStatus,setBurrowFilterStatus]=useState('all');
@@ -7320,8 +7358,8 @@ function App(){
             cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
             recoverBlankPhotos(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
             // Patch renumbered records back to Supabase so everyone stays consistent
-            changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
-            changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
+            changedW.forEach(w=>Promise.resolve(supa.from('wombats').update({code:w.code}).eq('id',w.id)).catch(e=>console.warn('[sync] code patch failed',e)));
+            changedB.forEach(b=>Promise.resolve(supa.from('burrows').update({code:b.code}).eq('id',b.id)).catch(e=>console.warn('[sync] code patch failed',e)));
             // Silently fill in any missing suburb names for records created offline
             geocodeBackfill(synced,dispatch);
           }else if(merged===null){
@@ -7359,8 +7397,8 @@ function App(){
           idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
           cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
           recoverBlankPhotos(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
-          changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
-          changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
+          changedW.forEach(w=>Promise.resolve(supa.from('wombats').update({code:w.code}).eq('id',w.id)).catch(e=>console.warn('[sync] code patch failed',e)));
+          changedB.forEach(b=>Promise.resolve(supa.from('burrows').update({code:b.code}).eq('id',b.id)).catch(e=>console.warn('[sync] code patch failed',e)));
           geocodeBackfill(synced,dispatch);
         }
       }catch(e){console.warn('[Sync] reconnect sync failed',e);}
@@ -7392,8 +7430,8 @@ function App(){
             // even if a (potentially stale) offline blob already exists for them.
             cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch,_uploadedPhotoIds).catch(()=>{});
             recoverBlankPhotos(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
-            changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
-            changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
+            changedW.forEach(w=>Promise.resolve(supa.from('wombats').update({code:w.code}).eq('id',w.id)).catch(e=>console.warn('[sync] code patch failed',e)));
+            changedB.forEach(b=>Promise.resolve(supa.from('burrows').update({code:b.code}).eq('id',b.id)).catch(e=>console.warn('[sync] code patch failed',e)));
             geocodeBackfill(synced,dispatch);
           }
         }).catch(e=>console.warn('[Sync] post-flush re-sync failed',e));
@@ -7513,9 +7551,9 @@ function App(){
   const syncDispatch=action=>{
     // Recovery celebration: catch a wombat being marked healthy from a treated state
     if(action.type==='UPDATE_WOMBAT'&&action.patch?.status==='healthy'){
-      const prev=data.wombats.find(w=>w.id===action.id);
+      const prev=dataRef.current.wombats.find(w=>w.id===action.id);
       if(prev&&prev.status==='under_treatment'){
-        const profilePhoto=(data.wombatPhotos||[]).find(p=>p.wombatId===prev.id&&p.isProfile);
+        const profilePhoto=(dataRef.current.wombatPhotos||[]).find(p=>p.wombatId===prev.id&&p.isProfile);
         setRecoveredWombat({name:prev.name,photoUrl:profilePhoto?.dataUrl||null});
       }
     }
@@ -7592,8 +7630,8 @@ function App(){
         dispatch({type:'REPLACE_ALL',data:synced});
         idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
         cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
-        changedW.forEach(w=>supa.from('wombats').update({code:w.code}).eq('id',w.id).then(null,()=>{}));
-        changedB.forEach(b=>supa.from('burrows').update({code:b.code}).eq('id',b.id).then(null,()=>{}));
+        changedW.forEach(w=>Promise.resolve(supa.from('wombats').update({code:w.code}).eq('id',w.id)).catch(e=>console.warn('[sync] code patch failed',e)));
+        changedB.forEach(b=>Promise.resolve(supa.from('burrows').update({code:b.code}).eq('id',b.id)).catch(e=>console.warn('[sync] code patch failed',e)));
       }else{
         // merged===undefined means all requests failed — we're offline.
         // Revert so the user keeps their cached data for the squad they were on.
