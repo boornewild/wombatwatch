@@ -3412,7 +3412,7 @@ function PhotoCell({photo,onReplace,onDelete,onSetProfile,labelDelete='Delete',s
           ? <span style={{fontSize:11,color:'#fff',fontWeight:700,display:'inline-flex',alignItems:'center',gap:4}}>{Ico.check('#fff',12)} Profile</span>
           : <button onClick={onSetProfile} style={{fontSize:11,color:'#fff',fontWeight:600,background:'rgba(255,255,255,0.22)',border:'none',borderRadius:999,padding:'3px 9px',cursor:'pointer'}}>{setProfileLabel}</button>
         }
-        <button onClick={onDelete} style={{width:26,height:26,borderRadius:13,background:'rgba(255,255,255,0.2)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>{Ico.trash('#fff',13)}</button>
+        <button onClick={onDelete} style={{width:26,height:26,borderRadius:13,background:'rgba(0,0,0,0.55)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',boxShadow:'0 0 0 1.5px rgba(255,255,255,0.5),0 2px 6px rgba(0,0,0,0.45)'}}>{Ico.trash('#fff',13)}</button>
       </div>
     </div>
   </div>
@@ -5913,7 +5913,7 @@ function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',o
           {attachedPhotos.length>0&&<div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8}}>
             {attachedPhotos.map((p,i)=><div key={i} style={{position:'relative',borderRadius:12,overflow:'hidden',aspectRatio:'1'}}>
               <img src={p.dataUrl} style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}} alt=""/>
-              <button onClick={()=>setAttachedPhotos(ps=>ps.filter((_,j)=>j!==i))} style={{position:'absolute',top:4,right:4,width:22,height:22,borderRadius:11,background:'rgba(0,0,0,0.55)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>{Ico.trash('#fff',11)}</button>
+              <button onClick={()=>setAttachedPhotos(ps=>ps.filter((_,j)=>j!==i))} style={{position:'absolute',top:4,right:4,width:22,height:22,borderRadius:11,background:'rgba(0,0,0,0.65)',border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',boxShadow:'0 0 0 1.5px rgba(255,255,255,0.5),0 2px 6px rgba(0,0,0,0.45)'}}>{Ico.trash('#fff',11)}</button>
             </div>)}
           </div>}
           <label style={{display:'inline-flex',alignItems:'center',gap:8,padding:'10px 14px',borderRadius:12,background:t.soft,border:`1px dashed ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.mid}}>
@@ -6191,7 +6191,7 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
       {photoDataUrl
         ? <div style={{position:'relative',display:'inline-block'}}>
             <img src={photoDataUrl} alt="Wombat" style={{width:'100%',maxWidth:240,height:160,objectFit:'cover',borderRadius:14,display:'block'}}/>
-            <button onClick={()=>setPhotoDataUrl(null)} style={{position:'absolute',top:6,right:6,width:26,height:26,borderRadius:13,background:'rgba(0,0,0,0.55)',border:'none',color:'#fff',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{Ico.close('#fff',12)}</button>
+            <button onClick={()=>setPhotoDataUrl(null)} style={{position:'absolute',top:6,right:6,width:26,height:26,borderRadius:13,background:'rgba(0,0,0,0.65)',border:'none',color:'#fff',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',boxShadow:'0 0 0 1.5px rgba(255,255,255,0.5),0 2px 6px rgba(0,0,0,0.45)'}}>{Ico.close('#fff',12)}</button>
           </div>
         : <label style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.ink}}>
             {Ico.camera(t.f700,15)} Add Photo
@@ -6298,7 +6298,7 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
       {photoDataUrl
         ? <div style={{position:'relative',display:'inline-block'}}>
             <img src={photoDataUrl} alt="Burrow" style={{width:'100%',maxWidth:240,height:160,objectFit:'cover',borderRadius:14,display:'block'}}/>
-            <button onClick={()=>setPhotoDataUrl(null)} style={{position:'absolute',top:6,right:6,width:26,height:26,borderRadius:13,background:'rgba(0,0,0,0.55)',border:'none',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{Ico.close('#fff',12)}</button>
+            <button onClick={()=>setPhotoDataUrl(null)} style={{position:'absolute',top:6,right:6,width:26,height:26,borderRadius:13,background:'rgba(0,0,0,0.65)',border:'none',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',boxShadow:'0 0 0 1.5px rgba(255,255,255,0.5),0 2px 6px rgba(0,0,0,0.45)'}}>{Ico.close('#fff',12)}</button>
           </div>
         : <label style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer',fontSize:13,fontWeight:600,color:t.ink}}>
             {Ico.camera(t.f700,15)} Add Photo
