@@ -5573,9 +5573,13 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
       }else{setSearchErr(true);}
     }catch(e){setSearchErr(true);}finally{setSearching(false);}
   };
-  return(
+  // Portal to document.body so the map picker always escapes any parent scroll
+  // container or stacking context (e.g. ModalWrap at z-index 1200). Without this,
+  // opening the map from inside AddWombatModal causes touch events to be swallowed
+  // by ModalWrap's scroll container and the z-index sits below the modal backdrop.
+  return ReactDOM.createPortal(
     // Backdrop — tap to cancel
-    <div onClick={onClose} style={{position:'fixed',inset:0,zIndex:1100,display:'flex',flexDirection:'column',justifyContent:'flex-end',alignItems:'center',background:'rgba(0,0,0,0.55)',paddingTop:'calc(var(--sat) + 48px)',paddingBottom:'calc(72px + var(--sab))'}}>
+    <div onClick={onClose} style={{position:'fixed',inset:0,zIndex:1500,display:'flex',flexDirection:'column',justifyContent:'flex-end',alignItems:'center',background:'rgba(0,0,0,0.55)',paddingTop:'calc(var(--sat) + 48px)',paddingBottom:'calc(72px + var(--sab))'}}>
       <div onClick={e=>e.stopPropagation()} style={{width:'100%',maxWidth:480,height:'88%',display:'flex',flexDirection:'column',background:t.bg,borderRadius:20,overflow:'hidden',boxShadow:'0 -8px 32px rgba(0,0,0,0.25)'}}>
         <div style={{display:'flex',alignItems:'center',gap:12,padding:'14px 16px 12px',background:t.surface,borderBottom:`1px solid ${t.div}`,flexShrink:0}}>
           <button onClick={onClose} style={{width:36,height:36,borderRadius:18,background:t.soft,border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>
@@ -5657,7 +5661,8 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
           }
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
