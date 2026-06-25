@@ -5513,6 +5513,10 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
         setPicked({lat,lng});
       });
       leafRef.current=map;
+      // In iOS PWA the viewport can settle after React paints, leaving Leaflet with
+      // stale container dimensions (wrong drag hit-zones). invalidateSize() forces a
+      // recalculation once the layout is stable.
+      setTimeout(()=>{if(leafRef.current)leafRef.current.invalidateSize();},150);
     };
     if(initialLat){
       initMap(initialLat,initialLng,14);
@@ -5535,23 +5539,30 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
     ).addTo(map);
   },[satellite]);
 
-  // Touch isolation for the map area — two separate concerns:
+  // Touch isolation for the map area.
   //
-  // 1. touchmove: must call preventDefault() (non-passive) to stop iOS from treating
-  //    map drags as page scrolls. This is the classic iOS Leaflet fix.
+  // The core tension on iOS PWA:
+  //   - preventDefault() on touchstart is required to claim the gesture for Leaflet
+  //     drag/pinch BEFORE iOS commits to a page-scroll. If touchstart is passive,
+  //     iOS may decide it's a scroll on the first touchmove and never hand off to Leaflet.
+  //   - BUT calling preventDefault() on touchstart also suppresses iOS's touch→click
+  //     synthesis, breaking button taps inside the map area.
   //
-  // 2. touchstart / touchend: stopPropagation only — NO preventDefault here.
-  //    Calling preventDefault() on touchstart tells iOS not to synthesise a click
-  //    event from the touch sequence. In PWA/standalone mode this breaks ALL button
-  //    taps and Leaflet's tap-to-pin inside the map area. Desktop browsers hide this
-  //    bug because they use real mouse events, not touch→click synthesis.
+  // Solution: call preventDefault() on touchstart only when the finger lands on the
+  // map canvas itself (not on a button, link, or other interactive element). Leaflet's
+  // own zoom controls are <a> tags and our GPS/satellite buttons are <button> tags —
+  // these are excluded by the closest() check so iOS still synthesises click for them.
   useEffect(()=>{
     const el=wrapRef.current;
     if(!el)return;
-    const absorbStart=e=>e.stopPropagation();
+    const absorbStart=e=>{
+      e.stopPropagation();
+      // Only claim the gesture (preventDefault) when touching the map canvas, not controls
+      if(!e.target.closest('button,a,[role="button"]')&&e.cancelable)e.preventDefault();
+    };
     const absorbMove=e=>{e.stopPropagation();if(e.cancelable)e.preventDefault();};
     const absorbEnd=e=>e.stopPropagation();
-    el.addEventListener('touchstart',absorbStart,{passive:true});
+    el.addEventListener('touchstart',absorbStart,{passive:false});
     el.addEventListener('touchmove',absorbMove,{passive:false});
     el.addEventListener('touchend',absorbEnd,{passive:true});
     return()=>{
