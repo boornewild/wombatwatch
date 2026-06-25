@@ -5541,26 +5541,29 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
 
   // Touch isolation for the map area.
   //
-  // The core tension on iOS PWA:
-  //   - preventDefault() on touchstart is required to claim the gesture for Leaflet
-  //     drag/pinch BEFORE iOS commits to a page-scroll. If touchstart is passive,
-  //     iOS may decide it's a scroll on the first touchmove and never hand off to Leaflet.
-  //   - BUT calling preventDefault() on touchstart also suppresses iOS's touch→click
-  //     synthesis, breaking button taps inside the map area.
+  // Three separate concerns:
   //
-  // Solution: call preventDefault() on touchstart only when the finger lands on the
-  // map canvas itself (not on a button, link, or other interactive element). Leaflet's
-  // own zoom controls are <a> tags and our GPS/satellite buttons are <button> tags —
-  // these are excluded by the closest() check so iOS still synthesises click for them.
+  // touchstart — non-passive so we can claim the gesture.
+  //   • stopPropagation: stops the backdrop's onClick(onClose) from firing.
+  //   • preventDefault on map canvas only: tells iOS "JS owns this gesture" so it
+  //     hands drag/pinch to Leaflet instead of starting a page-scroll. Excluded for
+  //     buttons/links so iOS still synthesises click events for controls.
+  //
+  // touchmove — preventDefault only, NO stopPropagation.
+  //   • Leaflet registers its drag handler on `document` (not on the map container),
+  //     so the event MUST be allowed to bubble all the way up to document. Calling
+  //     stopPropagation here breaks drag entirely.
+  //   • preventDefault still stops iOS from treating the drag as a page scroll.
+  //
+  // touchend — stopPropagation only, to match touchstart containment.
   useEffect(()=>{
     const el=wrapRef.current;
     if(!el)return;
     const absorbStart=e=>{
       e.stopPropagation();
-      // Only claim the gesture (preventDefault) when touching the map canvas, not controls
       if(!e.target.closest('button,a,[role="button"]')&&e.cancelable)e.preventDefault();
     };
-    const absorbMove=e=>{e.stopPropagation();if(e.cancelable)e.preventDefault();};
+    const absorbMove=e=>{if(e.cancelable)e.preventDefault();}; // no stopPropagation — Leaflet drag lives on document
     const absorbEnd=e=>e.stopPropagation();
     el.addEventListener('touchstart',absorbStart,{passive:false});
     el.addEventListener('touchmove',absorbMove,{passive:false});
