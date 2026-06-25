@@ -5535,23 +5535,29 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
     ).addTo(map);
   },[satellite]);
 
-  // Non-passive touch listeners on the map wrapper — this is the critical fix for iOS Safari.
-  // React's synthetic onTouch* handlers are passive by default (since React 17), meaning they
-  // cannot call preventDefault(), so iOS still treats the gesture as a page scroll before
-  // Leaflet's drag handler gets a chance to claim it. Attaching non-passive listeners directly
-  // to the DOM element lets us call preventDefault(), giving Leaflet full ownership of all
-  // touch input inside the map area.
+  // Touch isolation for the map area — two separate concerns:
+  //
+  // 1. touchmove: must call preventDefault() (non-passive) to stop iOS from treating
+  //    map drags as page scrolls. This is the classic iOS Leaflet fix.
+  //
+  // 2. touchstart / touchend: stopPropagation only — NO preventDefault here.
+  //    Calling preventDefault() on touchstart tells iOS not to synthesise a click
+  //    event from the touch sequence. In PWA/standalone mode this breaks ALL button
+  //    taps and Leaflet's tap-to-pin inside the map area. Desktop browsers hide this
+  //    bug because they use real mouse events, not touch→click synthesis.
   useEffect(()=>{
     const el=wrapRef.current;
     if(!el)return;
-    const absorb=e=>{e.stopPropagation();if(e.cancelable)e.preventDefault();};
-    el.addEventListener('touchstart',absorb,{passive:false});
-    el.addEventListener('touchmove',absorb,{passive:false});
-    el.addEventListener('touchend',absorb,{passive:false});
+    const absorbStart=e=>e.stopPropagation();
+    const absorbMove=e=>{e.stopPropagation();if(e.cancelable)e.preventDefault();};
+    const absorbEnd=e=>e.stopPropagation();
+    el.addEventListener('touchstart',absorbStart,{passive:true});
+    el.addEventListener('touchmove',absorbMove,{passive:false});
+    el.addEventListener('touchend',absorbEnd,{passive:true});
     return()=>{
-      el.removeEventListener('touchstart',absorb);
-      el.removeEventListener('touchmove',absorb);
-      el.removeEventListener('touchend',absorb);
+      el.removeEventListener('touchstart',absorbStart);
+      el.removeEventListener('touchmove',absorbMove);
+      el.removeEventListener('touchend',absorbEnd);
     };
   },[]);
 
@@ -5610,7 +5616,7 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
             Non-passive DOM listeners attached via useEffect call preventDefault(),
             giving Leaflet full ownership of all touch input inside the map area. */}
         <div ref={wrapRef} style={{flex:1,position:'relative',touchAction:'none'}}>
-          <div ref={mapRef} style={{width:'100%',height:'100%'}}/>
+          <div ref={mapRef} style={{width:'100%',height:'100%',touchAction:'none'}}/>
           {/* Status banner — GPS error takes priority; falls back to offline notice */}
           {(locError||isOffline)&&<div style={{position:'absolute',top:10,left:'50%',transform:'translateX(-50%)',zIndex:500,background:'rgba(0,0,0,0.65)',color:'#fff',fontSize:11,fontWeight:600,borderRadius:20,padding:'5px 12px',display:'flex',alignItems:'center',gap:6,pointerEvents:'none',whiteSpace:'nowrap'}}>
             {Ico.wifiOff('#fff',12)}<span>{locError?'Couldn\'t get location — tap the map to pin':'Offline — some tiles may be missing'}</span>
