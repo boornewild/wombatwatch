@@ -258,9 +258,10 @@ const fmtDate=s=>{if(!s)return'—';const d=new Date(s);if(isNaN(d.getTime()))re
 const fmtDateTime=s=>{if(!s)return'—';const hasTime=s.length>10&&s.includes('T')||s.includes(' ')&&s.split(' ')[1]?.includes(':');const d=new Date(s);if(isNaN(d.getTime()))return'—';const date=`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;if(!hasTime)return date;const h=d.getHours(),m=String(d.getMinutes()).padStart(2,'0');return`${date} ${h%12||12}:${m} ${h<12?'AM':'PM'}`;};
 const timeAgo=s=>{if(!s)return'';const h=Math.floor((Date.now()-new Date(s))/36e5);if(h<1)return'Just now';if(h<24)return`${h}h ago`;const d=Math.floor(h/24);return d===1?'Yesterday':`${d}d ago`;};
 const today=()=>new Date().toISOString().slice(0,10);
-const statusTone=s=>({healthy:'sage',under_treatment:'amber',missing:'pearl',deceased:'rose'}[s]||'pearl');
-const statusLabel=s=>({healthy:'Healthy',under_treatment:'Treatment',missing:'Missing',deceased:'Deceased'}[s]||(s?s.charAt(0).toUpperCase()+s.slice(1):s));
-const isInactive=w=>w.status==='deceased'||w.status==='missing';
+const statusTone=s=>({healthy:'sage',under_treatment:'amber',deceased:'rose',archived:'pearl'}[s]||'pearl');
+const statusLabel=s=>({healthy:'Healthy',under_treatment:'Treatment',deceased:'Deceased',archived:'Archived'}[s]||(s?s.charAt(0).toUpperCase()+s.slice(1):s));
+const isInactive=w=>w.status==='deceased';
+const isArchived=w=>w.status==='archived';
 const burrowTone=s=>({active:'sage',inactive:'amber',damaged:'rose'}[s]||'pearl');
 const burrowStatusLabel=s=>({active:'Active',inactive:'Inactive',damaged:'Damaged'}[s]||(s?s.charAt(0).toUpperCase()+s.slice(1):s));
 const nextWombatCode=wombats=>{const nums=wombats.map(w=>parseInt((w.code||'').slice(1)||'0')).filter(n=>n>0);const n=nums.length?Math.max(...nums)+1:1;return'W'+String(n).padStart(4,'0');};
@@ -1453,6 +1454,7 @@ async function syncAction(action,userId){
       case'UPDATE_WOMBAT':       {const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,...action.patch},userId));break;}
       case'MARK_WOMBAT_INACTIVE':{const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:action.inactiveAt,inactiveCause:action.inactiveCause||null,inactiveNotes:action.inactiveNotes||null},userId));break;}
       case'MARK_WOMBAT_ACTIVE':  {const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:null,inactiveCause:null,inactiveNotes:null},userId));break;}
+      case'ARCHIVE_WOMBAT':      {const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:'archived'},userId));break;}
       case'IMPORT_WOMBATS': for(const w of (action.wombats||[]))await push('wombats',wombatToDb(w,userId)); break;
       case'ASSIGN_WOMBAT':{
         const w=await fromIdb('w',action.wombatId);
@@ -2544,7 +2546,7 @@ function RecoveryModal({name,photoUrl,onClose}){
 /* ── DASHBOARD ── */
 function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunteerCount='—',squadLat,squadLng,squadName}){
   const t=useTheme();
-  const wombats=data.wombats.filter(w=>!isInactive(w)); // active only for stats
+  const wombats=data.wombats.filter(w=>!isInactive(w)&&!isArchived(w)); // active only for stats
   const inactiveWombats=data.wombats.filter(isInactive);
   const burrows=data.burrows;
   const treatments=data.treatments;
@@ -2828,7 +2830,7 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
     setShowOffSheet(false);
   };
 
-  const wColors={'healthy':'#4A7C52','under_treatment':'#D89039','missing':'#7A887E','deceased':'#B95C4A'};
+  const wColors={'healthy':'#4A7C52','under_treatment':'#D89039','deceased':'#B95C4A'};
   const bColors={'active':'#4A7C52','inactive':'#D89039','damaged':'#B95C4A'};
 
   const flyToUser=()=>{
@@ -2939,10 +2941,10 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
     const matchB=b=>!q||(b.name||'').toLowerCase().includes(q)||(b.location||'').toLowerCase().includes(q);
     // Wombats (null = hidden, empty set = show all, non-empty = filtered)
     if(wombatFilters!==null){
-      // by default show active only; inactive (missing/deceased) only shown when explicitly filtered
+      // by default show active only; inactive (deceased) only shown when explicitly filtered
       data.wombats.filter(w=>{
         if(!matchW(w))return false;
-        if(wombatFilters.size===0)return!isInactive(w);
+        if(wombatFilters.size===0)return!isInactive(w)&&!isArchived(w);
         return wombatFilters.has(w.status);
       }).forEach(w=>{
         if(!w.lat||!w.lng)return;
@@ -2973,15 +2975,13 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
     if(k==='all'){setBurrowFilters(prev=>prev===null?new Set():null);return;}
     setBurrowFilters(prev=>{const n=new Set(prev||[]);n.has(k)?n.delete(k):n.add(k);return n.size===0?new Set():n;});
   };
-  const activeMapWombats=data.wombats.filter(w=>!isInactive(w));
-  const missingWombats=data.wombats.filter(w=>w.status==='missing');
+  const activeMapWombats=data.wombats.filter(w=>!isInactive(w)&&!isArchived(w));
   const deceasedWombats=data.wombats.filter(w=>w.status==='deceased');
   const wombatChips=[
     {k:'all',label:'All active',count:activeMapWombats.length,dot:null},
     {k:'healthy',label:'Healthy',count:activeMapWombats.filter(w=>w.status==='healthy').length,dot:'#4A7C52'},
     {k:'under_treatment',label:'Treatment',count:activeMapWombats.filter(w=>w.status==='under_treatment').length,dot:'#D89039'},
     {k:'deceased',label:'Deceased',count:deceasedWombats.length,dot:'#B95C4A'},
-    {k:'missing',label:'Missing',count:missingWombats.length,dot:'#7A887E'},
   ];
   const burrowChips=[
     {k:'all',label:'All burrows',count:data.burrows.length,dot:null},
@@ -3154,17 +3154,68 @@ const selStyle=(t)=>({flex:1,height:38,borderRadius:19,background:t.surface,boxS
    WombatList:    searchable list of all wombats.
    WombatProfile: detail view — health, treatments, sightings, photos.
 ════════════════════════════════════════════════════════════════ */
+function ArchiveSheet({archivedWombats,data,nav,onClose}){
+  const t=useTheme();
+  const [search,setSearch]=useState('');
+  const filtered=archivedWombats.filter(w=>!search||w.name.toLowerCase().includes(search.toLowerCase()));
+  React.useEffect(()=>{
+    const prev=document.body.style.overflow;
+    document.body.style.overflow='hidden';
+    return()=>{document.body.style.overflow=prev;};
+  },[]);
+  return ReactDOM.createPortal(
+    <div style={{position:'fixed',inset:0,zIndex:1200,background:t.bg,display:'flex',flexDirection:'column',paddingTop:'var(--sat)',paddingBottom:'var(--sab)'}}>
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'14px 16px 10px',borderBottom:`1px solid ${t.div}`,flexShrink:0,background:t.surface}}>
+        <div style={{width:36}}/>
+        <div style={{textAlign:'center'}}>
+          <div style={{fontSize:17,fontWeight:700,color:t.ink}}>Archive</div>
+          <div style={{fontSize:12,color:t.mid,marginTop:1}}>{archivedWombats.length} wombat{archivedWombats.length!==1?'s':''}</div>
+        </div>
+        <button onClick={onClose} style={{width:36,height:36,borderRadius:18,display:'flex',alignItems:'center',justifyContent:'center',color:t.mid,fontSize:24,fontWeight:300,background:'none',border:'none',cursor:'pointer',lineHeight:1}}>×</button>
+      </div>
+      <div style={{padding:'10px 16px 6px',flexShrink:0,background:t.surface,borderBottom:`1px solid ${t.div}`}}>
+        <FInput value={search} onChange={setSearch} placeholder="Search archive…"/>
+      </div>
+      <div style={{flex:1,overflowY:'auto',overscrollBehavior:'contain',padding:'12px 16px 32px',display:'flex',flexDirection:'column',gap:10}}>
+        {filtered.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'40px 0',fontSize:14}}>{search?'No matches.':'No archived wombats.'}</div>}
+        {filtered.map(w=>{
+          const profilePhoto=(data.wombatPhotos||[]).find(p=>p.wombatId===w.id&&p.isProfile);
+          return <button key={w.id} onClick={()=>{onClose();nav('wombat-profile',w.id);}} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
+            <Card padding={16} style={{border:`1px solid rgba(45,95,63,0.08)`}}>
+              <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
+                <WAvatar size={64} photoUrl={profilePhoto?.dataUrl} photoId={profilePhoto?.id}/>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',gap:8}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:17,fontWeight:700,color:t.ink,lineHeight:1.2,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{w.name}</div>
+                      {w.code&&<div style={{fontSize:11,fontWeight:600,color:t.softInk,fontFamily:'monospace',letterSpacing:0.6,marginTop:1}}>{w.code}</div>}
+                    </div>
+                    <Pill tone="pearl" size="sm">Archived</Pill>
+                  </div>
+                  <div style={{marginTop:7}}><LocPill>{w.locationLabel||(isCodeLike(w.location)?null:w.location)||data.burrows.find(b=>w.burrowIds?.includes(b.id)&&b.location)?.location||'Unknown location'}</LocPill></div>
+                </div>
+              </div>
+            </Card>
+          </button>;
+        })}
+      </div>
+    </div>,
+    document.body
+  );
+}
 function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,filterStatus,setFilterStatus,sortBy,setSortBy,customOrder=[],onSaveOrder}){
   const t=useTheme();
   const isAdmin=authProfile?.role==='admin';
   const [search,setSearch]=useState('');
+  const [showArchive,setShowArchive]=useState(false);
   const [pendingDelete,setPendingDelete]=useState(null);
   const [editingWombat,setEditingWombat]=useState(null);
   const [reordering,setReordering]=useState(false);
-  const activeWombats=data.wombats.filter(w=>!isInactive(w));
+  const activeWombats=data.wombats.filter(w=>!isInactive(w)&&!isArchived(w));
   const inactiveWombats=data.wombats.filter(isInactive);
+  const archivedWombats=data.wombats.filter(isArchived);
   const myId=authUser?.id;
-  const mineCount=data.wombats.filter(w=>!isInactive(w)&&(w.assignees||[]).some(a=>a.userId===myId)).length;
+  const mineCount=data.wombats.filter(w=>!isInactive(w)&&!isArchived(w)&&(w.assignees||[]).some(a=>a.userId===myId)).length;
 
   const saveOrder=ids=>{if(onSaveOrder)onSaveOrder(ids);};
 
@@ -3177,19 +3228,21 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
   });
 
   const filtered=data.wombats.filter(w=>{
-    const active=!isInactive(w);
+    const active=!isInactive(w)&&!isArchived(w);
+    const sq=!search||w.name.toLowerCase().includes(search.toLowerCase());
     if(filterStatus==='mine'){
       if(!(w.assignees||[]).some(a=>a.userId===myId))return false;
-      return !search||w.name.toLowerCase().includes(search.toLowerCase());
+      if(!active)return false;
+      return sq;
     }
     if(filterStatus==='inactive'){
-      if(active)return false;
-      return !search||w.name.toLowerCase().includes(search.toLowerCase());
+      if(active||w.status==='archived')return false;
+      return sq;
     }
+    if(w.status==='archived') return false; // archived always hidden from normal views
     if(filterStatus!=='active'&&w.status!==filterStatus) return false;
     if(!active) return false;
-    const mq=!search||w.name.toLowerCase().includes(search.toLowerCase());
-    return mq;
+    return sq;
   }).slice().sort((a,b)=>{
     if(sortBy==='custom'){const oa=customOrder.indexOf(a.id),ob=customOrder.indexOf(b.id);if(oa===-1&&ob===-1)return 0;if(oa===-1)return 1;if(ob===-1)return -1;return oa-ob;}
     if(sortBy==='location') return (a.location||'').localeCompare(b.location||'');
@@ -3268,7 +3321,7 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
       ):(
         <>
         {filtered.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'40px 0',fontSize:14}}>No wombats found.</div>}
-        {filtered.filter(w=>!isInactive(w)).map(w=>{
+        {filtered.filter(w=>!isInactive(w)&&!isArchived(w)).map(w=>{
           const lastTreat=data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0];
           const lastSight=data.sightings.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0];
           const lastT=(!lastTreat&&!lastSight)?null:(!lastTreat?lastSight:(!lastSight?lastTreat:(new Date(lastSight.at)>=new Date(lastTreat.at)?lastSight:lastTreat)));
@@ -3300,7 +3353,6 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
         })}
         {filterStatus==='inactive'&&filtered.filter(isInactive).map(w=>{
           const profilePhoto=(data.wombatPhotos||[]).find(p=>p.wombatId===w.id&&p.isProfile);
-          const isMissing=w.status==='missing';
           return <button key={w.id} onClick={()=>nav('wombat-profile',w.id)} style={{textAlign:'left',background:'none',border:'none',padding:0,width:'100%'}}>
             <Card padding={16} style={{border:`1px solid rgba(45,95,63,0.1)`}}>
               <div style={{display:'flex',gap:14,alignItems:'flex-start'}}>
@@ -3314,7 +3366,7 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
                     <Pill tone={statusTone(w.status)} size="sm">{statusLabel(w.status)}</Pill>
                   </div>
                   <div style={{marginTop:7}}><LocPill>{w.locationLabel||(isCodeLike(w.location)?null:w.location)||data.burrows.find(b=>w.burrowIds?.includes(b.id)&&b.location)?.location||'Unknown location'}</LocPill></div>
-                  <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12.5,color:t.mid,marginTop:7}}>{Ico.cal(t.mid,13)} {isMissing?'Last seen':'Deceased'}: {fmtDate(w.inactiveAt)||'—'}</div>
+                  <div style={{display:'flex',alignItems:'center',gap:5,fontSize:12.5,color:t.mid,marginTop:7}}>{Ico.cal(t.mid,13)} Deceased: {fmtDate(w.inactiveAt)||'—'}</div>
                 </div>
               </div>
             </Card>
@@ -3323,6 +3375,10 @@ function WombatList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
         </>
       )}
     </div>
+    {archivedWombats.length>0&&<button onClick={()=>setShowArchive(true)} style={{display:'block',width:'100%',textAlign:'center',color:t.mid,fontSize:13,padding:'12px 0 4px',marginTop:16,background:'none',border:'none',cursor:'pointer',fontWeight:700}}>
+      View archive ({archivedWombats.length} wombat{archivedWombats.length!==1?'s':''})
+    </button>}
+    {showArchive&&<ArchiveSheet archivedWombats={archivedWombats} data={data} nav={nav} onClose={()=>setShowArchive(false)}/>}
     <AcknowledgementFooter/>
     {pendingDelete&&<ConfirmModal
       title={`Delete ${pendingDelete.name}?`}
@@ -3445,8 +3501,8 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
   const [locLabelDraft,setLocLabelDraft]=useState('');
   const [showMenu,setShowMenu]=useState(false);
   const [showMarkDeceased,setShowMarkDeceased]=useState(false);
-  const [showMarkMissing,setShowMarkMissing]=useState(false);
   const [showMarkActive,setShowMarkActive]=useState(false);
+  const [showMarkArchive,setShowMarkArchive]=useState(false);
   const w=data.wombats.find(x=>x.id===wombatId);
   if(!w)return <div style={{padding:20,color:t.ink}}>Wombat not found.</div>;
   const treatments=data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at));
@@ -3469,6 +3525,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
   const mapLng=latestGPSTr?.location?.lng||w.lng;
   const mapLabel=latestGPSTr?`Treatment · ${fmtDate(latestGPSTr.at)}`:(w.lat?'Last known location':null);
   const inactive=isInactive(w);
+  const archived=isArchived(w);
   const CAUSE_LABELS={vehicle_strike:'Vehicle strike',mange_complications:'Mange complications',natural_causes:'Natural causes',predation:'Predation',unknown:'Unknown'};
   return <div style={{background:t.bg,minHeight:'100%',paddingBottom:24}}>
     <Header showBack onBack={()=>nav('wombats')} title="Wombat Profile" showAvatar={false} rightAction={isAdmin&&<div style={{position:'relative'}}>
@@ -3478,25 +3535,30 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
       {showMenu&&<>
         <div onClick={()=>setShowMenu(false)} style={{position:'fixed',inset:0,zIndex:1100}}/>
         <div style={{position:'absolute',top:42,right:0,zIndex:1200,background:t.surface,borderRadius:14,boxShadow:'0 4px 24px rgba(0,0,0,0.18)',padding:'6px 0',minWidth:180}}>
-          {w.status!=='missing'&&w.status!=='deceased'&&<button onClick={()=>{setShowMenu(false);setShowMarkMissing(true);}} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'11px 16px',background:'none',border:'none',textAlign:'left',cursor:'pointer'}}>
-              <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke={t.mid} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
-              <span style={{fontSize:14,fontWeight:600,color:t.mid}}>Mark as Missing</span>
+          {!inactive&&!archived&&<button onClick={()=>{setShowMenu(false);setShowMarkArchive(true);}} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'11px 16px',background:'none',border:'none',textAlign:'left',cursor:'pointer'}}>
+              <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke={t.mid} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+              <span style={{fontSize:14,fontWeight:600,color:t.mid}}>Archive wombat</span>
             </button>}
-          {w.status!=='deceased'&&<button onClick={()=>{setShowMenu(false);setShowMarkDeceased(true);}} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'11px 16px',background:'none',border:'none',textAlign:'left',cursor:'pointer'}}>
+          {w.status!=='deceased'&&!archived&&<button onClick={()=>{setShowMenu(false);setShowMarkDeceased(true);}} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'11px 16px',background:'none',border:'none',textAlign:'left',cursor:'pointer'}}>
               <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke={t.rose700} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
               <span style={{fontSize:14,fontWeight:600,color:t.rose700}}>Mark as Deceased</span>
             </button>}
-          {inactive&&<button onClick={()=>{setShowMenu(false);setShowMarkActive(true);}} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'11px 16px',background:'none',border:'none',textAlign:'left',cursor:'pointer'}}>
+          {(inactive||archived)&&<button onClick={()=>{setShowMenu(false);setShowMarkActive(true);}} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'11px 16px',background:'none',border:'none',textAlign:'left',cursor:'pointer'}}>
               <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke={t.f700} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 13l4 4L19 7"/></svg>
-              <span style={{fontSize:14,fontWeight:600,color:t.f700}}>Mark as Active</span>
+              <span style={{fontSize:14,fontWeight:600,color:t.f700}}>{archived?'Unarchive wombat':'Mark as Active'}</span>
             </button>}
         </div>
       </>}
     </div>}/>
+    {/* Archived banner */}
+    {archived&&<div style={{margin:'14px var(--sp) 0',borderRadius:16,padding:'14px 16px',background:t.soft,border:`1px solid ${t.div}`}}>
+      <div style={{fontSize:13.5,fontWeight:700,color:t.mid,marginBottom:4}}>Archived</div>
+      <div style={{fontSize:13,color:t.mid,lineHeight:1.5}}>This wombat is archived and hidden from the active list. Their full history is preserved here.</div>
+    </div>}
     {/* Inactive banner */}
     {inactive&&<div style={{margin:'14px var(--sp) 0',borderRadius:16,padding:'14px 16px',background:w.status==='deceased'?t.rose50:t.soft,border:`1px solid ${w.status==='deceased'?t.rose700+'44':t.div}`}}>
       <div style={{fontSize:13.5,fontWeight:700,color:w.status==='deceased'?t.rose700:t.mid,marginBottom:4}}>
-        {w.status==='deceased'?'Deceased':'Missing'}
+        {'Deceased'}
         {w.inactiveAt&&<span style={{fontWeight:400,marginLeft:6}}>· {fmtDate(w.inactiveAt)}</span>}
       </div>
       {w.inactiveCause&&w.status==='deceased'&&<div style={{fontSize:13,color:t.mid,marginBottom:w.inactiveNotes?4:0}}>Cause: {CAUSE_LABELS[w.inactiveCause]||w.inactiveCause}</div>}
@@ -3564,8 +3626,8 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
     <div style={{padding:'16px 12px 0'}}><TabPills tabs={['Treatments','Photos','Notes','Location']} active={activeTab} onChange={setActiveTab}/></div>
     <div style={{padding:'20px var(--sp) 0'}}>
       {activeTab===0&&<>
-        <SectionLabel action={!inactive&&<button onClick={()=>setShowAddTreatment(true)} style={{border:'none',background:t.f700,color:'#fff',padding:'8px 14px',borderRadius:999,fontSize:12.5,fontWeight:600,display:'inline-flex',alignItems:'center',gap:6}}>{Ico.plus('#fff',14)} Add Treatment</button>}>Treatment History</SectionLabel>
-        {inactive&&<div style={{background:t.soft,borderRadius:12,padding:'12px 14px',marginBottom:14,fontSize:13,color:t.mid}}>Treatment logging is disabled for inactive wombats.</div>}
+        <SectionLabel action={!inactive&&!archived&&<button onClick={()=>setShowAddTreatment(true)} style={{border:'none',background:t.f700,color:'#fff',padding:'8px 14px',borderRadius:999,fontSize:12.5,fontWeight:600,display:'inline-flex',alignItems:'center',gap:6}}>{Ico.plus('#fff',14)} Add Treatment</button>}>Treatment History</SectionLabel>
+        {(inactive||archived)&&<div style={{background:t.soft,borderRadius:12,padding:'12px 14px',marginBottom:14,fontSize:13,color:t.mid}}>{archived?'This wombat is archived — treatment logging is disabled.':'Treatment logging is disabled for inactive wombats.'}</div>}
         {treatments.length===0&&<div style={{textAlign:'center',color:t.mid,padding:'30px 0',fontSize:14}}>No treatments logged yet.</div>}
         <div style={{display:'flex',flexDirection:'column',gap:14}}>
           {treatments.map((tr,i)=>{
@@ -3751,9 +3813,9 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
     <AcknowledgementFooter/>
     {showAddTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} defaultBy={authProfile?.display_name||''} onClose={()=>setShowAddTreatment(false)} onSave={(tr,photos=[],linkedBurrowId=null,statusChange=null)=>{dispatch({type:'ADD_TREATMENT',treatment:{...tr,markedRecovered:statusChange==='healthy'}});photos.forEach((p,i)=>dispatch({type:'ADD_WOMBAT_PHOTO',photo:{id:'ph_'+uid()+'_'+i,wombatId:w.id,dataUrl:p.dataUrl,isProfile:false,at:tr.at?new Date(tr.at).toISOString():new Date().toISOString()}}));if(linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(statusChange)dispatch({type:'UPDATE_WOMBAT',id:w.id,patch:{status:statusChange}});setShowAddTreatment(false);}}/>}
     {editingTreatment&&<AddTreatmentModal wombatId={w.id} wombatName={w.name} wombatStatus={w.status} burrows={data.burrows} defaultBy={authProfile?.display_name||''} initialTreatment={editingTreatment} onClose={()=>setEditingTreatment(null)} onSave={(tr)=>{dispatch({type:'EDIT_TREATMENT',treatment:tr});if(tr.linkedBurrowId&&tr.linkedBurrowId!==editingTreatment.linkedBurrowId)dispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:tr.linkedBurrowId});setEditingTreatment(null);}}/>}
+    {showMarkArchive&&<ArchiveWombatModal wombat={w} onClose={()=>setShowMarkArchive(false)} onSave={()=>{dispatch({type:'ARCHIVE_WOMBAT',id:w.id});setShowMarkArchive(false);}}/>}
     {showMarkDeceased&&<MarkDeceasedModal wombat={w} onClose={()=>setShowMarkDeceased(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_INACTIVE',id:w.id,...patch});setShowMarkDeceased(false);}}/>}
-    {showMarkMissing&&<MarkMissingModal wombat={w} lastTreatmentAt={data.treatments.filter(x=>x.wombatId===w.id).sort((a,b)=>new Date(b.at)-new Date(a.at))[0]?.at||null} onClose={()=>setShowMarkMissing(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_INACTIVE',id:w.id,...patch});setShowMarkMissing(false);}}/>}
-    {showMarkActive&&<MarkActiveModal wombat={w} onClose={()=>setShowMarkActive(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_ACTIVE',id:w.id,...patch});setShowMarkActive(false);}}/>}
+{showMarkActive&&<MarkActiveModal wombat={w} onClose={()=>setShowMarkActive(false)} onSave={patch=>{dispatch({type:'MARK_WOMBAT_ACTIVE',id:w.id,...patch});setShowMarkActive(false);}}/>}
   </div>;
 }
 
@@ -4933,7 +4995,7 @@ function ExportSheet({data,onClose,onBack}){
   const exportWOMSATWombats=()=>{
     const headers=['WombatID','WombatName','ObservationDate','Latitude','Longitude','Locality','MangeScore','MangeStatus','TreatmentApplied','TreatmentProduct','Dose','Method','Sex','AgeClass','RecordedBy','Notes'];
     const rows=wombatRows().map(({w,tr,lat,lng,loc})=>{
-      const score=tr?.severity??({under_treatment:2,missing:0,deceased:0,healthy:1}[w.status]??1);
+      const score=tr?.severity??({under_treatment:2,deceased:0,healthy:1}[w.status]??1);
       return[w.code||w.id,w.name,tr?.at?.slice(0,10)||w.firstSeen||ds,lat,lng,loc,score,statusLabel(w.status),tr&&tr.product!=='observation'?'Yes':'No',tr?.product||'',tr?.dose||'',tr?.method||'',w.sex==='M'?'Male':w.sex==='F'?'Female':'Unknown',w.ageClass||'',tr?.by||'',tr?.note||w.notes||''];
     });
     dlCSV(`wombatwatch-womsat-wombats-${ds}.csv`,headers,rows);
@@ -5502,26 +5564,73 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
   // Map init — create the Leaflet instance once. Tile layer is handled by a separate effect below.
   useEffect(()=>{
     if(!mapRef.current||leafRef.current)return;
+    let cleanupDrag=null;
     const initMap=(lat,lng,zoom)=>{
       if(leafRef.current)return; // guard against double-init if GPS comes back late
-      const map=L.map(mapRef.current,{zoomControl:true}).setView([lat,lng],zoom);
+
+      // dragging:false — we replace Leaflet's built-in drag with our own handler below.
+      // Root cause: Leaflet's _onDown calls L.DomEvent.stop(e) which calls
+      // e.preventDefault() on the pointerdown event. Per the Pointer Events spec, iOS
+      // then suppresses ALL subsequent pointermove events for that touch sequence —
+      // so Leaflet's own pointermove handler on document never fires and drag is broken.
+      // Our replacement never calls preventDefault(), so pointermove flows freely on iOS.
+      const map=L.map(mapRef.current,{zoomControl:true,tap:false,dragging:false}).setView([lat,lng],zoom);
       if(initialLat){markerRef.current=L.marker([initialLat,initialLng]).addTo(map);}
+
+      let didDrag=false; // suppress spurious click events that follow a drag gesture
       map.on('click',e=>{
+        if(didDrag){didDrag=false;return;}
         const{lat,lng}=e.latlng;
         if(markerRef.current)markerRef.current.remove();
         markerRef.current=L.marker([lat,lng]).addTo(map);
         setPicked({lat,lng});
       });
+
       leafRef.current=map;
-      // touch-action:none on every Leaflet-created element so iOS doesn't try to
-      // scroll/pan the page when the user drags the map. touch-action is NOT inherited
-      // in CSS, so Leaflet's tile/pane divs all default to 'auto' — we must override
-      // them explicitly. A scoped <style> tag is simpler than traversing the tree.
-      const cs=document.createElement('style');
-      cs.setAttribute('data-ww','mp');
-      map.getContainer().classList.add('ww-map-picker');
-      cs.textContent='.ww-map-picker,.ww-map-picker *{touch-action:none!important}';
-      document.head.appendChild(cs);
+
+      // Custom drag — pointer events only, no preventDefault() anywhere.
+      // Works for both mouse (desktop) and touch (mobile) via the unified PointerEvents API.
+      const ct=map.getContainer();
+      let prev=null;
+      let capturedId=null; // track so we can explicitly release before detach
+      const onPD=e=>{
+        if(e.target.closest('button,a,[role="button"]'))return;
+        prev={x:e.clientX,y:e.clientY};
+        didDrag=false;
+        capturedId=e.pointerId;
+        try{ct.setPointerCapture(e.pointerId);}catch(_){}
+      };
+      const onPM=e=>{
+        if(!prev)return;
+        const dx=prev.x-e.clientX,dy=prev.y-e.clientY;
+        if(!didDrag&&Math.abs(dx)+Math.abs(dy)<3)return; // ignore sub-pixel jitter
+        didDrag=true;
+        map.panBy([dx,dy],{animate:false});
+        prev={x:e.clientX,y:e.clientY};
+      };
+      const onPU=e=>{
+        prev=null;
+        // Explicitly release pointer capture so iOS Safari doesn't leave the pointer
+        // in a captured state after the element detaches, which blocks subsequent
+        // scroll gestures on other pages.
+        if(capturedId!=null){try{ct.releasePointerCapture(capturedId);}catch(_){}}
+        capturedId=null;
+      };
+      ct.addEventListener('pointerdown',onPD,{passive:true});
+      ct.addEventListener('pointermove',onPM,{passive:true});
+      ct.addEventListener('pointerup',onPU,{passive:true});
+      ct.addEventListener('pointercancel',onPU,{passive:true});
+      cleanupDrag=()=>{
+        // Release any active pointer capture BEFORE the element is detached from the DOM.
+        // iOS Safari has a known quirk where it may not auto-release captures on detach,
+        // leaving the pointer locked and blocking scroll on subsequent pages.
+        if(capturedId!=null){try{ct.releasePointerCapture(capturedId);}catch(_){}}
+        ct.removeEventListener('pointerdown',onPD);
+        ct.removeEventListener('pointermove',onPM);
+        ct.removeEventListener('pointerup',onPU);
+        ct.removeEventListener('pointercancel',onPU);
+      };
+
       // In iOS PWA the viewport can settle after React paints, leaving Leaflet with
       // stale container dimensions (wrong drag hit-zones). invalidateSize() forces a
       // recalculation once the layout is stable.
@@ -5536,8 +5645,8 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
       initMap(c?.lat??-33.22,c?.lng??150.87,11);
     }
     return()=>{
+      if(cleanupDrag)cleanupDrag();
       if(leafRef.current){leafRef.current.remove();leafRef.current=null;}
-      document.querySelectorAll('style[data-ww="mp"]').forEach(s=>s.remove());
     };
   },[]);
 
@@ -5550,34 +5659,6 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
       {attribution:satellite?ATTR_SAT:ATTR_OSM,maxZoom:19}
     ).addTo(map);
   },[satellite]);
-
-  // Touch isolation for the map area.
-  //
-  // Scroll prevention is handled entirely by the CSS rule we inject in the map-init
-  // effect (.ww-map-picker, .ww-map-picker * { touch-action: none !important }).
-  // That covers every Leaflet-created element, including tiles that are appended
-  // dynamically and wouldn't inherit touch-action from their parents.
-  //
-  // We do NOT call preventDefault() on touchstart here. Leaflet 1.9 uses the
-  // Pointer Events API (pointerdown / pointermove) for drag on modern iOS; calling
-  // preventDefault() on the underlying touchstart suppresses those pointer events,
-  // which kills drag even though tap/click events still work.
-  //
-  // stopPropagation on touchstart/end is kept only to prevent the events from
-  // bubbling to the backdrop and accidentally triggering onClose via synthesised
-  // clicks. The inner container's onClick={e=>e.stopPropagation()} handles the
-  // normal tap-to-dismiss path; this is a belt-and-braces safety net.
-  useEffect(()=>{
-    const el=wrapRef.current;
-    if(!el)return;
-    const stop=e=>e.stopPropagation();
-    el.addEventListener('touchstart',stop,{passive:true});
-    el.addEventListener('touchend',stop,{passive:true});
-    return()=>{
-      el.removeEventListener('touchstart',stop);
-      el.removeEventListener('touchend',stop);
-    };
-  },[]);
 
   // Location search — Nominatim geocoding (no API key required, rate-limited)
   const doSearch=async()=>{
@@ -5628,13 +5709,13 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
           >{searching?'…':'Go'}</button>
         </div>
         {searchErr&&<div style={{background:t.amb700+'22',color:t.amb700,fontSize:12,padding:'4px 16px',textAlign:'center',flexShrink:0}}>Location not found — try a different search</div>}
-        {/* wrapRef + touchAction:none on the OUTER wrapper is the iOS Safari pan fix.
-            React's synthetic onTouch* handlers are passive (can't call preventDefault),
-            so iOS consumes the gesture as a page scroll before Leaflet sees it.
-            Non-passive DOM listeners attached via useEffect call preventDefault(),
-            giving Leaflet full ownership of all touch input inside the map area. */}
-        <div ref={wrapRef} style={{flex:1,position:'relative',touchAction:'none'}}>
-          <div ref={mapRef} style={{width:'100%',height:'100%',touchAction:'none'}}/>
+        {/* Map area — mirrors the main MapScreen structure (position:absolute inset:0)
+            so iOS routes touch/pointer events identically to the working main map.
+            No touch-action CSS needed: the position:fixed modal + overflow:hidden
+            ancestors already prevent any page scroll, just like the main map's
+            position:absolute inset:0 overflow:hidden container does. */}
+        <div ref={wrapRef} style={{flex:1,position:'relative'}}>
+          <div ref={mapRef} style={{position:'absolute',inset:0,touchAction:'none'}}/>
           {/* Status banner — GPS error takes priority; falls back to offline notice */}
           {(locError||isOffline)&&<div style={{position:'absolute',top:10,left:'50%',transform:'translateX(-50%)',zIndex:500,background:'rgba(0,0,0,0.65)',color:'#fff',fontSize:11,fontWeight:600,borderRadius:20,padding:'5px 12px',display:'flex',alignItems:'center',gap:6,pointerEvents:'none',whiteSpace:'nowrap'}}>
             {Ico.wifiOff('#fff',12)}<span>{locError?'Couldn\'t get location — tap the map to pin':'Offline — some tiles may be missing'}</span>
@@ -5730,7 +5811,6 @@ function MiniMap({lat,lng,label,height=200,onOpen}){
    AddBurrowModal:    create a new burrow record with optional photo.
    AddSightingModal:  log a wombat sighting with optional GPS coords.
    MarkDeceasedModal: record a wombat as deceased (date, cause, notes).
-   MarkMissingModal:  record a wombat as missing (date last seen, notes).
    MarkActiveModal:   restore an inactive wombat to an active status.
 ════════════════════════════════════════════════════════════════ */
 function MarkDeceasedModal({wombat,onClose,onSave}){
@@ -5754,21 +5834,6 @@ function MarkDeceasedModal({wombat,onClose,onSave}){
     <FormField label="Notes"><FTextarea value={form.inactiveNotes} onChange={v=>set('inactiveNotes',v)} placeholder="Any additional details…" rows={3}/></FormField>
   </ModalWrap>;
 }
-function MarkMissingModal({wombat,lastTreatmentAt,onClose,onSave}){
-  const t=useTheme();
-  const [form,setForm]=useState({inactiveAt:lastTreatmentAt||today(),inactiveNotes:''});
-  const set=(k,v)=>setForm(p=>({...p,[k]:v}));
-  return <ModalWrap title={`Mark ${wombat.name} as Missing`} onClose={onClose} onSave={()=>{
-    if(!form.inactiveAt)return alert('Please enter the date last seen.');
-    onSave({status:'missing',inactiveAt:form.inactiveAt,inactiveCause:null,inactiveNotes:form.inactiveNotes.trim()||null});
-  }} saveLabel="Mark Missing" saveStyle={{background:'#7A887E'}}>
-    <div style={{background:t.soft,borderRadius:14,padding:'12px 14px',marginBottom:4}}>
-      <div style={{fontSize:13,color:t.mid,fontWeight:600,lineHeight:1.4}}>{wombat.name} will be moved to inactive and flagged as missing. Keep an eye out!</div>
-    </div>
-    <FormField label="Date Last Seen" required><FInput type="date" value={form.inactiveAt} onChange={v=>set('inactiveAt',v)}/></FormField>
-    <FormField label="Notes"><FTextarea value={form.inactiveNotes} onChange={v=>set('inactiveNotes',v)} placeholder="Where last seen, any relevant details…" rows={3}/></FormField>
-  </ModalWrap>;
-}
 function MarkActiveModal({wombat,onClose,onSave}){
   const [status,setStatus]=useState('healthy');
   return <ModalWrap title={`Restore ${wombat.name}`} onClose={onClose} onSave={()=>{
@@ -5777,6 +5842,14 @@ function MarkActiveModal({wombat,onClose,onSave}){
     <FormField label="New Status" required>
       <ChipPicker value={status} onChange={setStatus} options={[{value:'healthy',label:'Healthy'},{value:'under_treatment',label:'Treatment'}]}/>
     </FormField>
+  </ModalWrap>;
+}
+function ArchiveWombatModal({wombat,onClose,onSave}){
+  const t=useTheme();
+  return <ModalWrap title={`Archive ${wombat.name}?`} onClose={onClose} onSave={onSave} saveLabel="Archive" saveStyle={{background:t.mid}}>
+    <div style={{fontSize:14,color:t.mid,lineHeight:1.6}}>
+      {wombat.name} will be moved to the archive and hidden from the active wombat list. Their full profile and treatment history will be preserved and accessible via the archive link at the bottom of the wombat list.
+    </div>
   </ModalWrap>;
 }
 function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',onClose,onSave,burrows=[],defaultBy='',initialTreatment=null}){
@@ -6452,13 +6525,18 @@ function reducer(state,action){
     // _sync:false ensures local version wins on next supaFullSync merge even if the
     // page is refreshed before the async Supabase push completes (edit never gets lost).
     case 'MARK_WOMBAT_INACTIVE':{
-      // Sets status to 'deceased' or 'missing' and records the inactiveAt/inactiveCause/inactiveNotes fields.
+      // Sets status to 'deceased' and records the inactiveAt/inactiveCause/inactiveNotes fields.
       const wombats=state.wombats.map(w=>w.id===action.id?{...w,status:action.status,inactiveAt:action.inactiveAt,inactiveCause:action.inactiveCause||null,inactiveNotes:action.inactiveNotes||null,_sync:false}:w);
       save('w',wombats);return{...state,wombats};
     }
     case 'MARK_WOMBAT_ACTIVE':{
       // Restores an inactive wombat to an active status, clearing inactive fields.
       const wombats=state.wombats.map(w=>w.id===action.id?{...w,status:action.status,inactiveAt:null,inactiveCause:null,inactiveNotes:null,_sync:false}:w);
+      save('w',wombats);return{...state,wombats};
+    }
+    case 'ARCHIVE_WOMBAT':{
+      // Moves a healthy wombat to the archive — preserves all data, hidden from active lists.
+      const wombats=state.wombats.map(w=>w.id===action.id?{...w,status:'archived',_sync:false}:w);
       save('w',wombats);return{...state,wombats};
     }
     case 'IMPORT_WOMBATS':{const wombats=[...state.wombats,...action.wombats];save('w',wombats);return{...state,wombats};}
@@ -7327,6 +7405,23 @@ function App(){
                 try{localStorage.setItem(SK.wombatOrder,JSON.stringify(p.wombat_order));}catch{}
                 setWombatSortBy(prev=>prev==='date_added'?'custom':prev);
               }
+              // Sync streak — Supabase is the cross-device source of truth.
+              // Compare with whatever is in localStorage (e.g. offline activity) and
+              // keep whichever record is more recent, then bring both stores in sync.
+              {
+                const supaS={count:p.streak_count||0,weekKey:p.streak_week_key||''};
+                const localS=loadStreak();
+                const sd=weekKeyToDate(supaS.weekKey),ld=weekKeyToDate(localS.weekKey);
+                if(sd&&(!ld||sd>=ld)){
+                  // Supabase is more recent (or equal) — write it into localStorage
+                  if(supaS.count||supaS.weekKey)
+                    try{localStorage.setItem(SK.streak,JSON.stringify(supaS));}catch{}
+                }else if(ld&&(!sd||ld>sd)&&localS.count>0){
+                  // Local is newer (was updated while offline) — push it up to Supabase
+                  supa.from('profiles').update({streak_count:localS.count,streak_week_key:localS.weekKey}).eq('id',user.id).then(()=>{}).catch(()=>{});
+                }
+                setStreak(activeStreakCount());
+              }
             }else{const c=getCachedProfile();if(c)setAuthProfile(c);}
           })
           .catch(()=>{const c=getCachedProfile();if(c)setAuthProfile(c);});
@@ -7590,6 +7685,13 @@ function App(){
     if(ACTIVITY_ACTIONS.has(action.type)){
       const newCount=touchStreak();
       setStreak(newCount);
+      // Persist to Supabase so the streak survives across devices and reinstalls.
+      // Fire-and-forget — localStorage is already updated by touchStreak() so a
+      // network failure here doesn't lose the count locally.
+      if(authUser){
+        const s=loadStreak();
+        supa.from('profiles').update({streak_count:s.count,streak_week_key:s.weekKey}).eq('id',authUser.id).then(()=>{}).catch(()=>{});
+      }
     }
     // IDB: persist base64 photo data outside localStorage
     if((action.type==='ADD_WOMBAT_PHOTO'||action.type==='ADD_BURROW_PHOTO')&&action.photo?.dataUrl?.startsWith('data:')){
