@@ -264,8 +264,8 @@ const isInactive=w=>w.status==='deceased';
 const isArchived=w=>w.status==='archived';
 const burrowTone=s=>({active:'sage',inactive:'amber',damaged:'rose'}[s]||'pearl');
 const burrowStatusLabel=s=>({active:'Active',inactive:'Inactive',damaged:'Damaged'}[s]||(s?s.charAt(0).toUpperCase()+s.slice(1):s));
-const nextWombatCode=wombats=>{const nums=wombats.map(w=>parseInt((w.code||'').slice(1)||'0')).filter(n=>n>0);const n=nums.length?Math.max(...nums)+1:1;return'W'+String(n).padStart(4,'0');};
-const nextBurrowCode=burrows=>{const nums=burrows.map(b=>parseInt((b.code||'').slice(1)||'0')).filter(n=>n>0);const n=nums.length?Math.max(...nums)+1:1;return'B'+String(n).padStart(4,'0');};
+const nextWombatCode=wombats=>{const used=new Set(wombats.map(w=>parseInt((w.code||'').slice(1)||'0')).filter(n=>n>0));let n=1;while(used.has(n))n++;return'W'+String(n).padStart(4,'0');};
+const nextBurrowCode=burrows=>{const used=new Set(burrows.map(b=>parseInt((b.code||'').slice(1)||'0')).filter(n=>n>0));let n=1;while(used.has(n))n++;return'B'+String(n).padStart(4,'0');};
 // After a full sync, detect duplicate display codes (can happen when two volunteers both
 // add records while offline and each gets auto-assigned the same W/B number).
 // The earliest-created record keeps its code; later arrivals get the next available number.
@@ -284,6 +284,14 @@ const deduplicateCodes=(records,prefix)=>{
   });
   return{records:out,changed};
 };
+/* GPS helper — always uses the hardware GPS chip (enableHighAccuracy:true).
+   Network/WiFi positioning (the default) is only accurate to 20-100m and
+   causes nearby burrows to all land on the same point. */
+const gpsLocate=(onSuccess,onError)=>navigator.geolocation.getCurrentPosition(
+  onSuccess,
+  onError||(()=>{}),
+  {enableHighAccuracy:true,timeout:15000,maximumAge:0}
+);
 /* CSV helpers */
 const toCSV=(headers,rows)=>{const esc=v=>{if(v==null)return'';const s=String(v);return(s.includes(',')||s.includes('"')||s.includes('\n'))?`"${s.replace(/"/g,'""')}"`:`${s}`;};return[headers,...rows].map(r=>r.map(esc).join(',')).join('\r\n');};
 const dlCSV=(filename,headers,rows)=>{const blob=new Blob(['\uFEFF'+toCSV(headers,rows)],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=filename;a.click();URL.revokeObjectURL(url);};
@@ -1087,7 +1095,7 @@ let _syncSeq=0;
 const wombatToDb=(w,uid)=>({id:w.id,created_by:uid||null,squad_id:w.squadId||null,name:w.name,sex:w.sex||null,age_class:w.ageClass||null,status:w.status||null,severity:w.severity||{},burrow_ids:w.burrowIds||[],first_seen:w.firstSeen||null,location:w.location||null,lat:w.lat||null,lng:w.lng||null,notes:w.notes||null,code:w.code||null,location_label:w.locationLabel||null,inactive_at:w.inactiveAt||null,inactive_cause:w.inactiveCause||null,inactive_notes:w.inactiveNotes||null,assignees:w.assignees||[]});
 const dbToWombat=r=>({id:r.id,name:r.name,sex:r.sex,ageClass:r.age_class,status:r.status==='mange'?'under_treatment':r.status,severity:r.severity||{},burrowIds:r.burrow_ids||[],firstSeen:r.first_seen,location:r.location,lat:r.lat,lng:r.lng,notes:r.notes,code:r.code,locationLabel:r.location_label||null,inactiveAt:r.inactive_at||null,inactiveCause:r.inactive_cause||null,inactiveNotes:r.inactive_notes||null,squadId:r.squad_id||null,assignees:r.assignees||[],_createdBy:r.created_by,_sync:true});
 const burrowToDb=(b,uid)=>({id:b.id,created_by:uid||null,squad_id:b.squadId||null,name:b.name,status:b.status||null,location:b.location||null,lat:b.lat||null,lng:b.lng||null,habitat:b.habitat||{},wombat_ids:b.wombatIds||[],last_checked:b.lastChecked||null,next_check:b.nextCheck||null,entrance_height_cm:b.entranceHeightCm||null,entrance_width_cm:b.entranceWidthCm||null,orientation:b.orientation||null,code:b.code||null});
-const dbToBurrow=r=>({id:r.id,name:r.name,status:r.status,location:r.location,lat:r.lat,lng:r.lng,habitat:r.habitat||{},wombatIds:r.wombat_ids||[],lastChecked:r.last_checked,nextCheck:r.next_check,entranceHeightCm:r.entrance_height_cm,entranceWidthCm:r.entrance_width_cm,orientation:r.orientation,code:r.code,squadId:r.squad_id||null,_createdBy:r.created_by,_sync:true});
+const dbToBurrow=r=>({id:r.id,name:r.name,status:r.status,location:r.location,lat:r.lat,lng:r.lng,habitat:r.habitat||{},wombatIds:r.wombat_ids||[],lastChecked:r.last_checked,nextCheck:r.next_check,entranceHeightCm:r.entrance_height_cm,entranceWidthCm:r.entrance_width_cm,orientation:r.orientation,code:r.code,squadId:r.squad_id||null,_createdBy:r.created_by,_createdAt:r.created_at||null,_sync:true});
 const treatmentToDb=(t,uid)=>({id:t.id,wombat_id:t.wombatId,created_by:uid||null,at:t.at,by_name:t.by||null,product:t.product||null,dose:t.dose||null,method:t.method||null,severity:t.severity||null,regions:t.regions||{},note:t.note||null,linked_burrow_id:t.linkedBurrowId||null,marked_recovered:t.markedRecovered||false});
 const dbToTreatment=r=>({id:r.id,wombatId:r.wombat_id,at:r.at,by:r.by_name,product:r.product,dose:r.dose,method:r.method,severity:r.severity,regions:r.regions||{},note:r.note,linkedBurrowId:r.linked_burrow_id||null,markedRecovered:r.marked_recovered||false,_createdBy:r.created_by,_sync:true});
 const sightingToDb=(s,uid)=>({id:s.id,wombat_id:s.wombatId,created_by:uid||null,at:s.at,lat:s.lat||null,lng:s.lng||null,note:s.note||null});
@@ -1496,6 +1504,21 @@ async function syncAction(action,userId){
       }
       case'UPDATE_BURROW':  {const b=await fromIdb('b',action.id);if(b)await push('burrows',burrowToDb({...b,...action.patch},userId));break;}
       case'IMPORT_BURROWS': for(const b of (action.burrows||[]))await push('burrows',burrowToDb(b,userId)); break;
+      case'ASSIGN_MISSING_CODES':{
+        const bs=await idbGetAll(STORE.b);for(const b of bs.filter(b=>b.code))await push('burrows',burrowToDb(b,userId));
+        const ws=await idbGetAll(STORE.w);for(const w of ws.filter(w=>w.code))await push('wombats',wombatToDb(w,userId));
+        break;
+      }
+      case'RENUMBER_BURROWS':{
+        const bs=await idbGetAll(STORE.b);
+        const rows=bs.map(b=>burrowToDb(b,userId));
+        for(let i=0;i<rows.length;i+=200){
+          const chunk=rows.slice(i,i+200);
+          const{error}=await supa.from('burrows').upsert(chunk,{onConflict:'id'});
+          if(error)console.warn('[Supa] renumber chunk failed:',error);
+        }
+        break;
+      }
       case'DELETE_BURROW': {
         await del('burrows',action.id);
         // Explicitly delete child records — don't rely on CASCADE DELETE being configured in Supabase.
@@ -2835,7 +2858,7 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
 
   const flyToUser=()=>{
     if(!navigator.geolocation)return alert('Geolocation is not available on this device.');
-    navigator.geolocation.getCurrentPosition(pos=>{
+    gpsLocate(pos=>{
       const{latitude:lat,longitude:lng}=pos.coords;
       if(!leafletRef.current)return;
       leafletRef.current.flyTo([lat,lng],15,{duration:1.2});
@@ -2917,7 +2940,7 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
     if(tileLayerRef.current){tileLayerRef.current.remove();tileLayerRef.current=null;}
     const url=satellite?TILE_SAT:theme==='dark'?TILE_CARTO:TILE_OSM;
     const attr=satellite?ATTR_SAT:ATTR_OSM;
-    tileLayerRef.current=L.tileLayer(url,{attribution:attr,maxZoom:19}).addTo(map);
+    tileLayerRef.current=L.tileLayer(url,{attribution:attr,maxNativeZoom:19,maxZoom:22}).addTo(map);
   },[satellite]);
 
   useEffect(()=>{
@@ -2933,8 +2956,8 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
     const CPATH='M9 7l1.5-3h3L15 7';
     const makeBurrowIcon=(color,hasCamera=false)=>L.divIcon({
       className:'',
-      html:`<div style="position:relative;width:12px;height:12px;border-radius:3px;background:${color};border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.35)">${hasCamera?`<div style="position:absolute;top:-6px;right:-7px;width:12px;height:12px;border-radius:50%;background:#7A887E;border:1.5px solid #fff;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 4px rgba(0,0,0,0.35)"><svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="18" height="13" rx="2.5"/><circle cx="12" cy="13.5" r="3.5"/><path d="${CPATH}"/></svg></div>`:''}</div>`,
-      iconSize:[12,12],iconAnchor:[6,6],
+      html:`<div style="position:relative;width:7px;height:7px;border-radius:2px;background:${color};border:1.5px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.35)">${hasCamera?`<div style="position:absolute;top:-5px;right:-6px;width:10px;height:10px;border-radius:50%;background:#7A887E;border:1.5px solid #fff;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 4px rgba(0,0,0,0.35)"><svg width="6" height="6" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="18" height="13" rx="2.5"/><circle cx="12" cy="13.5" r="3.5"/><path d="${CPATH}"/></svg></div>`:''}</div>`,
+      iconSize:[7,7],iconAnchor:[3,3],
     });
     const q=searchQuery.trim().toLowerCase();
     const matchW=w=>!q||(w.name||'').toLowerCase().includes(q)||(w.location||'').toLowerCase().includes(q);
@@ -3764,7 +3787,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
                 </button>
               </div>
             : <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
-                <button onClick={()=>{if(!navigator.geolocation)return alert('Geolocation unavailable.');navigator.geolocation.getCurrentPosition(async pos=>{const patch={lat:pos.coords.latitude,lng:pos.coords.longitude};const loc=await reverseGeocode(pos.coords.latitude,pos.coords.longitude);if(loc)patch.location=loc;dispatch({type:'UPDATE_WOMBAT',id:w.id,patch});setShowLocPicker(false);},()=>alert('Could not get location.'));}} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'11px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
+                <button onClick={()=>{if(!navigator.geolocation)return alert('Geolocation unavailable.');gpsLocate(async pos=>{const patch={lat:pos.coords.latitude,lng:pos.coords.longitude};const loc=await reverseGeocode(pos.coords.latitude,pos.coords.longitude);if(loc)patch.location=loc;dispatch({type:'UPDATE_WOMBAT',id:w.id,patch});setShowLocPicker(false);},()=>alert('Could not get location.'));}} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'11px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
                   {Ico.location(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Current GPS</span>
                 </button>
                 <button onClick={()=>setShowLocMapPicker(true)} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'11px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
@@ -3840,8 +3863,8 @@ function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
   }).slice().sort((a,b)=>{
     if(sortBy==='location') return (a.location||'').localeCompare(b.location||'');
     if(sortBy==='last_logged'){
-      const al=data.burrowLogs.filter(x=>x.burrowId===a.id).sort((p,q)=>new Date(q.at)-new Date(p.at))[0]?.at||'';
-      const bl=data.burrowLogs.filter(x=>x.burrowId===b.id).sort((p,q)=>new Date(q.at)-new Date(p.at))[0]?.at||'';
+      const al=data.burrowLogs.filter(x=>x.burrowId===a.id).sort((p,q)=>new Date(q.at)-new Date(p.at))[0]?.at||a.lastChecked||'';
+      const bl=data.burrowLogs.filter(x=>x.burrowId===b.id).sort((p,q)=>new Date(q.at)-new Date(p.at))[0]?.at||b.lastChecked||'';
       return bl.localeCompare(al);
     }
     const dd=new Date(b.lastChecked||0)-new Date(a.lastChecked||0);
@@ -4312,7 +4335,7 @@ function SquadAreaEditor({initialBounds,onSave,onCancel,saveLabel='Save Home Are
   const handleLocate=()=>{
     if(!navigator.geolocation){setLocError(true);return;}
     setLocError(false);
-    navigator.geolocation.getCurrentPosition(
+    gpsLocate(
       pos=>{
         const{latitude:lat,longitude:lng}=pos.coords;
         if(typeof lat!=='number'||isNaN(lat)){setLocError(true);return;}
@@ -4756,7 +4779,7 @@ function SquadModal({onClose,onBack,authSquad,authUser,setAuthSquad,cacheSquad,c
   </>;
 }
 
-function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,onToggleSignIn,data,onExport,onCSVImport,authUser,authProfile,authSquad,onOpenSquad,allSquads,onSwitchSquad}){
+function ProfileSheet({onClose,onToggleTheme,theme,onEditProfile,onFAQ,signedIn,onToggleSignIn,data,onExport,onCSVImport,onAssignCodes,onRenumberBurrows,authUser,authProfile,authSquad,onOpenSquad,allSquads,onSwitchSquad}){
   const t=useTheme();
   const [page,setPage]=useState('main'); // 'main' | 'data'
   const userName=(typeof localStorage!=='undefined'&&localStorage.getItem(SK.userName))||(authProfile?.display_name)||'Volunteer';
@@ -5007,7 +5030,7 @@ function ExportSheet({data,onClose,onBack}){
     const rows=data.burrows.map(b=>{
       const lastLog=data.burrowLogs.filter(l=>l.burrowId===b.id).sort((a,c)=>new Date(c.at)-new Date(a.at))[0];
       const assoc=data.wombats.filter(w=>w.burrowIds?.includes(b.id)).map(w=>w.code||w.name).join('; ');
-      return[b.code||b.id,b.name,(lastLog?.at||b.lastChecked||'').slice(0,10),b.lat??'',b.lng??'',b.location||'',burrowStatusLabel(b.status),lastLog?.heightCm||'',lastLog?.widthCm||'',lastLog?.orientation||'',b.habitat?.substrate||'',b.habitat?.vegetation||'',lastLog?.by||'',assoc,b.habitat?.notes||''];
+      return[b.code||b.id,b.name,(lastLog?.at||b.lastChecked||'').slice(0,10),b.lat??'',b.lng??'',b.location||'',burrowStatusLabel(b.status),lastLog?.heightCm||b.entranceHeightCm||'',lastLog?.widthCm||b.entranceWidthCm||'',lastLog?.orientation||b.orientation||'',b.habitat?.substrate||'',b.habitat?.vegetation||'',lastLog?.by||'',assoc,b.habitat?.notes||''];
     });
     dlCSV(`wombatwatch-burrows-${ds}.csv`,headers,rows);
     onClose();
@@ -5726,7 +5749,7 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
               onClick={()=>{
                 if(!navigator.geolocation){setLocError(true);return;}
                 setLocError(false);
-                navigator.geolocation.getCurrentPosition(pos=>{
+                gpsLocate(pos=>{
                   const lat=pos.coords?.latitude;
                   const lng=pos.coords?.longitude;
                   // Validate — GPS can return NaN on some devices when offline
@@ -5869,7 +5892,7 @@ function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',o
   const [showBurrowSearch,setShowBurrowSearch]=useState(false);
   const useCurrentLocation=()=>{
     if(!navigator.geolocation)return alert('Geolocation is not available on this device.');
-    navigator.geolocation.getCurrentPosition(
+    gpsLocate(
       async pos=>{
         const lat=pos.coords.latitude,lng=pos.coords.longitude;
         setLocation({lat,lng});
@@ -6192,7 +6215,7 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
   const set=(k,v)=>setForm(f=>({...f,[k]:v}));
   const useCurrentLocation=()=>{
     if(!navigator.geolocation)return alert('Geolocation is not available on this device.');
-    navigator.geolocation.getCurrentPosition(
+    gpsLocate(
       async pos=>{
         const lat=pos.coords.latitude,lng=pos.coords.longitude;
         setLocation({lat,lng});
@@ -6322,7 +6345,7 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
   const useCurrentLocation=()=>{
     if(!navigator.geolocation)return alert('Geolocation is not available on this device.');
     setLocFailed(false);
-    navigator.geolocation.getCurrentPosition(
+    gpsLocate(
       async pos=>{
         setLocFailed(false);
         const lat=pos.coords.latitude,lng=pos.coords.longitude;
@@ -6335,7 +6358,7 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
   };
   useEffect(()=>{
     if(!initialLocation&&navigator.geolocation){
-      navigator.geolocation.getCurrentPosition(
+      gpsLocate(
         async pos=>{
           setLocFailed(false);
           const lat=pos.coords.latitude,lng=pos.coords.longitude;
@@ -6472,7 +6495,7 @@ function AddSightingModal({wombats,onClose,onSave}){
   const set=(k,v)=>setForm(f=>({...f,[k]:v}));
   const getGPS=()=>{
     if(!navigator.geolocation)return alert('Geolocation is not available on this device.');
-    navigator.geolocation.getCurrentPosition(
+    gpsLocate(
       pos=>{set('lat',pos.coords.latitude.toFixed(6));set('lng',pos.coords.longitude.toFixed(6));},
       ()=>alert('Could not get your location. Please check permissions.')
     );
@@ -6557,7 +6580,40 @@ function reducer(state,action){
 
     // ── Burrows ──────────────────────────────────────────────────
     case 'ADD_BURROW':{const burrows=[...state.burrows,{...action.burrow,_sync:false}];save('b',burrows);return{...state,burrows};}
-    case 'IMPORT_BURROWS':{const burrows=[...state.burrows,...action.burrows];save('b',burrows);return{...state,burrows};}
+    case 'ASSIGN_MISSING_CODES':{
+      const allSoFar=[...state.burrows.filter(b=>b.code)];
+      const burrows=state.burrows.map(b=>{
+        if(b.code)return b;
+        const code=nextBurrowCode(allSoFar);
+        allSoFar.push({...b,code});
+        return{...b,code,_sync:false};
+      });
+      const wAllSoFar=[...state.wombats.filter(w=>w.code)];
+      const wombats=state.wombats.map(w=>{
+        if(w.code)return w;
+        const code=nextWombatCode(wAllSoFar);
+        wAllSoFar.push({...w,code});
+        return{...w,code,_sync:false};
+      });
+      save('b',burrows);save('w',wombats);return{...state,burrows,wombats};
+    }
+    case 'RENUMBER_BURROWS':{
+      const sorted=[...state.burrows].sort((a,b)=>new Date(a._createdAt||'2099').getTime()-new Date(b._createdAt||'2099').getTime());
+      const codeMap=new Map(sorted.map((b,i)=>[b.id,'B'+String(i+1).padStart(4,'0')]));
+      const burrows=state.burrows.map(b=>({...b,code:codeMap.get(b.id)||b.code,_sync:false}));
+      save('b',burrows);return{...state,burrows};
+    }
+    case 'IMPORT_BURROWS':{
+      const allSoFar=[...state.burrows];
+      const withCodes=action.burrows.map(b=>{
+        if(b.code)return b;
+        const code=nextBurrowCode(allSoFar);
+        allSoFar.push({...b,code});
+        return{...b,code};
+      });
+      const burrows=[...state.burrows,...withCodes];
+      save('b',burrows);return{...state,burrows};
+    }
     case 'UPDATE_BURROW':{const burrows=state.burrows.map(b=>b.id===action.id?{...b,...action.patch,_sync:false}:b);save('b',burrows);return{...state,burrows};}
     // _sync:false mirrors the UPDATE_WOMBAT fix: local edit wins merge until server confirms.
     case 'DELETE_BURROW':{
@@ -6744,7 +6800,7 @@ function EditWombatModal({wombat,onClose,onSave}){
             {showGeoSearch
               ? <GeoSearch onSelect={r=>{setLocation(r);setShowGeoSearch(false);}} onCancel={()=>setShowGeoSearch(false)}/>
               : <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
-                  <button onClick={()=>{if(!navigator.geolocation)return;navigator.geolocation.getCurrentPosition(async pos=>{const lat=pos.coords.latitude,lng=pos.coords.longitude;const loc=await reverseGeocode(lat,lng);setLocation({lat,lng,address:loc||''});},()=>alert('Location unavailable.'));}} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
+                  <button onClick={()=>{if(!navigator.geolocation)return;gpsLocate(async pos=>{const lat=pos.coords.latitude,lng=pos.coords.longitude;const loc=await reverseGeocode(lat,lng);setLocation({lat,lng,address:loc||''});},()=>alert('Location unavailable.'));}} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
                     {Ico.location(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Current GPS</span>
                   </button>
                   <button onClick={()=>setShowMapPicker(true)} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
@@ -6824,7 +6880,7 @@ function EditBurrowModal({burrow,wombats=[],onClose,onSave}){
             {showGeoSearch
               ? <GeoSearch onSelect={r=>{setLocation(r);setShowGeoSearch(false);}} onCancel={()=>setShowGeoSearch(false)}/>
               : <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
-                  <button onClick={()=>{if(!navigator.geolocation)return;navigator.geolocation.getCurrentPosition(async pos=>{const lat=pos.coords.latitude,lng=pos.coords.longitude;const loc=await reverseGeocode(lat,lng);setLocation({lat,lng,address:loc||''});},()=>alert('Location unavailable.'));}} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
+                  <button onClick={()=>{if(!navigator.geolocation)return;gpsLocate(async pos=>{const lat=pos.coords.latitude,lng=pos.coords.longitude;const loc=await reverseGeocode(lat,lng);setLocation({lat,lng,address:loc||''});},()=>alert('Location unavailable.'));}} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
                     {Ico.location(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Current GPS</span>
                   </button>
                   <button onClick={()=>setShowMapPicker(true)} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
@@ -7874,7 +7930,7 @@ function App(){
       <div style={{flexShrink:0,height:'62px',background:'var(--tabbar)',borderTop:'1px solid var(--tabborder)'}}/>
       <TabBar active={screen} onNav={nav} onFAB={onFAB}/>
 
-      {modal==='profile'&&<ProfileSheet onClose={()=>setModal(null)} onToggleTheme={toggleTheme} theme={theme} onEditProfile={()=>setModal('edit-profile')} onFAQ={()=>setModal('faq')} signedIn={signedIn} onToggleSignIn={toggleSignIn} data={data} onExport={()=>setModal('export')} onCSVImport={()=>setModal('csv-import')} authUser={authUser} authProfile={authProfile} authSquad={authSquad} onOpenSquad={()=>setModal('squad')} allSquads={allSquads} onSwitchSquad={()=>setModal('switch-squad')}/>}
+      {modal==='profile'&&<ProfileSheet onClose={()=>setModal(null)} onToggleTheme={toggleTheme} theme={theme} onEditProfile={()=>setModal('edit-profile')} onFAQ={()=>setModal('faq')} signedIn={signedIn} onToggleSignIn={toggleSignIn} data={data} onExport={()=>setModal('export')} onCSVImport={()=>setModal('csv-import')} onAssignCodes={()=>syncDispatch({type:'ASSIGN_MISSING_CODES'})} onRenumberBurrows={()=>syncDispatch({type:'RENUMBER_BURROWS'})} authUser={authUser} authProfile={authProfile} authSquad={authSquad} onOpenSquad={()=>setModal('squad')} allSquads={allSquads} onSwitchSquad={()=>setModal('switch-squad')}/>}
       {modal==='squad'&&authUser&&<SquadModal onClose={()=>setModal(null)} onBack={()=>setModal('profile')} authSquad={authSquad} authUser={authUser} setAuthSquad={setAuthSquad} cacheSquad={cacheSquad} clearSquadCache={clearSquadCache}/>}
       {modal==='switch-squad'&&allSquads.length>1&&<SwitchSquadModal onClose={()=>setModal(null)} allSquads={allSquads} currentSquadId={authSquad?.id} onSwitch={switchSquad} online={online}/>}
       {modal==='edit-profile'&&<EditProfileModal onClose={()=>setModal(null)}/>}
