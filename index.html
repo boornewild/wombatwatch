@@ -38,6 +38,7 @@ input[type="date"],input[type="datetime-local"]{-webkit-appearance:none;appearan
 button{cursor:pointer;font-family:inherit;border:none;background:none;padding:0;}
 .leaflet-container{height:100%;width:100%;}
 @keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
 @keyframes syncBar{0%{opacity:1;transform:scaleX(0.2) translateX(-200%)}50%{opacity:1;transform:scaleX(0.6) translateX(50%)}100%{opacity:0;transform:scaleX(0.2) translateX(300%)}}
 .search-input::placeholder{color:rgba(255,255,255,0.45);}
 /* Safe-area custom properties (populated by the browser) */
@@ -544,6 +545,9 @@ const SK={
   streak:       'ww_streak',       // { count: number, weekKey: string } — volunteer streak
   wombatOrder:  'ww_wombat_order', // string[] — custom wombat sort order (IDs)
 };
+// Incremental sync timestamps — not versioned (survive data resets intentionally)
+const LS_SYNC_TS='ww_last_sync_ts';       // ISO string — timestamp of last successful sync
+const LS_FULL_SYNC_DATE='ww_last_full_sync_date'; // date string — when we last did a full sync
 const load=()=>{try{return{
   wombats:JSON.parse(localStorage.getItem(SK.w))||[],
   burrows:JSON.parse(localStorage.getItem(SK.b))||[],
@@ -1785,6 +1789,11 @@ async function supaFullSync(){
     console.info('[Sync] supaFullSync discarding stale result — newer sync in progress');
     return undefined;
   }
+  // Record when this full sync succeeded so incremental syncs know their baseline.
+  // Also record the date so the background timer knows a full sync has run today.
+  const _now=new Date().toISOString();
+  localStorage.setItem(LS_SYNC_TS,_now);
+  localStorage.setItem(LS_FULL_SYNC_DATE,new Date().toDateString());
   return filterSyncToSquad({
     _fetchStart,  // consumed by resolveWithCurrentQueue to detect in-flight push races
     wombats:     merge(w, 'w',  dbToWombat),
@@ -1795,6 +1804,50 @@ async function supaFullSync(){
     wombatPhotos:merge(wp,'wp', dbToWombatPhoto),
     burrowPhotos:merge(bp,'bp', dbToBurrowPhoto),
   },filterSquadId);
+}
+
+// ── Incremental sync ──────────────────────────────────────────
+// Fetches only records changed since the last sync using updated_at.
+// Much cheaper than supaFullSync — only transfers what actually changed.
+// Returns null if no baseline timestamp exists (caller should fall back to full sync).
+// Returns undefined if the result is stale (newer sync in flight).
+// Does NOT handle deletions — the background timer triggers a full sync once per day for that.
+async function supaIncrementalSync(){
+  const lastTs=localStorage.getItem(LS_SYNC_TS);
+  if(!lastTs)return null;
+  const _squadIdAtStart=_currentSquadId;
+  const _thisSeq=++_syncSeq;
+  const syncStart=new Date().toISOString();
+  try{
+    const results=await Promise.allSettled([
+      supa.from('wombats').select('*').gte('updated_at',lastTs),
+      supa.from('burrows').select('*').gte('updated_at',lastTs),
+      supa.from('treatments').select('*').gte('updated_at',lastTs),
+      supa.from('sightings').select('*').gte('updated_at',lastTs),
+      supa.from('burrow_logs').select('*').gte('updated_at',lastTs),
+      supa.from('wombat_photos').select('id,wombat_id,is_profile,at,created_by').gte('updated_at',lastTs),
+      supa.from('burrow_photos').select('id,burrow_id,is_profile,at,created_by').gte('updated_at',lastTs),
+    ]);
+    if(_thisSeq!==_syncSeq)return undefined;
+    if(_squadIdAtStart&&_currentSquadId&&_squadIdAtStart!==_currentSquadId)return undefined;
+    const anyOk=results.some(r=>r.status==='fulfilled'&&!r.value?.error);
+    if(!anyOk)return null; // all failed — offline or error, don't advance timestamp
+    const val=r=>r.status==='fulfilled'&&!r.value?.error?(r.value?.data||[]):[];
+    const data=filterSyncToSquad({
+      wombats:    val(results[0]).map(dbToWombat),
+      burrows:    val(results[1]).map(dbToBurrow),
+      treatments: val(results[2]).map(dbToTreatment),
+      sightings:  val(results[3]).map(dbToSighting),
+      burrowLogs: val(results[4]).map(dbToBurrowLog),
+      wombatPhotos:val(results[5]).map(dbToWombatPhoto),
+      burrowPhotos:val(results[6]).map(dbToBurrowPhoto),
+    },_currentSquadId);
+    localStorage.setItem(LS_SYNC_TS,syncStart);
+    return data;
+  }catch(e){
+    console.warn('[Sync] incremental failed:',e);
+    return null;
+  }
 }
 
 // ── Late-binding queue resolution ─────────────────────────────
@@ -2961,7 +3014,7 @@ function MapScreen({data,nav,onFAB,openProfile,theme,onAddAt,wombatFilters,setWo
     });
     const q=searchQuery.trim().toLowerCase();
     const matchW=w=>!q||(w.name||'').toLowerCase().includes(q)||(w.location||'').toLowerCase().includes(q);
-    const matchB=b=>!q||(b.name||'').toLowerCase().includes(q)||(b.location||'').toLowerCase().includes(q);
+    const matchB=b=>!q||(b.name||'').toLowerCase().includes(q)||(b.location||'').toLowerCase().includes(q)||(b.code||'').toLowerCase().includes(q);
     // Wombats (null = hidden, empty set = show all, non-empty = filtered)
     if(wombatFilters!==null){
       // by default show active only; inactive (deceased) only shown when explicitly filtered
@@ -3558,7 +3611,7 @@ function WombatProfile({wombatId,data,nav,dispatch,authProfile,authUser}){
       {showMenu&&<>
         <div onClick={()=>setShowMenu(false)} style={{position:'fixed',inset:0,zIndex:1100}}/>
         <div style={{position:'absolute',top:42,right:0,zIndex:1200,background:t.surface,borderRadius:14,boxShadow:'0 4px 24px rgba(0,0,0,0.18)',padding:'6px 0',minWidth:180}}>
-          {!inactive&&!archived&&<button onClick={()=>{setShowMenu(false);setShowMarkArchive(true);}} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'11px 16px',background:'none',border:'none',textAlign:'left',cursor:'pointer'}}>
+          {!archived&&<button onClick={()=>{setShowMenu(false);setShowMarkArchive(true);}} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'11px 16px',background:'none',border:'none',textAlign:'left',cursor:'pointer'}}>
               <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke={t.mid} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
               <span style={{fontSize:14,fontWeight:600,color:t.mid}}>Archive wombat</span>
             </button>}
@@ -3858,7 +3911,7 @@ function BurrowList({data,nav,onFAB,openProfile,dispatch,authUser,authProfile,fi
   const [visibleCount,setVisibleCount]=useState(PAGE_SIZE);
   const filtered=data.burrows.filter(b=>{
     const ms=filterStatus==='all'||b.status===filterStatus;
-    const mq=!search||b.name.toLowerCase().includes(search.toLowerCase());
+    const mq=!search||b.name.toLowerCase().includes(search.toLowerCase())||(b.code||'').toLowerCase().includes(search.toLowerCase());
     return ms&&mq;
   }).slice().sort((a,b)=>{
     if(sortBy==='location') return (a.location||'').localeCompare(b.location||'');
@@ -5909,7 +5962,7 @@ function AddTreatmentModal({wombatId,wombatName,wombatStatus='under_treatment',o
     });
     e.target.value='';
   };
-  const filteredBurrows=burrows.filter(b=>b.name.toLowerCase().includes(burrowSearch.toLowerCase()));
+  const filteredBurrows=burrows.filter(b=>b.name.toLowerCase().includes(burrowSearch.toLowerCase())||(b.code||'').toLowerCase().includes(burrowSearch.toLowerCase()));
   const extrasCount=(form.method?1:0)+(form.severity?1:0)+(location||linkedBurrow?1:0)+attachedPhotos.length;
   /* ── plain text divider toggle ── */
   const MoreToggle=()=><button onClick={()=>setShowMore(s=>!s)} style={{display:'flex',alignItems:'center',gap:8,background:'none',border:'none',cursor:'pointer',padding:'2px 0',width:'100%'}}>
@@ -6225,7 +6278,7 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
       ()=>alert('Could not get your location. Please check permissions.')
     );
   };
-  const filteredBurrows=burrows.filter(b=>b.name.toLowerCase().includes(burrowSearch.toLowerCase()));
+  const filteredBurrows=burrows.filter(b=>b.name.toLowerCase().includes(burrowSearch.toLowerCase())||(b.code||'').toLowerCase().includes(burrowSearch.toLowerCase()));
   return <ModalWrap title="New Wombat" subtitle="Register a newly identified wombat" onClose={onClose} saveLabel="Save Wombat" onSave={()=>{
     if(!form.name.trim())return alert('Please enter a name.');
     if(!form.firstSeen)return alert('Please enter the first seen date.');
@@ -6337,43 +6390,80 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
   const toggleWombat=id=>setForm(f=>({...f,wombatIds:f.wombatIds.includes(id)?f.wombatIds.filter(x=>x!==id):[...f.wombatIds,id]}));
   const [location,setLocation]=useState(initialLocation);
   const [locFailed,setLocFailed]=useState(false);
+  const [locAccuracy,setLocAccuracy]=useState(null); // metres, null = not yet known
+  const [locAcquiring,setLocAcquiring]=useState(false);
   const [showMapPicker,setShowMapPicker]=useState(false);
   const [showGeoSearch,setShowGeoSearch]=useState(false);
   const [showMore,setShowMore]=useState(false);
   const [photoDataUrl,setPhotoDataUrl]=useState(null);
+  const gpsWatchRef=useRef(null);
   const set=(k,v)=>setForm(f=>({...f,[k]:v}));
-  const useCurrentLocation=()=>{
-    if(!navigator.geolocation)return alert('Geolocation is not available on this device.');
-    setLocFailed(false);
-    gpsLocate(
+
+  // Start a watchPosition session. Updates location as accuracy improves;
+  // stops automatically once we have a ≤15m fix. Cleans up on modal close.
+  const startGpsWatch=()=>{
+    if(!navigator.geolocation){setLocFailed(true);return;}
+    if(gpsWatchRef.current!=null)navigator.geolocation.clearWatch(gpsWatchRef.current);
+    setLocFailed(false);setLocAcquiring(true);setLocAccuracy(null);
+    let bestLat=null,bestLng=null,bestAcc=Infinity;
+    const stopWatch=(watchId)=>{navigator.geolocation.clearWatch(watchId);gpsWatchRef.current=null;setLocAcquiring(false);};
+    // Hard cap: stop after 10s with whatever we have, so the spinner never runs forever.
+    // If accuracy never reached 50m, force-fill with the best reading so the user can
+    // still save (they'll see a warning if it's >25m).
+    const fallbackTimer=setTimeout(async()=>{
+      if(gpsWatchRef.current==null)return; // already stopped
+      stopWatch(gpsWatchRef.current);
+      if(bestLat!=null){
+        // Force-fill even if accuracy is worse than 50m — better than leaving the card empty
+        setLocation(p=>p?p:{lat:bestLat,lng:bestLng,accuracy:bestAcc,address:null});
+        const locality=await reverseGeocode(bestLat,bestLng);
+        if(locality)setLocation(p=>p?({...p,address:locality}):null);
+      }
+    },10000);
+    const watchId=navigator.geolocation.watchPosition(
       async pos=>{
-        setLocFailed(false);
-        const lat=pos.coords.latitude,lng=pos.coords.longitude;
-        setLocation({lat,lng});
-        const locality=await reverseGeocode(lat,lng);
-        if(locality)setLocation({lat,lng,address:locality});
-      },
-      ()=>{setLocFailed(true);alert('Could not get your location. Please check permissions.');}
-    );
-  };
-  useEffect(()=>{
-    if(!initialLocation&&navigator.geolocation){
-      gpsLocate(
-        async pos=>{
-          setLocFailed(false);
-          const lat=pos.coords.latitude,lng=pos.coords.longitude;
-          setLocation({lat,lng});
+        const lat=pos.coords.latitude,lng=pos.coords.longitude,acc=Math.round(pos.coords.accuracy);
+        if(typeof lat!=='number'||isNaN(lat))return;
+        setLocAccuracy(acc);
+        // Always track the best reading seen so far (used by the fallback timer)
+        if(acc<bestAcc){bestLat=lat;bestLng=lng;bestAcc=acc;}
+        // Only fill the location card once accuracy is ≤50m — this filters out
+        // cell-tower / WiFi fixes (typically 100–400m) while accepting any real
+        // GPS-chip reading, even under moderate bush canopy.
+        if(acc<=50){
+          setLocation(prev=>{
+            if(!prev||acc<(prev.accuracy??Infinity))return{lat,lng,accuracy:acc,address:prev?.address||null};
+            return prev;
+          });
+        }
+        if(acc<=15){
+          // Ideal fix — stop watching to save battery
+          clearTimeout(fallbackTimer);stopWatch(watchId);
           const locality=await reverseGeocode(lat,lng);
-          if(locality)setLocation({lat,lng,address:locality});
-        },
-        ()=>setLocFailed(true)
-      );
-    }
+          if(locality)setLocation(p=>p?({...p,address:locality}):null);
+        }
+      },
+      ()=>{clearTimeout(fallbackTimer);setLocFailed(true);stopWatch(watchId);},
+      {enableHighAccuracy:true,timeout:10000,maximumAge:0}
+    );
+    gpsWatchRef.current=watchId;
+  };
+
+  // Auto-start on open (skip if a location was pre-supplied, e.g. long-press on map)
+  useEffect(()=>{
+    if(!initialLocation)startGpsWatch();
+    return()=>{if(gpsWatchRef.current!=null)navigator.geolocation.clearWatch(gpsWatchRef.current);};
   },[]);
+
+  const useCurrentLocation=()=>startGpsWatch();
   return <ModalWrap title="New Burrow" subtitle="Log a newly discovered burrow" onClose={onClose} saveLabel="Save Burrow" onSave={()=>{
     if(!form.name.trim())return alert('Please enter a name.');
     if(!form.status)return alert('Please select a status.');
     if(!location)return alert('Please add a location.');
+    if(location.accuracy&&location.accuracy>25){
+      const ok=window.confirm(`GPS accuracy is ±${location.accuracy}m — the pin may be off by that distance. Wait for a better fix, or tap OK to save as-is.`);
+      if(!ok)return;
+    }
     const{substrate,vegetation,notes,trailCamera,orientation,entranceHeightCm,entranceWidthCm,...rest}=form;
     const bId=uid();
     const photo=photoDataUrl?{id:'ph_'+uid(),burrowId:bId,dataUrl:photoDataUrl,isProfile:true,at:new Date().toISOString()}:null;
@@ -6385,23 +6475,31 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
     </FormField>
     <FormField label="Date Observed"><FInput type="date" value={form.lastChecked} onChange={v=>set('lastChecked',v)}/></FormField>
     <FormField label="Location" required>
+      {/* Accuracy pill — shown while watching or once we have a reading */}
+      {(locAcquiring||locAccuracy!=null)&&!locFailed&&<div style={{display:'flex',alignItems:'center',gap:6,marginBottom:6}}>
+        {locAcquiring&&<span style={{display:'inline-block',width:8,height:8,borderRadius:'50%',background:'#D89039',animation:'pulse 1.2s ease-in-out infinite'}}/>}
+        {!locAcquiring&&locAccuracy!=null&&<span style={{display:'inline-block',width:8,height:8,borderRadius:'50%',background:locAccuracy<=15?'#4A7C52':'#D89039'}}/>}
+        <span style={{fontSize:12,color:t.mid}}>
+          {locAcquiring&&!location?'Acquiring GPS fix…':locAcquiring?`Improving fix… ±${locAccuracy}m`:locAccuracy!=null?`GPS locked ±${locAccuracy}m`:''}
+        </span>
+      </div>}
       {location
         ? <div style={{background:t.soft,borderRadius:12,padding:'10px 14px',display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}}>
             <div style={{flex:1,minWidth:0}}>
               {location.address&&<div style={{fontSize:13,fontWeight:600,color:t.ink,marginBottom:2}}>{location.address}</div>}
               {location.lat&&<div style={{fontSize:12,color:t.mid,fontFamily:'monospace'}}>{location.lat.toFixed(5)}, {location.lng.toFixed(5)}</div>}
             </div>
-            <button onClick={()=>{setLocation(null);setShowGeoSearch(false);}} style={{fontSize:12,color:t.mid,background:'none',border:'none',fontWeight:600,cursor:'pointer',flexShrink:0}}>Clear</button>
+            <button onClick={()=>{setLocation(null);setLocAccuracy(null);setShowGeoSearch(false);if(gpsWatchRef.current!=null){navigator.geolocation.clearWatch(gpsWatchRef.current);gpsWatchRef.current=null;}setLocAcquiring(false);}} style={{fontSize:12,color:t.mid,background:'none',border:'none',fontWeight:600,cursor:'pointer',flexShrink:0}}>Clear</button>
           </div>
         : <div style={{display:'flex',flexDirection:'column',gap:8}}>
             {showGeoSearch
               ? <GeoSearch
-                  onSelect={r=>{setLocation(r);setShowGeoSearch(false);}}
+                  onSelect={r=>{setLocation(r);setShowGeoSearch(false);if(gpsWatchRef.current!=null){navigator.geolocation.clearWatch(gpsWatchRef.current);gpsWatchRef.current=null;}setLocAcquiring(false);}}
                   onCancel={()=>setShowGeoSearch(false)}
                 />
               : <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
                   <button onClick={useCurrentLocation} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
-                    {Ico.location(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Current GPS</span>
+                    {Ico.location(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>{locAcquiring?'Getting GPS…':'Current GPS'}</span>
                   </button>
                   <button onClick={()=>setShowMapPicker(true)} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
                     {Ico.map(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Map</span>
@@ -6720,6 +6818,30 @@ function reducer(state,action){
       const burrows=state.burrows.map(b=>b.id===burrowId?{...b,wombatIds:(b.wombatIds||[]).filter(id=>id!==wombatId),_sync:false}:b);
       save('w',wombats);save('b',burrows);
       return{...state,wombats,burrows};
+    }
+
+    // ── Incremental sync ─────────────────────────────────────────
+    case 'PATCH_RECORDS':{
+      // Merges only the records that changed since last sync into existing state.
+      // Local pending changes (_sync:false) always win — server never overwrites unsaved edits.
+      // Deletions are NOT handled here — the daily full sync (REPLACE_ALL) covers those.
+      const patch=(existing,changed)=>{
+        if(!changed||!changed.length)return existing;
+        const m=new Map(existing.map(r=>[r.id,r]));
+        changed.forEach(r=>{const loc=m.get(r.id);if(!loc||loc._sync!==false)m.set(r.id,r);});
+        return[...m.values()];
+      };
+      const burrows=patch(state.burrows,action.data.burrows);
+      const wombats=patch(state.wombats,action.data.wombats);
+      save('b',burrows);save('w',wombats);
+      return{...state,
+        wombats,burrows,
+        treatments:patch(state.treatments,action.data.treatments),
+        sightings:patch(state.sightings,action.data.sightings),
+        burrowLogs:patch(state.burrowLogs,action.data.burrowLogs),
+        wombatPhotos:patch(state.wombatPhotos,action.data.wombatPhotos),
+        burrowPhotos:patch(state.burrowPhotos,action.data.burrowPhotos),
+      };
     }
 
     // ── Full sync ────────────────────────────────────────────────
@@ -7635,17 +7757,27 @@ function App(){
     // the "app sitting open, no interaction" case. Runs every 2 minutes.
     const bgSyncInterval=setInterval(()=>{
       if(!navigator.onLine||!authUser)return;
-      supaFullSync().then(async merged=>{
-        if(!merged)return;
-        const fresh=await resolveWithCurrentQueue(merged);
-        const{records:wombats}=deduplicateCodes(fresh.wombats,'W');
-        const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
-        const synced2=filterSyncToSquad({...fresh,wombats,burrows},_currentSquadId);
-        dispatch({type:'REPLACE_ALL',data:synced2});
-        // Photos are stable between syncs — only hydrate from IDB, don't re-fetch from Storage
-        idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
-      }).catch(()=>{});
-    },300000); // every 5 minutes
+      // Once per day do a full sync to catch any deletions made by other volunteers.
+      // Every other tick uses a cheap incremental sync (only changed records).
+      const today=new Date().toDateString();
+      const lastFullDate=localStorage.getItem(LS_FULL_SYNC_DATE);
+      if(lastFullDate!==today){
+        supaFullSync().then(async merged=>{
+          if(!merged)return;
+          const fresh=await resolveWithCurrentQueue(merged);
+          const{records:wombats}=deduplicateCodes(fresh.wombats,'W');
+          const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
+          const synced2=filterSyncToSquad({...fresh,wombats,burrows},_currentSquadId);
+          dispatch({type:'REPLACE_ALL',data:synced2});
+          idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
+        }).catch(()=>{});
+      }else{
+        supaIncrementalSync().then(patch=>{
+          if(!patch)return;
+          dispatch({type:'PATCH_RECORDS',data:patch});
+        }).catch(()=>{});
+      }
+    },300000); // every 5 minutes (cheap now that most ticks are incremental)
     return()=>{
       window.removeEventListener('online',on);
       window.removeEventListener('offline',off);
@@ -7682,19 +7814,14 @@ function App(){
       }else if(document.visibilityState==='visible'){
         const hiddenMs=hiddenAt?Date.now()-hiddenAt:Infinity;
         hiddenAt=null;
-        if(hiddenMs<30000)return; // too brief — skip
+        if(hiddenMs<120000)return; // skip if hidden < 2 minutes
         if(!authUser||!navigator.onLine)return;
-        supaFullSync().then(async merged=>{
-          if(merged){
-            const fresh=await resolveWithCurrentQueue(merged);
-            const{records:wombats}=deduplicateCodes(fresh.wombats,'W');
-            const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
-            const synced3={...fresh,wombats,burrows};
-            dispatch({type:'REPLACE_ALL',data:synced3});
-            idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
-            cacheRemotePhotosToIdb(synced3.wombatPhotos,synced3.burrowPhotos,dispatch).catch(()=>{});
-            recoverBlankPhotos(synced3.wombatPhotos,synced3.burrowPhotos,dispatch).catch(()=>{});
-          }
+        // Use incremental sync on tab return — reconnect sync (online event) already
+        // does a full sync when coming back from offline, so this just catches
+        // changes that happened while the device stayed connected but app was backgrounded.
+        supaIncrementalSync().then(patch=>{
+          if(!patch)return;
+          dispatch({type:'PATCH_RECORDS',data:patch});
         }).catch(()=>{});
       }
     };
