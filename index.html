@@ -1987,8 +1987,11 @@ function WombatAvatarDark({size=60}){
 }
 // Convert a Blob to a base64 data URL.
 function blobToDataUrl(blob){
-  return new Promise(resolve=>{
-    const r=new FileReader();r.onload=()=>resolve(r.result);r.readAsDataURL(blob);
+  return new Promise((resolve,reject)=>{
+    const r=new FileReader();
+    r.onload=()=>resolve(r.result);
+    r.onerror=()=>reject(new Error('FileReader failed'));
+    r.readAsDataURL(blob);
   });
 }
 // Download a photo and cache it in ww_photo_data IDB.
@@ -2470,7 +2473,7 @@ function WeatherWidget({lat,lng,squadName}){
     });
 
     return()=>{dead=true;};
-  },[]);
+  },[lat,lng]);
 
   const tempStr=wx?.temp!=null?`${wx.temp}°`:'—';
   const hiStr=wx?.hi!=null?`${wx.hi}°`:'—';
@@ -2635,6 +2638,7 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
   const allWombats=data.wombats; // all wombats (incl. inactive) for activity lookups
   const allActivity=[
     ...treatments.map(x=>({...x,type:'treatment',at:x.at})),
+    ...(data.burrowLogs||[]).map(x=>({...x,type:'burrowlog',at:x.at})),
     ...data.wombats.filter(x=>x.firstSeen).map(x=>({...x,type:'wombat_added',at:x.firstSeen})),
     ...burrows.filter(x=>x.lastChecked).map(x=>({...x,type:'burrow_added',at:x.lastChecked})),
   ].sort((a,b)=>new Date(b.at)-new Date(a.at)).slice(0,4);
@@ -6255,10 +6259,15 @@ function LogStatusModal({burrowId,burrowName,onClose,onSave,wombats=[]}){
 }
 
 /* ── ADD WOMBAT MODAL ── */
-function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode=''}){
+function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,recentFix=null,nextCode=''}){
   const t=useTheme();
   const [form,setForm]=useState({name:nextCode,sex:'unknown',ageClass:'adult',status:'',firstSeen:today(),notes:''});
-  const [location,setLocation]=useState(initialLocation);
+  const [location,setLocation]=useState(initialLocation||null);
+  const [locAccuracy,setLocAccuracy]=useState(null);
+  const [locAcquiring,setLocAcquiring]=useState(false);
+  const [locFailed,setLocFailed]=useState(false);
+  const gpsWatchRef=useRef(null);
+  const gpsFallbackRef=useRef(null);
   const [linkedBurrow,setLinkedBurrow]=useState(null);
   const [showMapPicker,setShowMapPicker]=useState(false);
   const [showGeoSearch,setShowGeoSearch]=useState(false);
@@ -6266,24 +6275,73 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
   const [showBurrowSearch,setShowBurrowSearch]=useState(false);
   const [photoDataUrl,setPhotoDataUrl]=useState(null);
   const set=(k,v)=>setForm(f=>({...f,[k]:v}));
-  const useCurrentLocation=()=>{
-    if(!navigator.geolocation)return alert('Geolocation is not available on this device.');
-    gpsLocate(
+
+  const startGpsWatch=()=>{
+    if(!navigator.geolocation){setLocFailed(true);return;}
+    if(gpsWatchRef.current!=null)navigator.geolocation.clearWatch(gpsWatchRef.current);
+    // Cancel any pending fallback timer from a previous call (H-1: double-tap fix)
+    if(gpsFallbackRef.current!=null){clearTimeout(gpsFallbackRef.current);gpsFallbackRef.current=null;}
+    setLocFailed(false);setLocAcquiring(true);setLocAccuracy(null);
+    let bestLat=null,bestLng=null,bestAcc=Infinity;
+    const stopWatch=(wid)=>{navigator.geolocation.clearWatch(wid);gpsWatchRef.current=null;gpsFallbackRef.current=null;setLocAcquiring(false);};
+    gpsFallbackRef.current=setTimeout(async()=>{
+      if(gpsWatchRef.current==null)return;
+      stopWatch(gpsWatchRef.current);
+      if(bestLat!=null){
+        setLocation(p=>p?p:{lat:bestLat,lng:bestLng,accuracy:bestAcc,address:null});
+        const locality=await reverseGeocode(bestLat,bestLng);
+        if(locality)setLocation(p=>p?({...p,address:locality}):null);
+      }
+    },10000);
+    const watchId=navigator.geolocation.watchPosition(
       async pos=>{
-        const lat=pos.coords.latitude,lng=pos.coords.longitude;
-        setLocation({lat,lng});
-        const locality=await reverseGeocode(lat,lng);
-        if(locality)setLocation({lat,lng,address:locality});
+        const lat=pos.coords.latitude,lng=pos.coords.longitude,acc=Math.round(pos.coords.accuracy);
+        if(typeof lat!=='number'||isNaN(lat))return;
+        setLocAccuracy(acc);
+        if(acc<bestAcc){bestLat=lat;bestLng=lng;bestAcc=acc;}
+        if(acc<=50){
+          setLocation(prev=>{
+            if(!prev||acc<(prev.accuracy??Infinity))return{lat,lng,accuracy:acc,address:prev?.address||null};
+            return prev;
+          });
+        }
+        if(acc<=5){
+          if(gpsFallbackRef.current!=null){clearTimeout(gpsFallbackRef.current);gpsFallbackRef.current=null;}
+          stopWatch(watchId);
+          const locality=await reverseGeocode(lat,lng);
+          if(locality)setLocation(p=>p?({...p,address:locality}):null);
+        }
       },
-      ()=>alert('Could not get your location. Please check permissions.')
+      ()=>{if(gpsFallbackRef.current!=null){clearTimeout(gpsFallbackRef.current);gpsFallbackRef.current=null;}setLocFailed(true);stopWatch(watchId);},
+      {enableHighAccuracy:true,timeout:10000,maximumAge:0}
     );
+    gpsWatchRef.current=watchId;
   };
+
+  useEffect(()=>{
+    if(initialLocation)return;
+    if(recentFix){
+      setLocation({lat:recentFix.lat,lng:recentFix.lng,accuracy:recentFix.accuracy,address:null});
+      setLocAccuracy(recentFix.accuracy);
+    }
+    startGpsWatch();
+    return()=>{
+      if(gpsFallbackRef.current!=null){clearTimeout(gpsFallbackRef.current);gpsFallbackRef.current=null;}
+      if(gpsWatchRef.current!=null){navigator.geolocation.clearWatch(gpsWatchRef.current);gpsWatchRef.current=null;}
+    };
+  },[]);
+
+  const useCurrentLocation=()=>startGpsWatch();
   const filteredBurrows=burrows.filter(b=>b.name.toLowerCase().includes(burrowSearch.toLowerCase())||(b.code||'').toLowerCase().includes(burrowSearch.toLowerCase()));
   return <ModalWrap title="New Wombat" subtitle="Register a newly identified wombat" onClose={onClose} saveLabel="Save Wombat" onSave={()=>{
     if(!form.name.trim())return alert('Please enter a name.');
     if(!form.firstSeen)return alert('Please enter the first seen date.');
     if(!form.status)return alert('Please select a health status.');
     if(!linkedBurrow&&!location)return alert('Please add a location.');
+    if(!linkedBurrow&&location?.accuracy&&location.accuracy>25){
+      const ok=window.confirm(`GPS accuracy is ±${location.accuracy}m — the pin may be off by that distance. Wait for a better fix, or tap OK to save as-is.`);
+      if(!ok)return;
+    }
     const lat=linkedBurrow?linkedBurrow.lat:location?.lat??null;
     const lng=linkedBurrow?linkedBurrow.lng:location?.lng??null;
     const locationStr=linkedBurrow?linkedBurrow.location:(location?.locality||location?.address||null);
@@ -6303,6 +6361,13 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
     </FormField>
     <FormField label="First Seen Date" required><FInput type="date" value={form.firstSeen} onChange={v=>set('firstSeen',v)}/></FormField>
     <FormField label="Location" required>
+      {!linkedBurrow&&(locAcquiring||locAccuracy!=null)&&!locFailed&&<div style={{display:'flex',alignItems:'center',gap:6,marginBottom:6}}>
+        {locAcquiring&&<span style={{display:'inline-block',width:8,height:8,borderRadius:'50%',background:'#D89039',animation:'pulse 1.2s ease-in-out infinite'}}/>}
+        {!locAcquiring&&locAccuracy!=null&&<span style={{display:'inline-block',width:8,height:8,borderRadius:'50%',background:locAccuracy<=15?'#4A7C52':'#D89039'}}/>}
+        <span style={{fontSize:12,color:t.mid}}>
+          {locAcquiring&&!location?'Acquiring GPS fix…':locAcquiring?`Improving fix… ±${locAccuracy}m`:locAccuracy!=null?`GPS locked ±${locAccuracy}m`:''}
+        </span>
+      </div>}
       {linkedBurrow
         ? <div style={{background:t.soft,borderRadius:12,padding:'10px 14px',display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}}>
             <div style={{display:'flex',alignItems:'center',gap:8,flex:1,minWidth:0}}>
@@ -6320,7 +6385,7 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
                 {location.address&&<div style={{fontSize:13,fontWeight:600,color:t.ink,marginBottom:2}}>{location.address}</div>}
                 {location.lat&&<div style={{fontSize:12,color:t.mid,fontFamily:'monospace'}}>{location.lat.toFixed(5)}, {location.lng.toFixed(5)}</div>}
               </div>
-              <button onClick={()=>{setLocation(null);setShowGeoSearch(false);}} style={{fontSize:12,color:t.mid,background:'none',border:'none',fontWeight:600,cursor:'pointer',flexShrink:0}}>Clear</button>
+              <button onClick={()=>{setLocation(null);setLocAccuracy(null);setShowGeoSearch(false);if(gpsWatchRef.current!=null){navigator.geolocation.clearWatch(gpsWatchRef.current);gpsWatchRef.current=null;}setLocAcquiring(false);}} style={{fontSize:12,color:t.mid,background:'none',border:'none',fontWeight:600,cursor:'pointer',flexShrink:0}}>Clear</button>
             </div>
           : <div style={{display:'flex',flexDirection:'column',gap:8}}>
               {showBurrowSearch
@@ -6343,12 +6408,12 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
                   </div>
                 : showGeoSearch
                   ? <GeoSearch
-                      onSelect={r=>{setLocation(r);setShowGeoSearch(false);}}
+                      onSelect={r=>{setLocation(r);setShowGeoSearch(false);if(gpsWatchRef.current!=null){navigator.geolocation.clearWatch(gpsWatchRef.current);gpsWatchRef.current=null;}setLocAcquiring(false);}}
                       onCancel={()=>setShowGeoSearch(false)}
                     />
                   : <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
                       <button onClick={useCurrentLocation} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
-                        {Ico.location(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Current GPS</span>
+                        {Ico.location(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>{locAcquiring?'Getting GPS…':'Current GPS'}</span>
                       </button>
                       <button onClick={()=>setShowMapPicker(true)} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 10px',borderRadius:12,background:t.soft,border:`1px solid ${t.div}`,cursor:'pointer'}}>
                         {Ico.map(t.f700,15)}<span style={{fontSize:12.5,fontWeight:600,color:t.ink}}>Map</span>
@@ -6361,6 +6426,7 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
                       </button>
                     </div>
               }
+              {locFailed&&!location&&<div style={{fontSize:12,color:'#B95C4A',marginTop:2}}>📍 GPS unavailable — please use Map, Burrow, or Address to add a location.</div>}
             </div>
       }
       {showMapPicker&&<MapPickerModal initialLat={location?.lat} initialLng={location?.lng} onClose={()=>setShowMapPicker(false)} onConfirm={async pos=>{setLocation(pos);setShowMapPicker(false);const locality=await reverseGeocode(pos.lat,pos.lng);if(locality)setLocation({...pos,address:locality});}}/>}
@@ -6382,7 +6448,7 @@ function AddWombatModal({burrows=[],onClose,onSave,initialLocation=null,nextCode
 }
 
 /* ── ADD BURROW MODAL ── */
-function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats=[]}){
+function AddBurrowModal({onClose,onSave,initialLocation=null,recentFix=null,nextCode='',wombats=[]}){
   const t=useTheme();
   const [form,setForm]=useState({name:nextCode,status:'',substrate:'',vegetation:'',notes:'',trailCamera:false,lastChecked:today(),orientation:'',wombatIds:[],entranceHeightCm:'',entranceWidthCm:''});
   const [wSearch,setWSearch]=useState('');
@@ -6397,20 +6463,23 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
   const [showMore,setShowMore]=useState(false);
   const [photoDataUrl,setPhotoDataUrl]=useState(null);
   const gpsWatchRef=useRef(null);
+  const gpsFallbackRef=useRef(null);
   const set=(k,v)=>setForm(f=>({...f,[k]:v}));
 
   // Start a watchPosition session. Updates location as accuracy improves;
-  // stops automatically once we have a ≤15m fix. Cleans up on modal close.
+  // stops automatically once we have a ≤5m fix. Cleans up on modal close.
   const startGpsWatch=()=>{
     if(!navigator.geolocation){setLocFailed(true);return;}
     if(gpsWatchRef.current!=null)navigator.geolocation.clearWatch(gpsWatchRef.current);
+    // Cancel any stale fallback timer (H-1: prevents double-tap killing the new watch)
+    if(gpsFallbackRef.current!=null){clearTimeout(gpsFallbackRef.current);gpsFallbackRef.current=null;}
     setLocFailed(false);setLocAcquiring(true);setLocAccuracy(null);
     let bestLat=null,bestLng=null,bestAcc=Infinity;
-    const stopWatch=(watchId)=>{navigator.geolocation.clearWatch(watchId);gpsWatchRef.current=null;setLocAcquiring(false);};
+    const stopWatch=(watchId)=>{navigator.geolocation.clearWatch(watchId);gpsWatchRef.current=null;gpsFallbackRef.current=null;setLocAcquiring(false);};
     // Hard cap: stop after 10s with whatever we have, so the spinner never runs forever.
     // If accuracy never reached 50m, force-fill with the best reading so the user can
     // still save (they'll see a warning if it's >25m).
-    const fallbackTimer=setTimeout(async()=>{
+    gpsFallbackRef.current=setTimeout(async()=>{
       if(gpsWatchRef.current==null)return; // already stopped
       stopWatch(gpsWatchRef.current);
       if(bestLat!=null){
@@ -6436,23 +6505,36 @@ function AddBurrowModal({onClose,onSave,initialLocation=null,nextCode='',wombats
             return prev;
           });
         }
-        if(acc<=15){
-          // Ideal fix — stop watching to save battery
-          clearTimeout(fallbackTimer);stopWatch(watchId);
+        if(acc<=5){
+          // Ideal fix (≤5m — near GPS chip precision) — stop watching to save battery
+          if(gpsFallbackRef.current!=null){clearTimeout(gpsFallbackRef.current);gpsFallbackRef.current=null;}
+          stopWatch(watchId);
           const locality=await reverseGeocode(lat,lng);
           if(locality)setLocation(p=>p?({...p,address:locality}):null);
         }
       },
-      ()=>{clearTimeout(fallbackTimer);setLocFailed(true);stopWatch(watchId);},
+      ()=>{if(gpsFallbackRef.current!=null){clearTimeout(gpsFallbackRef.current);gpsFallbackRef.current=null;}setLocFailed(true);stopWatch(watchId);},
       {enableHighAccuracy:true,timeout:10000,maximumAge:0}
     );
     gpsWatchRef.current=watchId;
   };
 
-  // Auto-start on open (skip if a location was pre-supplied, e.g. long-press on map)
+  // Auto-start on open.
+  // - If a map long-press location was supplied (initialLocation), skip GPS entirely — coords are already exact.
+  // - If the heater has a recent accurate fix (recentFix), pre-fill immediately and still run the watch to refine.
+  // - Otherwise start from scratch.
   useEffect(()=>{
-    if(!initialLocation)startGpsWatch();
-    return()=>{if(gpsWatchRef.current!=null)navigator.geolocation.clearWatch(gpsWatchRef.current);};
+    if(initialLocation)return; // map long-press — no GPS needed
+    if(recentFix){
+      // Pre-fill with heater's best fix so the card isn't empty, then refine
+      setLocation({lat:recentFix.lat,lng:recentFix.lng,accuracy:recentFix.accuracy,address:null});
+      setLocAccuracy(recentFix.accuracy);
+    }
+    startGpsWatch();
+    return()=>{
+      if(gpsFallbackRef.current!=null){clearTimeout(gpsFallbackRef.current);gpsFallbackRef.current=null;}
+      if(gpsWatchRef.current!=null){navigator.geolocation.clearWatch(gpsWatchRef.current);gpsWatchRef.current=null;}
+    };
   },[]);
 
   const useCurrentLocation=()=>startGpsWatch();
@@ -6833,15 +6915,16 @@ function reducer(state,action){
       };
       const burrows=patch(state.burrows,action.data.burrows);
       const wombats=patch(state.wombats,action.data.wombats);
+      const treatments=patch(state.treatments,action.data.treatments);
+      const sightings=patch(state.sightings,action.data.sightings);
+      const burrowLogs=patch(state.burrowLogs,action.data.burrowLogs);
+      const wombatPhotos=patch(state.wombatPhotos,action.data.wombatPhotos);
+      const burrowPhotos=patch(state.burrowPhotos,action.data.burrowPhotos);
+      // Persist ALL collections so incremental sync data survives a reload.
       save('b',burrows);save('w',wombats);
-      return{...state,
-        wombats,burrows,
-        treatments:patch(state.treatments,action.data.treatments),
-        sightings:patch(state.sightings,action.data.sightings),
-        burrowLogs:patch(state.burrowLogs,action.data.burrowLogs),
-        wombatPhotos:patch(state.wombatPhotos,action.data.wombatPhotos),
-        burrowPhotos:patch(state.burrowPhotos,action.data.burrowPhotos),
-      };
+      save('t',treatments);save('s',sightings);save('bl',burrowLogs);
+      save('wp',wombatPhotos.map(noB64));save('bp',burrowPhotos.map(noB64));
+      return{...state,wombats,burrows,treatments,sightings,burrowLogs,wombatPhotos,burrowPhotos};
     }
 
     // ── Full sync ────────────────────────────────────────────────
@@ -7398,11 +7481,11 @@ function App(){
   const [wombatSortBy,setWombatSortBy]=useState(()=>{try{return localStorage.getItem(SK.wombatOrder)?'custom':'date_added';}catch{return 'date_added';}});
   // Custom wombat order — lifted here so it can be synced to/from Supabase profiles (account-level)
   const [wombatCustomOrder,setWombatCustomOrder]=useState(()=>{try{return JSON.parse(localStorage.getItem(SK.wombatOrder))||[];}catch{return [];}});
-  const saveWombatOrder=(ids,userId=authUser?.id)=>{
+  const saveWombatOrder=React.useCallback((ids,userId=authUser?.id)=>{
     setWombatCustomOrder(ids);
     try{localStorage.setItem(SK.wombatOrder,JSON.stringify(ids));}catch{}
     if(userId)Promise.resolve(supa.from('profiles').update({wombat_order:ids}).eq('id',userId)).catch(()=>{});
-  };
+  },[authUser?.id]);
   // Burrow list filter/sort state — survives tab switches, resets on page reload
   const [burrowFilterStatus,setBurrowFilterStatus]=useState('all');
   const [burrowSortBy,setBurrowSortBy]=useState('date_added');
@@ -7860,8 +7943,9 @@ function App(){
     if(action.type==='UPDATE_WOMBAT'&&action.patch?.status==='healthy'){
       const prev=dataRef.current.wombats.find(w=>w.id===action.id);
       if(prev&&prev.status==='under_treatment'){
-        const profilePhoto=(dataRef.current.wombatPhotos||[]).find(p=>p.wombatId===prev.id&&p.isProfile);
-        setRecoveredWombat({name:prev.name,photoUrl:profilePhoto?.dataUrl||null});
+        // Store wombatId, not the dataUrl — photos may not be hydrated from IDB yet.
+        // The modal render looks up the photo at display time so it always gets the latest.
+        setRecoveredWombat({name:prev.name,wombatId:prev.id});
       }
     }
     // Streak: touch on any logging activity
@@ -7965,7 +8049,46 @@ function App(){
     }
   };
   const openProfile=()=>setModal('profile');
-  const onFAB=()=>setModal('fab');
+
+  // ── GPS heater ────────────────────────────────────────────────
+  // Keeps the GPS chip warm between consecutive Add Burrow / Add Wombat
+  // sessions so the second, third, fourth modal opens with an accurate
+  // fix already in hand — no "Acquiring…" wait.
+  // Stored in refs (not state) so updates never trigger re-renders.
+  const gpsHeaterWatchRef=useRef(null);
+  const gpsHeaterFix=useRef(null);   // {lat,lng,accuracy,ts}
+  const gpsHeaterTimerRef=useRef(null);
+  const stopGpsHeater=()=>{
+    if(gpsHeaterWatchRef.current!=null){navigator.geolocation.clearWatch(gpsHeaterWatchRef.current);gpsHeaterWatchRef.current=null;}
+    if(gpsHeaterTimerRef.current!=null){clearTimeout(gpsHeaterTimerRef.current);gpsHeaterTimerRef.current=null;}
+  };
+  const startGpsHeater=()=>{
+    if(!navigator.geolocation)return;
+    // Reset the 3-minute idle timer on every FAB tap
+    if(gpsHeaterTimerRef.current!=null)clearTimeout(gpsHeaterTimerRef.current);
+    gpsHeaterTimerRef.current=setTimeout(stopGpsHeater,180000);
+    if(gpsHeaterWatchRef.current!=null)return; // watch already running
+    const watchId=navigator.geolocation.watchPosition(
+      pos=>{
+        const lat=pos.coords.latitude,lng=pos.coords.longitude,acc=Math.round(pos.coords.accuracy);
+        if(typeof lat!=='number'||isNaN(lat))return;
+        // Only keep the best reading seen
+        if(!gpsHeaterFix.current||acc<gpsHeaterFix.current.accuracy)
+          gpsHeaterFix.current={lat,lng,accuracy:acc,ts:Date.now()};
+      },
+      ()=>{},
+      {enableHighAccuracy:true,timeout:10000,maximumAge:0}
+    );
+    gpsHeaterWatchRef.current=watchId;
+  };
+  // Helper: returns heater fix if it's recent (≤30s) and accurate (≤50m), else null
+  const getHeaterFix=()=>{
+    const f=gpsHeaterFix.current;
+    if(!f||f.accuracy>50||(Date.now()-f.ts)>30000)return null;
+    return f;
+  };
+
+  const onFAB=()=>{startGpsHeater();setModal('fab');}; // start heater immediately on FAB tap
   const [addAtLoc,setAddAtLoc]=useState(null);
   const onAddAt=(lat,lng,type)=>{setAddAtLoc({lat,lng});setModal(type==='wombat'?'add-wombat':'add-burrow');};
   const fabSelect=key=>{
@@ -8065,10 +8188,10 @@ function App(){
       {modal==='export'&&authProfile?.role==='admin'&&<ExportSheet data={data} onClose={()=>setModal(null)} onBack={()=>setModal('profile')}/>}
       {modal==='csv-import'&&authProfile?.role==='admin'&&<CSVImportModal onClose={()=>setModal(null)} onImportWombats={wombats=>{syncDispatch({type:'IMPORT_WOMBATS',wombats:wombats.map(w=>({...w,squadId:authSquad?.id||null}))});nav('wombats');}} onImportBurrows={burrows=>{syncDispatch({type:'IMPORT_BURROWS',burrows:burrows.map(b=>({...b,squadId:authSquad?.id||null}))});nav('burrows');}}/>}
       {modal==='fab'&&<FABSheet onClose={()=>setModal(null)} onSelect={fabSelect}/>}
-      {modal==='add-wombat'&&<AddWombatModal burrows={data.burrows} initialLocation={addAtLoc} nextCode={nextWombatCode(data.wombats)} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(w,linkedBurrowId,photo)=>{syncDispatch({type:'ADD_WOMBAT',wombat:{...w,squadId:authSquad?.id||null},linkedBurrowId:linkedBurrowId||null});if(linkedBurrowId)syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(photo)syncDispatch({type:'ADD_WOMBAT_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('wombat-profile',w.id);}}/>}
-      {modal==='add-burrow'&&<AddBurrowModal initialLocation={addAtLoc} nextCode={nextBurrowCode(data.burrows)} wombats={data.wombats} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(b,photo)=>{syncDispatch({type:'ADD_BURROW',burrow:{...b,squadId:authSquad?.id||null}});(b.wombatIds||[]).forEach(wId=>syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:wId,burrowId:b.id}));if(photo)syncDispatch({type:'ADD_BURROW_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('burrow-profile',b.id);}}/>}
+      {modal==='add-wombat'&&<AddWombatModal burrows={data.burrows} initialLocation={addAtLoc} recentFix={addAtLoc?null:getHeaterFix()} nextCode={nextWombatCode(data.wombats)} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(w,linkedBurrowId,photo)=>{syncDispatch({type:'ADD_WOMBAT',wombat:{...w,squadId:authSquad?.id||null},linkedBurrowId:linkedBurrowId||null});if(linkedBurrowId)syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(photo)syncDispatch({type:'ADD_WOMBAT_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('wombat-profile',w.id);}}/>}
+      {modal==='add-burrow'&&<AddBurrowModal initialLocation={addAtLoc} recentFix={addAtLoc?null:getHeaterFix()} nextCode={nextBurrowCode(data.burrows)} wombats={data.wombats} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(b,photo)=>{syncDispatch({type:'ADD_BURROW',burrow:{...b,squadId:authSquad?.id||null}});(b.wombatIds||[]).forEach(wId=>syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:wId,burrowId:b.id}));if(photo)syncDispatch({type:'ADD_BURROW_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('burrow-profile',b.id);}}/>}
       {modal==='sign-in'&&<SignInModal onClose={()=>setModal(null)}/>}
-      {recoveredWombat&&<RecoveryModal name={recoveredWombat.name} photoUrl={recoveredWombat.photoUrl} onClose={()=>setRecoveredWombat(null)}/>}
+      {recoveredWombat&&<RecoveryModal name={recoveredWombat.name} photoUrl={(data.wombatPhotos||[]).find(p=>p.wombatId===recoveredWombat.wombatId&&p.isProfile)?.dataUrl||(data.wombatPhotos||[]).find(p=>p.wombatId===recoveredWombat.wombatId)?.dataUrl||null} onClose={()=>setRecoveredWombat(null)}/>}
     </div>
   </ThemeCtx.Provider>;
 }
