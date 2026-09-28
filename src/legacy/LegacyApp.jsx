@@ -25,6 +25,9 @@ import { createRemote } from '../sync/remote';
 import { queueOp as enqueueOp, registerBrowserBackgroundSync } from '../sync/queue';
 import { flushQueue as flushQueueWith } from '../sync/flush';
 import { syncAction as syncActionWith } from '../sync/syncAction';
+import { createSyncSession, squadCenter as centreOfSquad } from '../sync/session';
+import { supaFullSync as pullFullSync, supaIncrementalSync as pullIncrementalSync } from '../sync/pull';
+import { cacheRemotePhotos, recoverBlankPhotos as recoverBlankPhotosWith, uploadPhotoToStorage as uploadPhotoWith, resolvePhotoUrl as resolvePhotoUrlWith } from '../sync/photos';
 import { markRecentlyDeleted as markRecentlyDeletedIn, getRecentlyDeleted as getRecentlyDeletedIn } from '../sync/recentlyDeleted';
 
 /* ════════════════════════════════════════════════════════════════
@@ -396,7 +399,6 @@ const SK={
   wombatOrder:  'ww_wombat_order', // string[] — custom wombat sort order (IDs)
 };
 // Incremental sync timestamps — not versioned (survive data resets intentionally)
-const LS_SYNC_TS='ww_last_sync_ts';       // ISO string — timestamp of last successful sync
 const LS_FULL_SYNC_DATE='ww_last_full_sync_date'; // date string — when we last did a full sync
 const load=()=>{try{return{
   wombats:JSON.parse(localStorage.getItem(SK.w))||[],
@@ -445,166 +447,11 @@ const idbQueueCount=appDb.dataQueueCount;
 const idbMetaGet=appDb.metaGet;
 const idbMetaSet=appDb.metaSet;
 const migrateToIdb=()=>appDb.migrateFromLocalStorage(localStorage);
-// Cache remote photos into IDB so they render when offline.
-// Called after every full sync and on bootstrap. Downloads in parallel using
-// the Supabase Storage SDK (CORS-safe) so results are consistent with
-// fetchAndCachePhoto. Only fetches photos not already in IDB — cheap after
-// first run. Dispatches HYDRATE_PHOTO_DATA so the UI updates without reload.
-// forcedIds: Set of photo IDs to re-download even if their blob is already in IDB.
-// Used after flushQueue to guarantee freshly-uploaded photos are cached locally.
-async function cacheRemotePhotosToIdb(wombatPhotos,burrowPhotos,dispatch,forcedIds=new Set()){
-  try{
-    const existing=await idbGetAllPhotos();
-    const all=[...(wombatPhotos||[]),...(burrowPhotos||[])];
-    // Include photos where:
-    //   (a) the blob is missing from IDB and there is a Storage URL or no URL at all, OR
-    //   (b) the photo ID is in forcedIds — these were just uploaded so we force a fresh
-    //       cache even if a stale blob already exists (ensures post-sync offline viewing).
-    const toFetch=all.filter(p=>p.id&&(forcedIds.has(p.id)||!existing[p.id])&&(p.dataUrl?.startsWith('https://')||!p.dataUrl));
-    // Direct-save: if Supabase DB returned a base64 blob in data_url (Storage not configured),
-    // we already have the bytes — just write them to ww_photo_data without a network round-trip.
-    const toSaveDirect=all.filter(p=>p.id&&!existing[p.id]&&p.dataUrl?.startsWith('data:'));
-    if(forcedIds.size) console.info('[Photo] cacheRemotePhotosToIdb: forced re-cache for',forcedIds.size,'IDs, toFetch='+toFetch.length);
-    console.info('[Photo] cacheRemotePhotosToIdb: direct-save='+toSaveDirect.length+' network-fetch='+toFetch.length);
-    if(!toFetch.length&&!toSaveDirect.length)return;
-    const newMap={};
-    // Direct-save pass: photos whose base64 blob came back from Supabase DB directly.
-    // Storage might not be configured — the DB column stores the raw base64 as fallback.
-    // No network request needed; just persist to ww_photo_data for offline use.
-    for(const p of toSaveDirect){
-      try{
-        await idbPutPhoto(p.id,p.dataUrl);
-        newMap[p.id]=p.dataUrl;
-        console.info('[Photo] cacheRemote: direct-save base64 ok',p.id);
-      }catch(e){console.warn('[Photo] cacheRemote: direct-save failed for',p.id,e?.message);}
-    }
-    // Network-fetch pass: photos with https:// URLs or null (try Storage SDK + CDN fallback)
-    await Promise.allSettled(toFetch.map(async p=>{
-      // Attempt 1: Supabase Storage SDK (uses auth token + CDN)
-      try{
-        const{data,error}=await supa.storage.from('photos').download(`${p.id}.jpg`);
-        if(!error&&data instanceof Blob){
-          const dataUrl=await blobToDataUrl(data);
-          await idbPutPhoto(p.id,dataUrl);
-          newMap[p.id]=dataUrl;
-          console.info('[Photo] cacheRemote: SDK ok',p.id);
-          return;
-        }
-        // Log the failure so we know why attempt 1 didn't work
-        console.info('[Photo] cacheRemote: SDK failed for',p.id,'error=',error?.message||'no blob');
-      }catch(e){console.info('[Photo] cacheRemote: SDK exception for',p.id,e?.message);}
-      // Attempt 2: direct fetch via the stored https:// URL (if one is present in state)
-      if(p.dataUrl?.startsWith('https://')){
-        try{
-          const res=await fetch(p.dataUrl);
-          if(res.ok){
-            const dataUrl=await blobToDataUrl(await res.blob());
-            await idbPutPhoto(p.id,dataUrl);
-            newMap[p.id]=dataUrl;
-            console.info('[Photo] cacheRemote: direct fetch ok',p.id);
-            return;
-          }
-          console.info('[Photo] cacheRemote: direct fetch',res.status,'for',p.id);
-        }catch(e){console.info('[Photo] cacheRemote: direct fetch exception for',p.id,e?.message);}
-      }
-      // Attempt 3: construct the public CDN URL from the known Storage path convention.
-      // This covers the common case where p.dataUrl is null (noB64 stripped it from IDB)
-      // but the file DOES exist in Storage under the standard {id}.jpg naming.
-      try{
-        const{data:{publicUrl}}=supa.storage.from('photos').getPublicUrl(`${p.id}.jpg`);
-        const res=await fetch(publicUrl);
-        if(res.ok){
-          const dataUrl=await blobToDataUrl(await res.blob());
-          await idbPutPhoto(p.id,dataUrl);
-          newMap[p.id]=dataUrl;
-          // Update DB row with the URL so future syncs return it and noB64 doesn't wipe it
-          // (belt-and-suspenders alongside flushQueue/syncAction upsert paths)
-          try{
-            const tbl=p.wombatId?'wombat_photos':'burrow_photos';
-            Promise.resolve(supa.from(tbl).update({data_url:publicUrl}).eq('id',p.id)).catch(e=>console.warn('[sync] photo url patch failed',e));
-          }catch{}
-          console.info('[Photo] cacheRemote: constructed-URL ok',p.id,'→',publicUrl.substring(0,60));
-          return;
-        }
-        console.info('[Photo] cacheRemote: constructed-URL',res.status,'for',p.id,'(file may not be in Storage yet)');
-      }catch(e){console.info('[Photo] cacheRemote: constructed-URL exception for',p.id,e?.message);}
-      // Attempt 4: fetch base64 directly from the DB column (Storage not configured,
-      // or photo predates Storage migration). This is a targeted single-row query —
-      // supaFullSync now excludes data_url to avoid downloading MBs of base64 on
-      // every sync, so we only pull it here, once, for photos not yet in IDB.
-      try{
-        const tbl=p.wombatId?'wombat_photos':'burrow_photos';
-        const{data:row}=await supa.from(tbl).select('data_url').eq('id',p.id).single();
-        if(row?.data_url?.startsWith('data:')){
-          await idbPutPhoto(p.id,row.data_url);
-          newMap[p.id]=row.data_url;
-          console.info('[Photo] cacheRemote: DB base64 ok',p.id);
-          return;
-        }
-      }catch(e){console.info('[Photo] cacheRemote: DB base64 exception for',p.id,e?.message);}
-    }));
-    const cached=Object.keys(newMap).length;
-    console.info('[Photo] cacheRemotePhotosToIdb: cached',cached,'blob(s) into ww_photo_data');
-    if(cached&&dispatch)dispatch({type:'HYDRATE_PHOTO_DATA',map:newMap});
-  }catch(e){}
-}
-// ── Blank photo recovery ──────────────────────────────────────
-// Detects photos that exist in state (metadata present) but have a null dataUrl —
-// the "grey box" bug. This happens when an offline-added photo's IDB blob is evicted
-// before flushQueue runs, causing the queue op to be silently discarded.
-// Recovery strategy:
-//   1. Check Supabase Storage for the expected file path (photoId.jpg).
-//   2. If the file exists: fetch the blob, cache it in IDB, update the Supabase
-//      table row with the public URL, patch localStorage to _sync:true, and
-//      dispatch HYDRATE_PHOTO_DATA so the UI shows the photo immediately.
-//   3. If the file is missing: re-queue an upsert with data_url:null so that if
-//      the blob reappears in IDB somehow (unlikely) it gets a second chance, and
-//      so the user sees a "pending sync" badge rather than a permanently grey box.
-// Called once on app mount (after hydratePhotos) and non-destructively — any photo
-// that is NOT blank is left entirely alone.
-async function recoverBlankPhotos(wombatPhotos,burrowPhotos,dispatch){
-  // Attempts to recover photos whose dataUrl is null by checking if Supabase Storage
-  // still has the file. Uses a direct GET (not HEAD — Supabase public buckets may reject
-  // HEAD from the browser) so the blob is fetched in one shot if present.
-  // Safe to call repeatedly; only processes null-dataUrl entries.
-  if(!navigator.onLine)return;
-  try{
-    const all=[
-      ...(wombatPhotos||[]).map(p=>({...p,_table:'wombat_photos',_lk:'wp'})),
-      ...(burrowPhotos||[]).map(p=>({...p,_table:'burrow_photos',_lk:'bp'})),
-    ];
-    const blanks=all.filter(p=>!p.dataUrl);
-    if(!blanks.length)return;
-    console.info('[Recovery] Checking Storage for',blanks.length,'blank photo(s)…');
-    const recovered={};
-    for(const p of blanks){
-      try{
-        const{data:{publicUrl}}=supa.storage.from('photos').getPublicUrl(`${p.id}.jpg`);
-        // Attempt a GET — if the file doesn't exist Storage will return 400/404
-        const res=await fetch(publicUrl);
-        if(!res.ok){
-          console.info('[Recovery] Not in Storage:',p.id,'(status',res.status+')');
-          continue;
-        }
-        const blob=await res.blob();
-        const dataUrl=await new Promise(resolve=>{
-          const r=new FileReader();r.onload=()=>resolve(r.result);r.readAsDataURL(blob);
-        });
-        await idbPutPhoto(p.id,dataUrl);
-        recovered[p.id]=dataUrl;
-        // Patch the Supabase table row so future syncs don't re-introduce the blank
-        Promise.resolve(supa.from(p._table).update({data_url:publicUrl}).eq('id',p.id)).catch(e=>console.warn('[sync] photo url patch failed',e));
-        // Patch IDB so the recovered URL survives future syncs
-        try{
-          const rec=await idbGetOne(STORE[p._lk],p.id);
-          if(rec)await idbSaveAll(STORE[p._lk],(await idbGetAll(STORE[p._lk])).map(r=>r.id===p.id?{...r,dataUrl:publicUrl,_sync:true}:r));
-        }catch(e){}
-        console.info('[Recovery] ✓ Recovered from Storage:',p.id);
-      }catch(e){console.info('[Recovery] Error for',p.id,e?.message);}
-    }
-    if(Object.keys(recovered).length)dispatch({type:'HYDRATE_PHOTO_DATA',map:recovered});
-  }catch(e){}
-}
+// ── Photo sync (src/sync/photos.ts) ─────────────────────────────
+// Built on use: `remote` is declared further down the file.
+const photoDeps=()=>({remote,photoStore,appDb,storage:localStorage,fetch:(...a)=>fetch(...a),blobToDataUrl:b=>blobToDataUrl(b),isOnline:()=>navigator.onLine});
+const cacheRemotePhotosToIdb=(wp,bp,dispatch,forcedIds)=>cacheRemotePhotos(wp,bp,dispatch,photoDeps(),forcedIds);
+const recoverBlankPhotos=(wp,bp,dispatch)=>recoverBlankPhotosWith(wp,bp,dispatch,photoDeps());
 
 
 /* Compress an image File to a JPEG dataUrl ≤ maxPx wide/tall at the given quality */
@@ -643,16 +490,9 @@ function compressImage(file,maxPx=1200,quality=0.75){
 // Tracks the currently active squad ID so supaFullSync can filter its output
 // to just that squad. Updated whenever authSquad changes in the App component.
 // Module-level so supaFullSync doesn't need the ID threaded through every call site.
-let _currentSquadId=null;
-// Midpoint of the active squad's bounding box — used as the default map centre in
-// MapPickerModal when no existing coordinates are pre-filled. Updated alongside
-// _currentSquadId so every modal opens at the right place without prop-threading.
-let _squadCenter=null; // {lat,lng} or null
-const _computeSquadCenter=sq=>(sq?.boundsSwLat!=null&&sq?.boundsNeLat!=null?{lat:(sq.boundsSwLat+sq.boundsNeLat)/2,lng:(sq.boundsSwLng+sq.boundsNeLng)/2}:null);
-// Monotonically-increasing counter — incremented at the start of every supaFullSync call.
-// If a newer sync starts while this one is in-flight, this sync becomes stale and returns
-// undefined rather than dispatching out-of-order data.
-let _syncSeq=0;
+// Active squad, its map centre and the sync sequence counter (src/sync/session.ts).
+// Syncs filter to the active squad; the centre is the default for map pickers.
+const syncSession=createSyncSession();
 
 
 // ── Remote ops (src/sync/remote.ts) ─────────────────────────
@@ -663,82 +503,9 @@ const supaUpsert=(table,row)=>remote.upsert(table,row).then(r=>r.ok);
 const supaDelete=(table,id)=>remote.remove(table,id).then(r=>r.ok);
 
 // ── Supabase Storage — photo upload ──────────────────────────
-// Convert a base64 data URL to a Blob without using fetch() — Safari iOS does not
-// support fetch() on data: URLs, which would silently cause the upload to fail.
-function dataUrlToBlob(dataUrl){
-  try{
-    const[header,b64]=dataUrl.split(',');
-    const mime=(header.match(/:(.*?);/)||[])[1]||'image/jpeg';
-    const binary=atob(b64);
-    const bytes=new Uint8Array(binary.length);
-    for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
-    return new Blob([bytes],{type:mime});
-  }catch(e){console.warn('[Photo] dataUrlToBlob failed',e);return null;}
-}
 
-// Uploads a base64 dataUrl to the 'photos' storage bucket.
-// Returns the public URL on success, or null if upload fails.
-// After a successful upload the local record is patched to use the
-// URL so subsequent syncs don't re-upload the same image.
-async function uploadPhotoToStorage(dataUrl,photoId,localStorageKey){
-  try{
-    console.info('[Photo] uploadPhotoToStorage: uploading',photoId,'dataUrl len='+dataUrl?.length);
-    // Use dataUrlToBlob() instead of fetch(dataUrl) — Safari iOS doesn't support
-    // fetching data: URLs, which would silently make the whole upload fail.
-    const blob=dataUrlToBlob(dataUrl);
-    if(!blob){console.warn('[Photo] dataUrlToBlob returned null for',photoId);return null;}
-    const path=`${photoId}.jpg`;
-    const{error}=await supa.storage.from('photos').upload(path,blob,{upsert:true,contentType:'image/jpeg'});
-    if(error){
-      console.warn('[Storage] upload failed ('+error.message+') — caching base64 directly in IDB so offline still works');
-      // Storage upload failed (bucket missing, permissions, etc.) — the base64 dataUrl
-      // will go into Supabase DB as a fallback, but we also cache it in ww_photo_data
-      // so offline viewing works even though no Storage URL exists.
-      await idbPutPhoto(photoId,dataUrl).catch(e=>console.warn('[Photo] idbPutPhoto FAILED (storage-fallback)',photoId,e));
-      return null;
-    }
-    const{data:{publicUrl}}=supa.storage.from('photos').getPublicUrl(path);
-    // Cache blob to IDB immediately so the photo is available offline right away —
-    // without this there is a window between upload and the next supaFullSync where
-    // IDB has no entry for this photo and an offline reload shows a broken image.
-    // AWAITED (not fire-and-forget) so the write completes before we return publicUrl.
-    // If the IDB write fails we log but still return the URL — the blob will be
-    // re-downloaded by cacheRemotePhotosToIdb on the next online session.
-    await idbPutPhoto(photoId,dataUrl).catch(e=>console.warn('[Photo] idbPutPhoto FAILED for',photoId,e));
-    console.info('[Photo] uploadPhotoToStorage: IDB blob saved for',photoId,'→',publicUrl);
-    // Belt-and-suspenders: directly update the Supabase DB row with the Storage URL.
-    // The queue upsert (in flushQueue / syncAction) will also carry the URL, but that
-    // path can carry a large base64 fallback if anything goes wrong — this direct UPDATE
-    // guarantees the URL is persisted in the DB so every future sync returns data_url
-    // as an https:// URL rather than null. When sync returns the URL, noB64 preserves it
-    // in IDB (only strips data: URLs), so cacheRemotePhotosToIdb has a URL to fall back to.
-    if(localStorageKey){
-      const supaTable=localStorageKey===SK.wp?'wombat_photos':'burrow_photos';
-      supa.from(supaTable).update({data_url:publicUrl}).eq('id',photoId).then(
-        ({error:ue})=>{
-          if(ue) console.warn('[Photo] DB url update failed for',photoId,ue.message);
-          else console.info('[Photo] DB url updated for',photoId);
-        },
-        err=>console.warn('[Photo] DB url update exception for',photoId,err?.message)
-      );
-      // Also patch localStorage key so this record survives until the next sync
-      try{
-        const list=JSON.parse(localStorage.getItem(localStorageKey)||'[]');
-        const updated=list.map(p=>p.id===photoId?{...p,dataUrl:publicUrl}:p);
-        localStorage.setItem(localStorageKey,JSON.stringify(updated));
-      }catch{}
-    }
-    return publicUrl;
-  }catch(e){console.warn('[Storage] exception',e);return null;}
-}
-
-// Resolves the data_url for a photo before writing to Supabase:
-// if it's base64, uploads to Storage and returns the URL; otherwise passes through.
-async function resolvePhotoUrl(dataUrl,photoId,localKey){
-  if(!dataUrl||!dataUrl.startsWith('data:'))return dataUrl;
-  const url=await uploadPhotoToStorage(dataUrl,photoId,localKey);
-  return url||dataUrl; // fall back to base64 if storage fails (still functional, just big)
-}
+const uploadPhotoToStorage=(dataUrl,photoId,localStorageKey)=>uploadPhotoWith(dataUrl,photoId,localStorageKey,photoDeps());
+const resolvePhotoUrl=(dataUrl,photoId,localKey)=>resolvePhotoUrlWith(dataUrl,photoId,localKey,photoDeps());
 
 // ── Offline queue + flush (src/sync/queue.ts, flush.ts, recentlyDeleted.ts) ──
 const alertVolunteer=m=>{if(typeof alert!=='undefined')alert(m);};
@@ -774,80 +541,7 @@ const syncAction=(action,userId)=>syncActionWith(action,userId,{
 // parent's ID being in the active squad.
 const filterSyncToSquad=filterToSquad;
 
-async function supaFullSync(){
-  // Claim a sequence number. If another supaFullSync starts AFTER us, our result is stale
-  // and we return undefined rather than dispatching out-of-order data.
-  const _thisSeq=++_syncSeq;
-  // Snapshot the active squad at the moment this sync starts.
-  // If the user switches squads while fetches are in flight, _currentSquadId will
-  // have changed by the time we filter — so we discard the stale result rather than
-  // dispatching the wrong squad's data.
-  const _squadIdAtStart=_currentSquadId;
-  // Record when the fetch started so resolveWithCurrentQueue can distinguish pushes
-  // that completed DURING the flight (those pushes should still beat the stale response).
-  const _fetchStart=Date.now();
-  const results=await Promise.allSettled([
-    supa.from('wombats').select('*'),
-    supa.from('burrows').select('*'),
-    supa.from('treatments').select('*'),
-    supa.from('sightings').select('*'),
-    supa.from('burrow_logs').select('*'),
-    supa.from('wombat_photos').select('id,wombat_id,is_profile,at,created_by'),
-    supa.from('burrow_photos').select('id,burrow_id,is_profile,at,created_by'),
-  ]);
-  const val=(r,key)=>{
-    if(r.status==='rejected'){console.warn('[Supa] sync failed for',key,r.reason);return null;}
-    if(r.value?.error){console.warn('[Supa] sync error for',key,r.value.error.message);return null;}
-    return r.value?.data||null;
-  };
-  const[w,b,t,s,bl,wp,bp]=[val(results[0],'wombats'),val(results[1],'burrows'),val(results[2],'treatments'),val(results[3],'sightings'),val(results[4],'burrow_logs'),val(results[5],'wombat_photos'),val(results[6],'burrow_photos')];
-  // If every single query failed the device is almost certainly offline.
-  // Return undefined (distinct from null) so the caller knows NOT to touch local state.
-  const anySucceeded=results.some(r=>r.status==='fulfilled'&&!r.value?.error);
-  if(!anySucceeded)return undefined;
-  // Pending queue ops decide which local records win (see src/sync/merge.ts).
-  let _pendingOps=[];
-  try{_pendingOps=await idbGetQueue();}catch(e){}
-  const{queuedIds,deletedIds,hasPendingUpserts}=pendingSets(_pendingOps);
-  // Read all local stores from IndexedDB (durable) rather than localStorage (iOS can evict it).
-  const idbLocal={};
-  await Promise.all(Object.entries(STORE).map(async([k,s])=>{
-    try{idbLocal[k]=await idbGetAll(s);}catch(e){idbLocal[k]=[];}
-  }));
-  const localHasData=(idbLocal.w.length>0)||(idbLocal.b.length>0);
-  if(isConfirmedNewUser({remoteWombats:w,remoteBurrows:b,hasPendingUpserts,localHasData}))return null;
-  const recentlyDeleted=await getRecentlyDeleted();
-  const merge=(remote,localKey,conv)=>mergeTable({remote,local:idbLocal[localKey],queuedIds,deletedIds,recentlyDeleted,currentSquadId:_currentSquadId,fromDb:conv});
-  // If the squad changed mid-flight (both sides non-null and different), discard —
-  // the caller would dispatch the wrong squad's data. A null start just means the
-  // sync launched before loadSquad finished; use whatever squad is current now.
-  const filterSquadId=_squadIdAtStart||_currentSquadId;
-  if(_squadIdAtStart&&_currentSquadId&&_squadIdAtStart!==_currentSquadId){
-    console.info('[Squad] supaFullSync discarding stale result — squad changed mid-flight');
-    return undefined;
-  }
-  // If a newer supaFullSync started while we were fetching, our result is stale —
-  // the newer sync will dispatch fresher data so there is no value in dispatching ours.
-  if(_thisSeq!==_syncSeq){
-    console.info('[Sync] supaFullSync discarding stale result — newer sync in progress');
-    return undefined;
-  }
-  // Record when this full sync succeeded so incremental syncs know their baseline.
-  // Also record the date so the background timer knows a full sync has run today.
-  const _now=new Date().toISOString();
-  localStorage.setItem(LS_SYNC_TS,_now);
-  localStorage.setItem(LS_FULL_SYNC_DATE,new Date().toDateString());
-  return filterSyncToSquad({
-    _fetchStart,  // consumed by resolveWithCurrentQueue to detect in-flight push races
-    wombats:     merge(w, 'w',  dbToWombat),
-    burrows:     merge(b, 'b',  dbToBurrow),
-    treatments:  merge(t, 't',  dbToTreatment),
-    sightings:   merge(s, 's',  dbToSighting),
-    burrowLogs:  merge(bl,'bl', dbToBurrowLog),
-    wombatPhotos:merge(wp,'wp', dbToWombatPhoto),
-    burrowPhotos:merge(bp,'bp', dbToBurrowPhoto),
-  },filterSquadId);
-}
+const supaFullSync=()=>pullFullSync({session:syncSession,fetchTable:remote.fetchTable,appDb,getRecentlyDeleted,storage:localStorage});
 
 // ── Incremental sync ──────────────────────────────────────────
 // Fetches only records changed since the last sync using updated_at.
@@ -855,43 +549,7 @@ async function supaFullSync(){
 // Returns null if no baseline timestamp exists (caller should fall back to full sync).
 // Returns undefined if the result is stale (newer sync in flight).
 // Does NOT handle deletions — the background timer triggers a full sync once per day for that.
-async function supaIncrementalSync(){
-  const lastTs=localStorage.getItem(LS_SYNC_TS);
-  if(!lastTs)return null;
-  const _squadIdAtStart=_currentSquadId;
-  const _thisSeq=++_syncSeq;
-  const syncStart=new Date().toISOString();
-  try{
-    const results=await Promise.allSettled([
-      supa.from('wombats').select('*').gte('updated_at',lastTs),
-      supa.from('burrows').select('*').gte('updated_at',lastTs),
-      supa.from('treatments').select('*').gte('updated_at',lastTs),
-      supa.from('sightings').select('*').gte('updated_at',lastTs),
-      supa.from('burrow_logs').select('*').gte('updated_at',lastTs),
-      supa.from('wombat_photos').select('id,wombat_id,is_profile,at,created_by').gte('updated_at',lastTs),
-      supa.from('burrow_photos').select('id,burrow_id,is_profile,at,created_by').gte('updated_at',lastTs),
-    ]);
-    if(_thisSeq!==_syncSeq)return undefined;
-    if(_squadIdAtStart&&_currentSquadId&&_squadIdAtStart!==_currentSquadId)return undefined;
-    const anyOk=results.some(r=>r.status==='fulfilled'&&!r.value?.error);
-    if(!anyOk)return null; // all failed — offline or error, don't advance timestamp
-    const val=r=>r.status==='fulfilled'&&!r.value?.error?(r.value?.data||[]):[];
-    const data=filterSyncToSquad({
-      wombats:    val(results[0]).map(dbToWombat),
-      burrows:    val(results[1]).map(dbToBurrow),
-      treatments: val(results[2]).map(dbToTreatment),
-      sightings:  val(results[3]).map(dbToSighting),
-      burrowLogs: val(results[4]).map(dbToBurrowLog),
-      wombatPhotos:val(results[5]).map(dbToWombatPhoto),
-      burrowPhotos:val(results[6]).map(dbToBurrowPhoto),
-    },_currentSquadId);
-    localStorage.setItem(LS_SYNC_TS,syncStart);
-    return data;
-  }catch(e){
-    console.warn('[Sync] incremental failed:',e);
-    return null;
-  }
-}
+const supaIncrementalSync=()=>pullIncrementalSync({session:syncSession,fetchTable:remote.fetchTable,appDb,getRecentlyDeleted,storage:localStorage});
 
 // ── Late-binding queue resolution ─────────────────────────────
 // supaFullSync() computes its merge at network-request time. If the user makes
@@ -906,7 +564,7 @@ async function resolveWithCurrentQueue(merged){
   await Promise.all(Object.keys(STORE).map(async k=>{
     try{localStores[k]=await idbGetAll(STORE[k]);}catch(e){localStores[k]=[];}
   }));
-  return resolveWithQueue({merged,local:localStores,queue:q,fetchStart:merged._fetchStart||0,currentSquadId:_currentSquadId});
+  return resolveWithQueue({merged,local:localStores,queue:q,fetchStart:merged._fetchStart||0,currentSquadId:syncSession.currentSquadId});
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -4717,7 +4375,7 @@ function MapPickerModal({onClose,onConfirm,initialLat,initialLng}){
     }else{
       // Use the squad's operational area centre if available, otherwise fall back to a
       // sensible Australian default.  GPS auto-detect removed — use the GPS button instead.
-      const c=_squadCenter;
+      const c=syncSession.squadCenter;
       initMap(c?.lat??-33.22,c?.lng??150.87,11);
     }
     return()=>{
@@ -6299,9 +5957,9 @@ function App(){
   },[authUser?.id]);
   const [authProfile,setAuthProfile]=useState(()=>getCachedProfile());
   // null = no squad (or not yet loaded). Object = squad loaded.
-  // Also prime _currentSquadId eagerly from cache so supaFullSync filters
+  // Also prime syncSession.currentSquadId eagerly from cache so supaFullSync filters
   // correctly on the very first run (before any useEffect fires).
-  const [authSquad,setAuthSquad]=useState(()=>{const c=getCachedSquad();if(c){_currentSquadId=c.id;_squadCenter=_computeSquadCenter(c);}return c;});
+  const [authSquad,setAuthSquad]=useState(()=>{const c=getCachedSquad();if(c){syncSession.currentSquadId=c.id;syncSession.squadCenter=centreOfSquad(c);}return c;});
   const [allSquads,setAllSquads]=useState(()=>getCachedAllSquads()||[]);
   // true once we've completed at least one squad fetch (online or from cache)
   const [squadChecked,setSquadChecked]=useState(()=>!!getCachedSquad());
@@ -6474,8 +6132,8 @@ function App(){
               // otherwise default to the first squad returned.
               const cached=getCachedSquad();
               const active=(cached&&squads.find(s=>s.id===cached.id))||squads[0];
-              _currentSquadId=active.id; // set before supaFullSync below uses it
-              console.info('[Squad] loadSquad — set _currentSquadId:',_currentSquadId);
+              syncSession.currentSquadId=active.id; // set before supaFullSync below uses it
+              console.info('[Squad] loadSquad — set syncSession.currentSquadId:',syncSession.currentSquadId);
               cacheSquad(active);setAuthSquad(active);
             }else if(!me&&(!rows||rows.length===0)){
               // Empty result — user genuinely has no squad yet
@@ -6501,7 +6159,7 @@ function App(){
             const fresh=await resolveWithCurrentQueue(merged);
             const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
             const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
-            const synced=filterSyncToSquad({...fresh,wombats,burrows},_currentSquadId);
+            const synced=filterSyncToSquad({...fresh,wombats,burrows},syncSession.currentSquadId);
             dispatch({type:'REPLACE_ALL',data:synced});
             // Re-hydrate IDB photo data after the sync wipes dataUrls from state
             idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
@@ -6543,7 +6201,7 @@ function App(){
           const fresh=await resolveWithCurrentQueue(merged);
           const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
           const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
-          const synced=filterSyncToSquad({...fresh,wombats,burrows},_currentSquadId);
+          const synced=filterSyncToSquad({...fresh,wombats,burrows},syncSession.currentSquadId);
           dispatch({type:'REPLACE_ALL',data:synced});
           idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
           cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
@@ -6574,7 +6232,7 @@ function App(){
             const fresh=await resolveWithCurrentQueue(merged);
             const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
             const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
-            const synced=filterSyncToSquad({...fresh,wombats,burrows},_currentSquadId);
+            const synced=filterSyncToSquad({...fresh,wombats,burrows},syncSession.currentSquadId);
             dispatch({type:'REPLACE_ALL',data:synced});
             idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
             // Pass _uploadedPhotoIds so just-synced photos are force-recached into ww_photo_data
@@ -6616,7 +6274,7 @@ function App(){
           const fresh=await resolveWithCurrentQueue(merged);
           const{records:wombats}=deduplicateCodes(fresh.wombats,'W');
           const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
-          const synced2=filterSyncToSquad({...fresh,wombats,burrows},_currentSquadId);
+          const synced2=filterSyncToSquad({...fresh,wombats,burrows},syncSession.currentSquadId);
           dispatch({type:'REPLACE_ALL',data:synced2});
           idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
         }).catch(()=>{});
@@ -6756,7 +6414,7 @@ function App(){
   // Keep <html> data-theme in sync so CSS variables (including body background) work outside .app
   useEffect(()=>{document.documentElement.setAttribute('data-theme',theme);},[theme]);
   // Keep the module-level squad ID and centre in sync
-  useEffect(()=>{_currentSquadId=authSquad?.id||null;_squadCenter=_computeSquadCenter(authSquad);},[authSquad]);
+  useEffect(()=>{syncSession.currentSquadId=authSquad?.id||null;syncSession.squadCenter=centreOfSquad(authSquad);},[authSquad]);
   const toggleSignIn=async()=>{
     if(signedIn){
       explicitSignOut.current=true;
@@ -6774,8 +6432,8 @@ function App(){
   const switchSquad=async(sq)=>{
     if(sq.id===authSquad?.id)return; // already active
     const prevSquad=authSquad; // keep reference in case we need to revert
-    _currentSquadId=sq.id; // set eagerly so supaFullSync filters correctly
-    _squadCenter=_computeSquadCenter(sq);
+    syncSession.currentSquadId=sq.id; // set eagerly so supaFullSync filters correctly
+    syncSession.squadCenter=centreOfSquad(sq);
     cacheSquad(sq);
     setAuthSquad(sq);
     setModal(null);
@@ -6799,15 +6457,15 @@ function App(){
       }else{
         // merged===undefined means all requests failed — we're offline.
         // Revert so the user keeps their cached data for the squad they were on.
-        _currentSquadId=prevSquad?.id||null; // must revert eagerly — useEffect fires too late
-        _squadCenter=_computeSquadCenter(prevSquad);
+        syncSession.currentSquadId=prevSquad?.id||null; // must revert eagerly — useEffect fires too late
+        syncSession.squadCenter=centreOfSquad(prevSquad);
         cacheSquad(prevSquad);
         setAuthSquad(prevSquad);
         alert('You\'re offline — squad switching requires an internet connection. Your current squad data is still intact.');
       }
     }catch{
-      _currentSquadId=prevSquad?.id||null; // same — revert eagerly on error too
-      _squadCenter=_computeSquadCenter(prevSquad);
+      syncSession.currentSquadId=prevSquad?.id||null; // same — revert eagerly on error too
+      syncSession.squadCenter=centreOfSquad(prevSquad);
       cacheSquad(prevSquad);
       setAuthSquad(prevSquad);
     }finally{

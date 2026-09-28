@@ -9,8 +9,15 @@ type SupaError = ErrorLike & { message: string };
 type ErrorResult = PromiseLike<{ error: SupaError | null }>;
 
 /** The slice of SupabaseClient this module uses; the real client satisfies it. */
+type Rows = PromiseLike<{ data: unknown[] | null; error: SupaError | null }>;
+type Single = PromiseLike<{ data: Record<string, unknown> | null; error: SupaError | null }>;
+type Query = Rows & { gte(column: string, value: string): Rows; eq(column: string, value: string): { single(): Single } };
+
 export interface SupabaseLike {
   from(table: string): {
+    /** Loosely typed: matching the real client's query-builder generics makes tsc give up. Narrowed to Query inside. */
+    select(columns: string): unknown;
+    update(values: Record<string, unknown>): { eq(column: string, value: string): ErrorResult };
     upsert(row: never, options: { onConflict: string }): ErrorResult;
     delete(): { eq(column: string, value: never): ErrorResult };
   };
@@ -152,6 +159,25 @@ export function createRemote(supa: SupabaseLike, { onAuthError = null }: RemoteO
         console.warn('[Storage] exception', e);
         return { ok: false, error: String(e), failure: 'threw' };
       }
+    },
+
+    /** Rows of a table (optionally only those updated since `since`), as the raw { data, error } result. */
+    fetchTable(table: string, columns: string, since?: string): Rows {
+      const q = supa.from(table).select(columns) as Query;
+      return since ? q.gte('updated_at', since) : q;
+    },
+
+    /** Stores a photo's Storage URL on its row so later syncs return a URL. Fire-and-forget; failures are logged. */
+    setPhotoUrl(table: string, photoId: string, url: string): void {
+      Promise.resolve(supa.from(table).update({ data_url: url }).eq('id', photoId)).catch((e) =>
+        console.warn('[sync] photo url patch failed', e),
+      );
+    },
+
+    /** The raw data_url column of one photo row (may hold base64 for photos saved before Storage existed). */
+    async fetchPhotoDataUrl(table: string, photoId: string): Promise<string | null> {
+      const { data } = await (supa.from(table).select('data_url') as Query).eq('id', photoId).single();
+      return (data?.data_url as string | null | undefined) ?? null;
     },
 
     /** Builds the URL locally; no request is made. */
