@@ -20,6 +20,7 @@ import { reducer } from '../state/reducer';
 import { withPersistence } from '../state/persistence';
 import { appDb, STORE_NAMES } from '../sync/idb/appDb';
 import { photoStore } from '../sync/idb/photoStore';
+import { filterToSquad, pendingSets, isConfirmedNewUser, mergeTable, resolveWithQueue } from '../sync/merge';
 
 /* ════════════════════════════════════════════════════════════════
    WOMBATWATCH — ARCHITECTURE OVERVIEW
@@ -1199,25 +1200,7 @@ async function syncAction(action,userId){
 // the active squad so the UI only shows one squad at a time.
 // Wombats + burrows have a direct squadId; child records are filtered by their
 // parent's ID being in the active squad.
-function filterSyncToSquad(data,squadId){
-  console.info('[Squad] filterSyncToSquad called — squadId:',squadId,'_currentSquadId:',_currentSquadId);
-  if(!squadId){console.warn('[Squad] filterSyncToSquad — no squadId, returning unfiltered');return data;}
-  const wombats=data.wombats.filter(w=>w.squadId===squadId);
-  const burrows=data.burrows.filter(b=>b.squadId===squadId);
-  console.info('[Squad] filterSyncToSquad — wombats:',data.wombats.length,'→',wombats.length,'burrows:',data.burrows.length,'→',burrows.length);
-  const wIds=new Set(wombats.map(w=>w.id));
-  const bIds=new Set(burrows.map(b=>b.id));
-  return{
-    ...data,
-    wombats,
-    burrows,
-    treatments:  data.treatments.filter(t=>wIds.has(t.wombatId)),
-    sightings:   data.sightings.filter(s=>wIds.has(s.wombatId)),
-    burrowLogs:  data.burrowLogs.filter(l=>bIds.has(l.burrowId)),
-    wombatPhotos:data.wombatPhotos.filter(p=>wIds.has(p.wombatId)),
-    burrowPhotos:data.burrowPhotos.filter(p=>bIds.has(p.burrowId)),
-  };
-}
+const filterSyncToSquad=filterToSquad;
 
 async function supaFullSync(){
   // Claim a sequence number. If another supaFullSync starts AFTER us, our result is stale
@@ -1250,69 +1233,19 @@ async function supaFullSync(){
   // Return undefined (distinct from null) so the caller knows NOT to touch local state.
   const anySucceeded=results.some(r=>r.status==='fulfilled'&&!r.value?.error);
   if(!anySucceeded)return undefined;
-  // Build sets of IDs from the offline queue so the merge can respect pending operations.
+  // Pending queue ops decide which local records win (see src/sync/merge.ts).
   let _pendingOps=[];
   try{_pendingOps=await idbGetQueue();}catch(e){}
-  // Only treat as a confirmed new user (empty DB) if there are also no pending local ops.
-  // If there ARE pending upserts, the user added data offline before their first sync —
-  // returning null here would cause the caller to wipe that unsynchronised data.
-  const hasPendingUpserts=_pendingOps.some(op=>op.t==='upsert');
-  // Pre-fetch ALL 7 IDB stores before the merge so merge() uses durable IDB data
-  // (eviction-resistant, GBs of quota) rather than localStorage (5 MB, iOS can evict).
-  // Without this, every branch of merge() reads [] from localStorage when evicted —
-  // the empty-server protection fires incorrectly, and the local-wins logic adds nothing.
-  // resolveWithCurrentQueue() compensates for _sync:false records, but _sync:true records
-  // that the server temporarily returns empty (expired token RLS edge case) would be lost
-  // for the current session. Pre-fetching here gives both layers the full IDB picture.
+  const{queuedIds,deletedIds,hasPendingUpserts}=pendingSets(_pendingOps);
+  // Read all local stores from IndexedDB (durable) rather than localStorage (iOS can evict it).
   const idbLocal={};
   await Promise.all(Object.entries(STORE).map(async([k,s])=>{
     try{idbLocal[k]=await idbGetAll(s);}catch(e){idbLocal[k]=[];}
   }));
   const localHasData=(idbLocal.w.length>0)||(idbLocal.b.length>0);
-  if(!(w?.length||0)&&!(b?.length||0)&&!hasPendingUpserts&&!localHasData)return null; // confirmed new user, genuinely empty DB
-  // Pending upserts — local version must win over whatever the server returned
-  const queuedIds=new Set(
-    _pendingOps.filter(op=>op.t==='upsert'&&op.row&&op.row.id).map(op=>op.row.id)
-  );
-  // Pending deletes — these records haven't been removed from Supabase yet, so the
-  // server will return them during sync. We must filter them out so they don't
-  // reappear after the user deleted them offline.
-  const deletedIds=new Set(
-    _pendingOps.filter(op=>op.t==='delete'&&op.id).map(op=>op.id)
-  );
-  // Recently-deleted IDs (deletes that already succeeded but whose queue op is now gone).
-  // These are needed to handle the zombie-resurrection race: a delete completes, clears its
-  // queue op, but this fetch was already in flight so the server response still contains
-  // the deleted record. Without this filter it reappears as if never deleted.
+  if(isConfirmedNewUser({remoteWombats:w,remoteBurrows:b,hasPendingUpserts,localHasData}))return null;
   const recentlyDeleted=await getRecentlyDeleted();
-  const merge=(remote,localKey,conv)=>{
-    // Use IDB as the authoritative local source — iOS can evict localStorage but IDB
-    // has much higher eviction thresholds and survives the hours-long offline sessions
-    // that field volunteers routinely do. localStorage is still written as a secondary
-    // mirror by save() but must not be the primary source of truth here.
-    const local=idbLocal[localKey]||[];
-    // If this table's query failed entirely (permissions error, network blip, etc.),
-    // remote is null. We can't safely merge — keep everything local so we don't
-    // silently drop records that were previously synced (_sync:true).
-    if(remote===null)return local;
-    // CRITICAL: If the server returns an empty array but we have locally-synced records,
-    // something is wrong (expired token returning 0 rows, RLS edge case, transient outage).
-    // A legitimately empty table for an established user is essentially impossible —
-    // we already gate new-user detection above with the null return path.
-    // Treat an unexpected empty response as a failed query: keep local to prevent silent deletion.
-    const syncedLocalCount=local.filter(r=>r._sync&&!deletedIds.has(r.id)&&!recentlyDeleted.has(r.id)).length;
-    if(remote.length===0&&syncedLocalCount>0){
-      console.warn('[Sync] Server returned empty for',localKey,'but',syncedLocalCount,'synced local records exist — keeping local to prevent data loss');
-      return local.filter(r=>!deletedIds.has(r.id)&&!recentlyDeleted.has(r.id));
-    }
-    const map=Object.fromEntries(remote.map(r=>[r.id,conv(r)]));
-    // Local record wins if: never synced to server (!_sync), OR has a pending edit in the queue.
-    // Also exclude stale local records whose squadId doesn't match the active squad —
-    // these are contamination from the period when multi-squad data was mixed in the IDB.
-    local.filter(r=>(!r._sync||queuedIds.has(r.id))&&(!r.squadId||!_currentSquadId||r.squadId===_currentSquadId)).forEach(r=>{map[r.id]=r;});
-    // Strip out anything the user deleted (pending queue op OR recently-completed delete)
-    return Object.values(map).filter(r=>!deletedIds.has(r.id)&&!recentlyDeleted.has(r.id));
-  };
+  const merge=(remote,localKey,conv)=>mergeTable({remote,local:idbLocal[localKey],queuedIds,deletedIds,recentlyDeleted,currentSquadId:_currentSquadId,fromDb:conv});
   // If the squad changed mid-flight (both sides non-null and different), discard —
   // the caller would dispatch the wrong squad's data. A null start just means the
   // sync launched before loadSquad finished; use whatever squad is current now.
@@ -1397,60 +1330,11 @@ async function supaIncrementalSync(){
 async function resolveWithCurrentQueue(merged){
   let q=[];
   try{q=await idbGetQueue();}catch(e){}
-  const qIds=new Set(q.filter(op=>op.t==='upsert'&&op.row?.id).map(op=>op.row.id));
-  const dIds=new Set(q.filter(op=>op.t==='delete'&&op.id).map(op=>op.id));
-  // fetchStart: timestamp recorded at the very start of the supaFullSync fetch.
-  // Any local record whose push completed AFTER fetchStart means the server response
-  // is stale relative to that push — local wins even though _sync is true.
-  const fetchStart=merged._fetchStart||0;
-  // Pre-fetch all local stores from IDB in parallel for efficiency.
   const localStores={};
   await Promise.all(Object.keys(STORE).map(async k=>{
     try{localStores[k]=await idbGetAll(STORE[k]);}catch(e){localStores[k]=[];}
   }));
-  const fix=(items,lsKey)=>{
-    const local=localStores[lsKey]||[];
-    const localById=Object.fromEntries(local.map(r=>[r.id,r]));
-    // Use local version when ANY of these are true:
-    //   (a) pending queue op exists for this record
-    //   (b) record has unsync'd local changes (_sync:false)
-    //   (c) record was pushed successfully AFTER this fetch started (_pushedAt > fetchStart)
-    //       — the server response is stale relative to the local push
-    // Exception: if local dataUrl is null (noB64 stripped the blob) but the server
-    // has a real Storage URL, always keep the server's URL so photos don't go blank.
-    const localWins=(loc,r)=>{
-      if(!loc)return false;
-      if(qIds.has(r.id))return true;
-      if(loc._sync===false)return true;
-      if(loc._pushedAt&&fetchStart&&loc._pushedAt>fetchStart)return true;
-      return false;
-    };
-    const out=items.map(r=>{
-      const loc=localById[r.id];
-      if(localWins(loc,r)){
-        if(loc.dataUrl==null&&r.dataUrl)return{...loc,dataUrl:r.dataUrl};
-        return loc;
-      }
-      return r;
-    }).filter(r=>!dIds.has(r.id));
-    // Also include new local records created during the fetch (not on server yet).
-    // Exclude records from a different squad — they are contamination from a prior squad
-    // session and must not bleed into the current squad's resolved data.
-    const outIds=new Set(out.map(r=>r.id));
-    local.filter(r=>(qIds.has(r.id)||!r._sync)&&!outIds.has(r.id)&&!dIds.has(r.id)
-                  &&(!r.squadId||!_currentSquadId||r.squadId===_currentSquadId))
-         .forEach(r=>out.push(r));
-    return out;
-  };
-  return{
-    wombats:     fix(merged.wombats,     'w'),
-    burrows:     fix(merged.burrows,     'b'),
-    treatments:  fix(merged.treatments,  't'),
-    sightings:   fix(merged.sightings,   's'),
-    burrowLogs:  fix(merged.burrowLogs,  'bl'),
-    wombatPhotos:fix(merged.wombatPhotos,'wp'),
-    burrowPhotos:fix(merged.burrowPhotos,'bp'),
-  };
+  return resolveWithQueue({merged,local:localStores,queue:q,fetchStart:merged._fetchStart||0,currentSquadId:_currentSquadId});
 }
 
 /* ════════════════════════════════════════════════════════════════
