@@ -5,6 +5,7 @@ import ReactDOM from 'react-dom';
 import L from 'leaflet';
 import JSZip from 'jszip';
 import { supa } from '../data/supabaseClient';
+import { nextWombatCode, nextBurrowCode, deduplicateCodes } from '../domain/codes';
 
 /* ════════════════════════════════════════════════════════════════
    WOMBATWATCH — ARCHITECTURE OVERVIEW
@@ -135,26 +136,6 @@ const isInactive=w=>w.status==='deceased';
 const isArchived=w=>w.status==='archived';
 const burrowTone=s=>({active:'sage',inactive:'amber',damaged:'rose'}[s]||'pearl');
 const burrowStatusLabel=s=>({active:'Active',inactive:'Inactive',damaged:'Damaged'}[s]||(s?s.charAt(0).toUpperCase()+s.slice(1):s));
-const nextWombatCode=wombats=>{const used=new Set(wombats.map(w=>parseInt((w.code||'').slice(1)||'0')).filter(n=>n>0));let n=1;while(used.has(n))n++;return'W'+String(n).padStart(4,'0');};
-const nextBurrowCode=burrows=>{const used=new Set(burrows.map(b=>parseInt((b.code||'').slice(1)||'0')).filter(n=>n>0));let n=1;while(used.has(n))n++;return'B'+String(n).padStart(4,'0');};
-// After a full sync, detect duplicate display codes (can happen when two volunteers both
-// add records while offline and each gets auto-assigned the same W/B number).
-// The earliest-created record keeps its code; later arrivals get the next available number.
-// Returns {records, changed} where changed = only the renumbered ones (for Supabase patching).
-const deduplicateCodes=(records,prefix)=>{
-  const seen=new Set();const changed=[];
-  const sorted=[...records].sort((a,b)=>new Date(a.createdAt||0)-new Date(b.createdAt||0));
-  const nums=sorted.map(r=>parseInt((r.code||'').slice(1)||'0')).filter(n=>n>0);
-  let next=(nums.length?Math.max(...nums):0)+1;
-  const out=sorted.map(r=>{
-    const c=r.code||'';
-    if(c&&!seen.has(c)){seen.add(c);return r;}
-    const newCode=prefix+String(next++).padStart(4,'0');
-    seen.add(newCode);
-    const updated={...r,code:newCode};changed.push(updated);return updated;
-  });
-  return{records:out,changed};
-};
 /* GPS helper — always uses the hardware GPS chip (enableHighAccuracy:true).
    Network/WiFi positioning (the default) is only accurate to 20-100m and
    causes nearby burrows to all land on the same point. */
