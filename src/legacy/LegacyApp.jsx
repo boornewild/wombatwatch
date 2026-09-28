@@ -18,6 +18,8 @@ import { weekKeyToDate } from '../domain/streak';
 import { loadStreak, activeStreakCount, touchStreak } from '../state/streakStorage';
 import { reducer } from '../state/reducer';
 import { withPersistence } from '../state/persistence';
+import { appDb, STORE_NAMES } from '../sync/idb/appDb';
+import { photoStore } from '../sync/idb/photoStore';
 
 /* ════════════════════════════════════════════════════════════════
    WOMBATWATCH — ARCHITECTURE OVERVIEW
@@ -368,7 +370,7 @@ const SD={
 // SK — localStorage key registry
 // Short keys (w, b, t…) are used throughout the codebase via save(key, val).
 // To wipe all data and start fresh, bump the version suffix (ww2_ → ww3_).
-// Photo blobs are NOT stored here — they live in IndexedDB (see openPhotoIdb).
+// Photo blobs are NOT stored here — they live in IndexedDB (see src/sync/idb/photoStore.ts).
 // Photo metadata (id, wombatId, isProfile, etc.) IS stored here with dataUrl:null.
 const SK={
   // Versioned data — bump suffix (ww2_ → ww3_) to reset to seed data
@@ -410,268 +412,33 @@ const save=(key,val)=>{
   try{localStorage.setItem(SK[key],JSON.stringify(val));}catch(e){}
 };
 
-// ── IndexedDB photo store ─────────────────────────────────────────
-// Keeps base64 photo data out of localStorage's 5 MB quota.
-// Records (wombats, burrows, etc.) are small and stay in localStorage.
-// Photos from Supabase Storage are URLs (tiny) and also stay in localStorage.
-// Only offline-captured base64 images go into IDB.
-let _photoIdb=null;
-function openPhotoIdb(){
-  if(_photoIdb)return Promise.resolve(_photoIdb);
-  return new Promise((res,rej)=>{
-    const req=indexedDB.open('ww_photo_data',1);
-    req.onupgradeneeded=e=>e.target.result.createObjectStore('p');
-    req.onsuccess=e=>{_photoIdb=e.target.result;res(_photoIdb);};
-    req.onerror=e=>rej(e.target.error);
-  });
-}
-// Write a photo blob (dataUrl string) to ww_photo_data.
-// Retries once on InvalidStateError/DatabaseClosedError — iOS Safari can close
-// IDB connections silently, so the first attempt resets the singleton and retries.
-async function idbPutPhoto(id,dataUrl){
-  for(let attempt=0;attempt<2;attempt++){
-    try{
-      const db=await openPhotoIdb();
-      await new Promise((res,rej)=>{
-        const tx=db.transaction('p','readwrite');
-        tx.objectStore('p').put(dataUrl,id);
-        tx.oncomplete=()=>res();
-        tx.onerror=e=>rej(e.target?.error||new Error('IDB tx error'));
-        tx.onabort=e=>rej(e.target?.error||new Error('IDB tx aborted'));
-      });
-      return; // success
-    }catch(e){
-      if(attempt===0&&(e?.name==='InvalidStateError'||e?.name==='DatabaseClosedError')){
-        // Stale connection — reset singleton and retry with a fresh open
-        console.warn('[IDB] Stale connection, retrying idbPutPhoto for',id);
-        _photoIdb=null;
-        continue;
-      }
-      throw e; // let caller handle (already have .catch() wrappers)
-    }
-  }
-}
-async function idbGetAllPhotos(){
-  try{
-    const db=await openPhotoIdb();
-    return new Promise((res,rej)=>{
-      const tx=db.transaction('p','readonly');
-      const map={};
-      tx.objectStore('p').openCursor().onsuccess=e=>{
-        const c=e.target.result;
-        if(c){map[c.key]=c.value;c.continue();}else res(map);
-      };
-      tx.onerror=()=>res({});
-    });
-  }catch(e){return{};}
-}
-async function idbGetPhoto(id){
-  try{
-    const db=await openPhotoIdb();
-    return new Promise((res)=>{
-      const req=db.transaction('p','readonly').objectStore('p').get(id);
-      req.onsuccess=()=>res(req.result||null);
-      req.onerror=()=>res(null);
-    });
-  }catch(e){return null;}
-}
-async function idbDeletePhoto(id){
-  try{
-    const db=await openPhotoIdb();
-    const tx=db.transaction('p','readwrite');
-    tx.objectStore('p').delete(id);
-    await new Promise((res,rej)=>{tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);});
-  }catch(e){console.warn('[IDB] delete photo failed:',id,e);}
-}
+// ── IndexedDB photo store (src/sync/idb/photoStore.ts) ─────────
+// Image data (base64) lives in ww_photo_data, outside localStorage's 5 MB quota.
+const idbPutPhoto=photoStore.put;
+const idbGetAllPhotos=photoStore.getAll;
+const idbGetPhoto=photoStore.get;
+const idbDeletePhoto=photoStore.remove;
 // Strip base64 dataUrls before saving to localStorage (they live in IDB instead).
 // Supabase Storage URLs (https://...) are small and safe to keep.
 const noB64=p=>p.dataUrl?.startsWith('data:')?{...p,dataUrl:null}:p;
 // Pure reducer (src/state/reducer.ts) + saving each changed collection to IDB/localStorage.
 const reducerWithSaves=withPersistence(reducer,save);
 
-// ── App data IDB (records + queue + meta) ─────────────────────────────────────
-// All wombat/burrow/etc records, the sync queue, and recently-deleted cache live
-// here. IndexedDB has significantly higher eviction thresholds than localStorage
-// on iOS Safari — iOS can silently clear localStorage when device storage is low,
-// causing data loss in the field. Moving critical data to IDB prevents that.
-const STORE={w:'wombats',b:'burrows',t:'treatments',s:'sightings',bl:'burrow_logs',wp:'wombat_photos',bp:'burrow_photos'};
-let _appDb=null;
-function openAppDb(){
-  if(_appDb)return Promise.resolve(_appDb);
-  return new Promise((res,rej)=>{
-    const req=indexedDB.open('wombatwatch_v1',1);
-    req.onupgradeneeded=e=>{
-      const db=e.target.result;
-      Object.values(STORE).forEach(s=>{if(!db.objectStoreNames.contains(s))db.createObjectStore(s,{keyPath:'id'});});
-      if(!db.objectStoreNames.contains('queue'))db.createObjectStore('queue',{keyPath:'_qid',autoIncrement:true});
-      if(!db.objectStoreNames.contains('meta'))db.createObjectStore('meta',{keyPath:'key'});
-    };
-    req.onsuccess=e=>{_appDb=e.target.result;res(_appDb);};
-    req.onerror=e=>rej(e.target.error);
-  });
-}
-async function idbSaveAll(storeName,records){
-  try{
-    const db=await openAppDb();
-    return new Promise((res,rej)=>{
-      const tx=db.transaction(storeName,'readwrite');
-      const s=tx.objectStore(storeName);
-      s.clear();
-      records.forEach(r=>s.put(r));
-      tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);
-    });
-  }catch(e){console.error('[IDB] idbSaveAll failed:',storeName,e);}
-}
-async function idbGetAll(storeName){
-  try{
-    const db=await openAppDb();
-    return new Promise((res,rej)=>{
-      const req=db.transaction(storeName,'readonly').objectStore(storeName).getAll();
-      req.onsuccess=e=>res(e.target.result||[]);
-      req.onerror=e=>rej(e.target.error);
-    });
-  }catch(e){return[];}
-}
-async function idbGetOne(storeName,id){
-  try{
-    const db=await openAppDb();
-    return new Promise((res,rej)=>{
-      const req=db.transaction(storeName,'readonly').objectStore(storeName).get(id);
-      req.onsuccess=e=>res(e.target.result||null);
-      req.onerror=e=>rej(e.target.error);
-    });
-  }catch(e){return null;}
-}
-// Patch a single record's _sync:true + _pushedAt in IDB after a successful push.
-// Much cheaper than idbSaveAll (one put, no clear).
-async function idbMarkSynced(storeName,id){
-  try{
-    const db=await openAppDb();
-    const rec=await new Promise((res,rej)=>{
-      const req=db.transaction(storeName,'readonly').objectStore(storeName).get(id);
-      req.onsuccess=e=>res(e.target.result||null);req.onerror=e=>rej(e.target.error);
-    });
-    if(!rec)return;
-    await new Promise((res,rej)=>{
-      const tx=db.transaction(storeName,'readwrite');
-      tx.objectStore(storeName).put({...rec,_sync:true,_pushedAt:Date.now()});
-      tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);
-    });
-  }catch(e){}
-}
-// Queue helpers — each queue op gets an auto-assigned _qid by IDB.
-async function idbEnqueue(op){
-  try{
-    const db=await openAppDb();
-    return new Promise((res,rej)=>{
-      const tx=db.transaction('queue','readwrite');
-      tx.objectStore('queue').add({...op,_retries:op._retries||0});
-      tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);
-    });
-  }catch(e){throw e;}
-}
-async function idbGetQueue(){
-  try{
-    const db=await openAppDb();
-    return new Promise((res,rej)=>{
-      const req=db.transaction('queue','readonly').objectStore('queue').getAll();
-      req.onsuccess=e=>res(e.target.result||[]);
-      req.onerror=e=>rej(e.target.error);
-    });
-  }catch(e){return[];}
-}
-async function idbDequeueOp(qid){
-  try{
-    const db=await openAppDb();
-    return new Promise((res,rej)=>{
-      const tx=db.transaction('queue','readwrite');
-      tx.objectStore('queue').delete(qid);
-      tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);
-    });
-  }catch(e){}
-}
-async function idbUpdateQueueOp(op){
-  try{
-    const db=await openAppDb();
-    return new Promise((res,rej)=>{
-      const tx=db.transaction('queue','readwrite');
-      tx.objectStore('queue').put(op); // _qid keyPath used for in-place update
-      tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);
-    });
-  }catch(e){}
-}
-// Only count ops for core data tables — wombats, burrows, treatments, burrow_logs,
-// sightings. Photo uploads and storage-deletes are excluded so the "N pending"
-// badge reflects meaningful data entries, not individual photo blobs.
-const DATA_TABLES=new Set(['wombats','burrows','treatments','burrow_logs','sightings']);
-async function idbQueueCount(){
-  try{
-    const db=await openAppDb();
-    const all=await new Promise((res,rej)=>{
-      const req=db.transaction('queue','readonly').objectStore('queue').getAll();
-      req.onsuccess=e=>res(e.target.result||[]);
-      req.onerror=e=>rej(e.target.error);
-    });
-    return all.filter(op=>DATA_TABLES.has(op.table)).length;
-  }catch(e){return 0;}
-}
-// Key-value meta store — used for recently-deleted cache, migration flag, etc.
-async function idbMetaGet(key){
-  try{
-    const db=await openAppDb();
-    return new Promise((res,rej)=>{
-      const req=db.transaction('meta','readonly').objectStore('meta').get(key);
-      req.onsuccess=e=>res(e.target.result?.value??null);
-      req.onerror=e=>rej(e.target.error);
-    });
-  }catch(e){return null;}
-}
-async function idbMetaSet(key,value){
-  try{
-    const db=await openAppDb();
-    return new Promise((res,rej)=>{
-      const tx=db.transaction('meta','readwrite');
-      tx.objectStore('meta').put({key,value});
-      tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);
-    });
-  }catch(e){}
-}
-// One-time migration: copy localStorage data into IDB so existing users don't
-// lose their data when upgrading. Safe to call on every startup — once the
-// 'migrated' meta flag is set it returns in one IDB read.
-async function migrateToIdb(){
-  try{
-    const done=await idbMetaGet('migrated');
-    if(done)return;
-    // Migrate record stores
-    const OLD={w:'ww2_wombats',b:'ww2_burrows',t:'ww2_treatments',s:'ww2_sightings',bl:'ww2_burrow_logs',wp:'ww2_wombat_photos',bp:'ww2_burrow_photos'};
-    for(const[k,lsKey]of Object.entries(OLD)){
-      try{
-        const d=JSON.parse(localStorage.getItem(lsKey)||'[]');
-        if(d.length)await idbSaveAll(STORE[k],d);
-      }catch(e){}
-    }
-    // Migrate sync queue
-    try{
-      const q=JSON.parse(localStorage.getItem('ww_sync_queue')||'[]');
-      if(q.length){
-        const db=await openAppDb();
-        const tx=db.transaction('queue','readwrite');
-        const s=tx.objectStore('queue');
-        q.forEach(op=>s.add({...op,_retries:op._retries||0}));
-        await new Promise((res,rej)=>{tx.oncomplete=res;tx.onerror=e=>rej(e.target.error);});
-      }
-    }catch(e){}
-    // Migrate recently-deleted cache
-    try{
-      const m=JSON.parse(localStorage.getItem('ww_sync_deleted')||'{}');
-      const entries=Object.entries(m).map(([id,ts])=>({id,ts}));
-      if(entries.length)await idbMetaSet('recently_deleted',entries);
-    }catch(e){}
-    await idbMetaSet('migrated',true);
-    console.log('[IDB] Migration from localStorage complete');
-  }catch(e){console.warn('[IDB] Migration failed:',e);}
-}
+// ── App data IDB (src/sync/idb/appDb.ts) ───────────────────────
+// Records, the offline sync queue and metadata live in wombatwatch_v1.
+const STORE=STORE_NAMES;
+const idbSaveAll=appDb.saveAll;
+const idbGetAll=appDb.getAll;
+const idbGetOne=appDb.getOne;
+const idbMarkSynced=(storeName,id)=>appDb.markSynced(storeName,id);
+const idbEnqueue=appDb.enqueue;
+const idbGetQueue=appDb.getQueue;
+const idbDequeueOp=appDb.dequeue;
+const idbUpdateQueueOp=appDb.updateQueueOp;
+const idbQueueCount=appDb.dataQueueCount;
+const idbMetaGet=appDb.metaGet;
+const idbMetaSet=appDb.metaSet;
+const migrateToIdb=()=>appDb.migrateFromLocalStorage(localStorage);
 // Cache remote photos into IDB so they render when offline.
 // Called after every full sync and on bootstrap. Downloads in parallel using
 // the Supabase Storage SDK (CORS-safe) so results are consistent with
