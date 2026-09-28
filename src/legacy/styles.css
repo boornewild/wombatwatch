@@ -1,0 +1,61 @@
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+html{height:100%;height:-webkit-fill-available;}
+body{height:100%;min-height:-webkit-fill-available;overflow:hidden;background:var(--tabbar);font-family:-apple-system,"SF Pro Text","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;}
+#root{height:100%;display:flex;justify-content:center;align-items:flex-start;}
+.app{width:100%;max-width:480px;height:100%;height:100svh;min-height:-webkit-fill-available;display:flex;flex-direction:column;overflow:hidden;background:var(--bg);}
+/* Tab bar: fixed to the true screen bottom so it's never left floating in PWA standalone mode.
+   left/right math centres it on desktop (>480px) and makes it full-width on mobile. */
+.tabbar{position:fixed;bottom:0;z-index:800;
+  left:max(0px,calc(50vw - 240px));right:max(0px,calc(50vw - 240px));}
+/* Scrollable content area — sits above the tab bar, never behind it */
+.content-area{flex:1;position:relative;overflow:hidden;min-height:0;}
+.scroll{position:absolute;top:0;left:0;right:0;bottom:0;overflow-y:auto;-webkit-overflow-scrolling:touch;}
+.noscroll::-webkit-scrollbar{display:none;}.noscroll{-ms-overflow-style:none;scrollbar-width:none;}
+/* ≥16 px prevents iOS auto-zoom on focus */
+input,textarea,select{font-family:inherit;outline:none;background:none;border:none;font-size:16px;}
+input[type="date"],input[type="datetime-local"]{-webkit-appearance:none;appearance:none;max-width:100%;min-width:0;}
+button{cursor:pointer;font-family:inherit;border:none;background:none;padding:0;}
+.leaflet-container{height:100%;width:100%;}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+@keyframes syncBar{0%{opacity:1;transform:scaleX(0.2) translateX(-200%)}50%{opacity:1;transform:scaleX(0.6) translateX(50%)}100%{opacity:0;transform:scaleX(0.2) translateX(300%)}}
+.search-input::placeholder{color:rgba(255,255,255,0.45);}
+/* Safe-area custom properties (populated by the browser) */
+:root{
+--sat:env(safe-area-inset-top,0px);
+--sab:env(safe-area-inset-bottom,0px);
+--sal:env(safe-area-inset-left,0px);
+--sar:env(safe-area-inset-right,0px);
+/* Derived layout helpers */
+--hdr-pt:max(16px,calc(var(--sat) + 12px));    /* header top padding — just clears the status bar */
+--tab-pb:max(22px,calc(var(--sab) + 8px));     /* tab bar bottom pad  */
+--screen-pb:max(100px,calc(var(--sab) + 84px));/* scroll content bottom clearance */
+--sp:clamp(16px,7.2vw,28px);                   /* screen side padding — scales w/ viewport width */
+}
+/* Light theme */
+:root{
+--bg:#F7F5EF;--surface:#fff;--soft:#F2EFE7;--div:rgba(28,48,32,0.08);
+--f900:#1F3A2A;--f800:#27482F;--f700:#2E5536;--f600:#3A6A42;--f500:#4A7C52;--f300:#A7C0A2;
+--ink:#1B2A1F;--mid:#4A5C4F;--soft-ink:#7A897E;--faint:#A9B2AB;
+--lav50:#F2EEFB;--lav100:#E6DEF7;--lav500:#7A6AB8;
+--sage50:#E8EFE6;--sage700:#3D6B3F;
+--amb50:#FBECCF;--amb700:#A26B1E;
+--rose50:#F3D9D4;--rose700:#B95C4A;
+--sky50:#DDE8F1;--sky700:#3B5B7A;
+--shadow:0 1px 2px rgba(28,48,32,0.04),0 4px 18px rgba(28,48,32,0.06);
+--shadow-hdr:0 6px 18px rgba(31,58,42,0.12);
+--tabbar:#fff;--tabborder:rgba(28,48,32,0.08);
+}
+[data-theme=dark]{
+--bg:#12181A;--surface:#1C2527;--soft:#232D2F;--div:rgba(255,255,255,0.06);
+--f900:#0F1E15;--f800:#152A1E;--f700:#5A9E68;--f600:#2A4C35;--f500:#4A7C52;--f300:#6A8C6E;
+--ink:#EFEFE8;--mid:#A8B0A9;--soft-ink:#79827B;--faint:#4A524C;
+--lav50:#2B2636;--lav100:#342D46;--lav500:#A196D6;
+--sage50:#1F2E22;--sage700:#88C594;
+--amb50:#33281A;--amb700:#E6B272;
+--rose50:#32211D;--rose700:#E39085;
+--sky50:#1C2934;--sky700:#8CB4D9;
+--shadow:0 1px 2px rgba(0,0,0,0.4),0 8px 22px rgba(0,0,0,0.35);
+--shadow-hdr:0 6px 18px rgba(0,0,0,0.35);
+--tabbar:#0F1517;--tabborder:rgba(255,255,255,0.06);
+}
