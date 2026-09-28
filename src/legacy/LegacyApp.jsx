@@ -24,6 +24,7 @@ import { filterToSquad, pendingSets, isConfirmedNewUser, mergeTable, resolveWith
 import { createRemote } from '../sync/remote';
 import { queueOp as enqueueOp, registerBrowserBackgroundSync } from '../sync/queue';
 import { flushQueue as flushQueueWith } from '../sync/flush';
+import { syncAction as syncActionWith } from '../sync/syncAction';
 import { markRecentlyDeleted as markRecentlyDeletedIn, getRecentlyDeleted as getRecentlyDeletedIn } from '../sync/recentlyDeleted';
 
 /* ════════════════════════════════════════════════════════════════
@@ -748,245 +749,18 @@ const flushQueue=userId=>flushQueueWith(userId,{
   appDb,remote,getLocalPhoto:idbGetPhoto,resolvePhotoUrl,isOnline:()=>navigator.onLine,notify:alertVolunteer,
 });
 
-// ── Sync single action → Supabase ─────────────────────────────
-async function syncAction(action,userId){
-  // Read latest record from IDB (more reliable than localStorage after eviction).
-  const fromIdb=async(k,id)=>{try{return await idbGetOne(STORE[k],id);}catch{return null;}};
-  const lsKeyMap={wombats:'w',burrows:'b',treatments:'t',sightings:'s',burrow_logs:'bl',wombat_photos:'wp',burrow_photos:'bp'};
-  const push=async(table,row)=>{
-    const r={...row,created_by:row.created_by||userId};
-    if(!navigator.onLine){await queueOp({t:'upsert',table,row:r});return;}
-    // Catch exceptions as well as false returns — both mean the push failed and the op
-    // must be queued so it isn't silently lost. Without this, a thrown error escapes
-    // the case statement and reaches the outer catch, bypassing the queueOp fallback.
-    try{
-      const ok=await supaUpsert(table,r);
-      if(!ok){await queueOp({t:'upsert',table,row:r});return;}
-      // Mark _sync:true in IDB so resolveWithCurrentQueue knows the push was confirmed,
-      // and record _pushedAt so it can detect pushes that completed while a sync fetch
-      // was already in flight (those pushes should still win over the stale server response).
-      const lk=lsKeyMap[table];
-      if(lk&&r.id)await idbMarkSynced(STORE[lk],r.id);
-    }catch(e){
-      console.warn('[Supa] push threw, queuing for retry:',table,e);
-      await queueOp({t:'upsert',table,row:r});
-    }
-  };
-  const del=async(table,id)=>{
-    if(!navigator.onLine){await queueOp({t:'delete',table,id});return;}
-    try{
-      const ok=await supaDelete(table,id);
-      // On success, record the ID in the recently-deleted cache so supaFullSync can
-      // filter it out even if its fetch was already in flight when the delete completed.
-      if(ok)await markRecentlyDeleted(id);
-      else await queueOp({t:'delete',table,id});
-    }catch(e){
-      console.warn('[Supa] del threw, queuing for retry:',table,id,e);
-      await queueOp({t:'delete',table,id});
-    }
-  };
-  try{
-    switch(action.type){
-      case'ADD_WOMBAT': {
-        // Always push/queue the wombat so it is never silently lost.
-        // If a burrow link was also specified, LINK_WOMBAT_BURROW fires immediately after
-        // and upserts the wombat again with the correct burrowIds — the second upsert wins
-        // (onConflict:'id') and is idempotent. Previously we skipped this push when
-        // linkedBurrowId was set, but that meant an offline ADD_WOMBAT was never queued
-        // if LINK_WOMBAT_BURROW's syncAction ran concurrently before localStorage was updated.
-        await push('wombats',wombatToDb(action.wombat,userId));
-        break;
-      }
-      // Apply patch directly rather than relying on reducer timing — IDB is updated
-      // synchronously (fire-and-forget) by the reducer, so by the time syncAction's
-      // async body runs, IDB has the latest version of the record.
-      case'UPDATE_WOMBAT':       {const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,...action.patch},userId));break;}
-      case'MARK_WOMBAT_INACTIVE':{const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:action.inactiveAt,inactiveCause:action.inactiveCause||null,inactiveNotes:action.inactiveNotes||null},userId));break;}
-      case'MARK_WOMBAT_ACTIVE':  {const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:action.status,inactiveAt:null,inactiveCause:null,inactiveNotes:null},userId));break;}
-      case'ARCHIVE_WOMBAT':      {const w=await fromIdb('w',action.id);if(w)await push('wombats',wombatToDb({...w,status:'archived'},userId));break;}
-      case'IMPORT_WOMBATS': for(const w of (action.wombats||[]))await push('wombats',wombatToDb(w,userId)); break;
-      case'ASSIGN_WOMBAT':{
-        const w=await fromIdb('w',action.wombatId);
-        if(w){
-          const cur=w.assignees||[];
-          const assignees=cur.some(a=>a.userId===action.userId)?cur:[...cur,{userId:action.userId,name:action.name}];
-          await push('wombats',wombatToDb({...w,assignees},userId));
-        }
-        break;}
-      case'UNASSIGN_WOMBAT':{
-        const w=await fromIdb('w',action.wombatId);
-        if(w){
-          const assignees=(w.assignees||[]).filter(a=>a.userId!==action.userId);
-          await push('wombats',wombatToDb({...w,assignees},userId));
-        }
-        break;}
-      case'DELETE_WOMBAT': {
-        await del('wombats',action.id);
-        // Explicitly delete child records — don't rely on CASCADE DELETE being configured in Supabase.
-        // IDs were captured at dispatch time (before the reducer wiped them from localStorage).
-        for(const tId of (action.treatmentIds||[]))     await del('treatments',    tId);
-        for(const pId of (action.wombatPhotoIds||[]))   await del('wombat_photos', pId);
-        // Push each previously-linked burrow so Supabase no longer shows the deleted wombat ID
-        // in their wombat_ids array. The reducer already removed it locally with _sync:false.
-        for(const bId of (action.burrowIds||[])){
-          const b=await fromIdb('b',bId);
-          if(b)await push('burrows',burrowToDb(b,userId));
-        }
-        break;
-      }
-      case'ADD_BURROW': {
-        // Read back from IDB rather than action.burrow — by the time syncAction runs,
-        // the reducer may have already committed a LINK_WOMBAT_BURROW that updated wombatIds.
-        // This prevents queuing a stale burrow with empty wombatIds only to have LINK overwrite it.
-        // Falls back to action.burrow if IDB write hasn't committed yet (timing edge case).
-        const latestBurrow=await fromIdb('b',action.burrow.id)||action.burrow;
-        await push('burrows',burrowToDb(latestBurrow,userId));
-        break;
-      }
-      case'UPDATE_BURROW':  {const b=await fromIdb('b',action.id);if(b)await push('burrows',burrowToDb({...b,...action.patch},userId));break;}
-      case'IMPORT_BURROWS': for(const b of (action.burrows||[]))await push('burrows',burrowToDb(b,userId)); break;
-      case'ASSIGN_MISSING_CODES':{
-        const bs=await idbGetAll(STORE.b);for(const b of bs.filter(b=>b.code))await push('burrows',burrowToDb(b,userId));
-        const ws=await idbGetAll(STORE.w);for(const w of ws.filter(w=>w.code))await push('wombats',wombatToDb(w,userId));
-        break;
-      }
-      case'RENUMBER_BURROWS':{
-        const bs=await idbGetAll(STORE.b);
-        const rows=bs.map(b=>burrowToDb(b,userId));
-        for(let i=0;i<rows.length;i+=200){
-          const chunk=rows.slice(i,i+200);
-          const{error}=await supa.from('burrows').upsert(chunk,{onConflict:'id'});
-          if(error)console.warn('[Supa] renumber chunk failed:',error);
-        }
-        break;
-      }
-      case'DELETE_BURROW': {
-        await del('burrows',action.id);
-        // Explicitly delete child records — don't rely on CASCADE DELETE being configured in Supabase.
-        // IDs were captured at dispatch time (before the reducer wiped them from localStorage).
-        for(const lId of (action.burrowLogIds||[]))     await del('burrow_logs',   lId);
-        for(const pId of (action.burrowPhotoIds||[]))   await del('burrow_photos', pId);
-        // Push each previously-linked wombat so Supabase no longer shows the deleted burrow ID
-        // in their burrow_ids array. The reducer already removed it locally with _sync:false.
-        for(const wId of (action.wombatIds||[])){
-          const w=await fromIdb('w',wId);
-          if(w)await push('wombats',wombatToDb(w,userId));
-        }
-        break;
-      }
-      case'ADD_TREATMENT':  await push('treatments', treatmentToDb(action.treatment,userId)); break;
-      case'EDIT_TREATMENT': await push('treatments', treatmentToDb(action.treatment,userId)); break;
-      case'DELETE_TREATMENT': await del('treatments',action.treatmentId); break;
-      // Sightings are not an active UI feature — no volunteer-facing flow creates them.
-      // These cases are kept so existing sighting seed data syncs correctly if it
-      // exists in the DB, and to avoid silent failures if an action somehow fires.
-      case'ADD_SIGHTING':    await push('sightings',  sightingToDb(action.sighting,userId)); break;
-      case'DELETE_SIGHTING': await del('sightings',action.sightingId); break;
-      case'ADD_BURROW_LOG': {
-        await push('burrow_logs',burrowLogToDb(action.log,userId));
-        // Apply the same logPatch the reducer uses so we don't rely on localStorage timing.
-        const b=await fromIdb('b',action.log.burrowId);
-        if(b){
-          const lp={status:action.log.status,lastChecked:action.log.at};
-          if(action.log.heightCm!=null&&action.log.heightCm!=='')lp.entranceHeightCm=action.log.heightCm;
-          if(action.log.widthCm!=null&&action.log.widthCm!=='')lp.entranceWidthCm=action.log.widthCm;
-          if(action.log.orientation)lp.orientation=action.log.orientation;
-          const hp={};
-          if(action.log.substrate)hp.substrate=action.log.substrate;
-          if(action.log.vegetation)hp.vegetation=action.log.vegetation;
-          if(action.log.trailCamera!==undefined)hp.trailCamera=action.log.trailCamera;
-          await push('burrows',burrowToDb({...b,...lp,habitat:{...b.habitat,...hp}},userId));
-        }
-        break;
-      }
-      case'DELETE_BURROW_LOG': {
-        await del('burrow_logs',action.logId);
-        // Also push the burrow back so Supabase reflects the reverted status/lastChecked.
-        // We read from localStorage here; if the reducer hasn't committed yet the value
-        // will be slightly stale, but the next full sync will reconcile it.
-        const bd=await fromIdb('b',action.burrowId);if(bd)await push('burrows',burrowToDb(bd,userId));
-        break;
-      }
-      case'ADD_WOMBAT_PHOTO': {
-        // Upload photo data to Supabase Storage; store URL in DB (not base64).
-        // Offline path: write blob to IDB for offline-viewing, then queue the op with the
-        // base64 directly in data_url. This is a belt-and-suspenders approach — if IDB is
-        // evicted (iOS 7-day rule, "clear data on exit" settings) before flushQueue runs,
-        // the queue op still has the raw image data and flushQueue's data: handler will
-        // upload it to Storage correctly on reconnect. Without this, IDB eviction silently
-        // discards the photo forever.
-        const wp=action.photo;
-        if(!navigator.onLine&&wp.dataUrl?.startsWith('data:'))await idbPutPhoto(wp.id,wp.dataUrl).catch(()=>{});
-        const url=navigator.onLine?await resolvePhotoUrl(wp.dataUrl,wp.id,SK.wp):wp.dataUrl;
-        await push('wombat_photos',wombatPhotoToDb({...wp,dataUrl:url},userId));
-        break;
-      }
-      case'DELETE_WOMBAT_PHOTO': {
-        await del('wombat_photos',action.photoId);
-        // Remove the Storage file — queue it if offline so it's cleaned up on reconnect
-        const wPath=`${action.photoId}.jpg`;
-        if(navigator.onLine){supa.storage.from('photos').remove([wPath]).catch(()=>{});}
-        else{await queueOp({t:'storage-delete',path:wPath});}
-        break;
-      }
-      case'SET_PROFILE_PHOTO': {
-        const ps=(await idbGetAll(STORE.wp)).filter(p=>p.wombatId===action.wombatId);
-        for(const p of ps){
-          // dataUrl is null in IDB if noB64 stripped it (blob lives in ww_photo_data).
-          // Fall back to photo IDB so we don't clobber an existing Storage URL with null.
-          let dataUrl=p.dataUrl;
-          if(!dataUrl)dataUrl=await idbGetPhoto(p.id)||null;
-          const url=navigator.onLine?await resolvePhotoUrl(dataUrl,p.id,SK.wp):dataUrl;
-          await push('wombat_photos',wombatPhotoToDb({...p,isProfile:p.id===action.photoId,dataUrl:url},userId));
-        }
-        break;
-      }
-      case'ADD_BURROW_PHOTO': {
-        // Offline: write blob to IDB for offline-viewing, and include the base64 in the
-        // queued op so IDB eviction doesn't silently destroy the photo before flushQueue.
-        const bp=action.photo;
-        if(!navigator.onLine&&bp.dataUrl?.startsWith('data:'))await idbPutPhoto(bp.id,bp.dataUrl).catch(()=>{});
-        const url=navigator.onLine?await resolvePhotoUrl(bp.dataUrl,bp.id,SK.bp):bp.dataUrl;
-        await push('burrow_photos',burrowPhotoToDb({...bp,dataUrl:url},userId));
-        break;
-      }
-      case'DELETE_BURROW_PHOTO': {
-        await del('burrow_photos',action.photoId);
-        // Remove the Storage file — queue it if offline so it's cleaned up on reconnect
-        const bPath=`${action.photoId}.jpg`;
-        if(navigator.onLine){supa.storage.from('photos').remove([bPath]).catch(()=>{});}
-        else{await queueOp({t:'storage-delete',path:bPath});}
-        break;
-      }
-      case'SET_BURROW_PROFILE_PHOTO': {
-        const ps=(await idbGetAll(STORE.bp)).filter(p=>p.burrowId===action.burrowId);
-        for(const p of ps){
-          let dataUrl=p.dataUrl;
-          if(!dataUrl)dataUrl=await idbGetPhoto(p.id)||null;
-          const url=navigator.onLine?await resolvePhotoUrl(dataUrl,p.id,SK.bp):dataUrl;
-          await push('burrow_photos',burrowPhotoToDb({...p,isProfile:p.id===action.photoId,dataUrl:url},userId));
-        }
-        break;
-      }
-      case'LINK_WOMBAT_BURROW': {
-        // Apply the bidirectional ID arrays directly — don't rely on reducer having updated localStorage yet.
-        const w=await fromIdb('w',action.wombatId);
-        if(w)await push('wombats',wombatToDb({...w,burrowIds:[...(w.burrowIds||[]).filter(id=>id!==action.burrowId),action.burrowId]},userId));
-        const b=await fromIdb('b',action.burrowId);
-        if(b)await push('burrows',burrowToDb({...b,wombatIds:[...(b.wombatIds||[]).filter(id=>id!==action.wombatId),action.wombatId]},userId));
-        break;
-      }
-      case'UNLINK_WOMBAT_BURROW': {
-        const w=await fromIdb('w',action.wombatId);
-        if(w)await push('wombats',wombatToDb({...w,burrowIds:(w.burrowIds||[]).filter(id=>id!==action.burrowId)},userId));
-        const b=await fromIdb('b',action.burrowId);
-        if(b)await push('burrows',burrowToDb({...b,wombatIds:(b.wombatIds||[]).filter(id=>id!==action.wombatId)},userId));
-        break;
-      }
-      default:break;
-    }
-  }catch(e){console.warn('[Supa] syncAction error',e);}
-}
+// ── Sync single action → Supabase (src/sync/syncAction.ts) ────
+const syncAction=(action,userId)=>syncActionWith(action,userId,{
+  isOnline:()=>navigator.onLine,
+  getRecord:(store,id)=>idbGetOne(store,id).catch(()=>null),
+  getAllRecords:idbGetAll,
+  remote,queueOp,
+  markSynced:idbMarkSynced,
+  markRecentlyDeleted,
+  putLocalPhoto:idbPutPhoto,
+  getLocalPhoto:idbGetPhoto,
+  resolvePhotoUrl,
+});
 
 // ── Full pull on sign-in ───────────────────────────────────────
 // Returns merged state object, or null for a new user (no remote data).

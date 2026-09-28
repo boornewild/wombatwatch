@@ -95,6 +95,19 @@ export function createRemote(supa: SupabaseLike, { onAuthError = null }: RemoteO
       return write(() => supa.from(table).upsert(row as never, { onConflict: 'id' }), 'upsert', table, row?.id);
     },
 
+    /**
+     * Many rows in one request (burrow renumbering). Legacy behaviour kept: no auth-error sign-out,
+     * and exceptions propagate to the caller.
+     */
+    async upsertBatch(table: string, rows: unknown[]): Promise<WriteResult> {
+      const { error } = await supa.from(table).upsert(rows as never, { onConflict: 'id' });
+      if (error) {
+        console.warn('[Supa] renumber chunk failed:', error);
+        return { ok: false, error: formatSupaError(error) };
+      }
+      return { ok: true };
+    },
+
     remove(table: string, id: unknown): Promise<WriteResult> {
       return write(() => supa.from(table).delete().eq('id', id as never), 'delete', table, id);
     },

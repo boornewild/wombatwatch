@@ -11,14 +11,15 @@ export type Action =
   | { type: 'MARK_WOMBAT_ACTIVE'; id: string; status: string }
   | { type: 'ARCHIVE_WOMBAT'; id: string }
   | { type: 'IMPORT_WOMBATS'; wombats: Wombat[] }
-  | { type: 'DELETE_WOMBAT'; id: string }
+  // Child ids are captured at dispatch time, before the reducer removes them, so sync can delete them remotely.
+  | { type: 'DELETE_WOMBAT'; id: string; burrowIds?: string[]; treatmentIds?: string[]; wombatPhotoIds?: string[] }
   // Burrows
   | { type: 'ADD_BURROW'; burrow: Burrow }
   | { type: 'ASSIGN_MISSING_CODES' }
   | { type: 'RENUMBER_BURROWS' }
   | { type: 'IMPORT_BURROWS'; burrows: Burrow[] }
   | { type: 'UPDATE_BURROW'; id: string; patch: Partial<Burrow> }
-  | { type: 'DELETE_BURROW'; id: string }
+  | { type: 'DELETE_BURROW'; id: string; wombatIds?: string[]; burrowLogIds?: string[]; burrowPhotoIds?: string[] }
   // Treatments and sightings
   | { type: 'ADD_TREATMENT'; treatment: Treatment }
   | { type: 'EDIT_TREATMENT'; treatment: Treatment }
