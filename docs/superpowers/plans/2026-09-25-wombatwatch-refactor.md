@@ -773,3 +773,18 @@ Open question for all four: what ±m does the app currently report when saving b
 ## Rollback
 
 Every production release is a merged PR. To roll back: `git revert <merge-sha> && git push` → the deploy workflow republishes the previous build in ~2 minutes. Database migrations must be additive (add columns/tables, never drop/rename in the same release as the code change) so a code rollback never meets an incompatible schema.
+
+## Bugs Found During the Refactor (not yet fixed — behaviour kept identical, each pinned by a test)
+
+| # | Bug | Where | Impact |
+|---|---|---|---|
+| 1 | Invite join runs after the first sync starts; join errors from `?join=` links are silent | `LegacyApp` auth effect (`loadSquad` not awaited) | New invitees see an empty app (Phase 4) |
+| 2 | Queued writes rejected by the database are dropped after 5 tries | `flushQueue`, `SQ_MAX_RETRIES` | Silent data loss (Phase 3) |
+| 3 | No DELETE/UPDATE storage policy on the `photos` bucket | prod storage policies | Photo deletes/re-uploads fail (Phase 4) |
+| 4 | `deduplicateCodes` sorts by `createdAt`, which records never have | `domain/codes.ts` | Arbitrary record keeps a duplicated W/B code, not the earliest |
+| 5 | `today()` is the UTC date | `domain/format.ts` | Before 10–11am in NSW, new records default to yesterday |
+| 6 | `parseCSV` drops quote marks and breaks on quoted newlines | `domain/csv.ts` | CSV import mangles some notes |
+| 7 | Incremental sync re-saves hydrated photos with their https URL stripped to null | `state/persistence.ts` (`PATCH_RECORDS`) | Likely cause of blank photos |
+| 8 | `Card` ignores `onClick` | `LegacyApp` `Card` | Dashboard/Activity items look tappable but do nothing |
+| 9 | `saveWombatOrder` read `authUser` before declaration | fixed in Phase 1 | Custom order didn't sync to profile on fresh sign-in |
+| 10 | Macdonald River height request blocked by CORS | `WeatherWidget` (BOM API) | River height always shows "—" |
