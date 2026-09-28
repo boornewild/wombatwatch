@@ -21,6 +21,10 @@ import { withPersistence } from '../state/persistence';
 import { appDb, STORE_NAMES } from '../sync/idb/appDb';
 import { photoStore } from '../sync/idb/photoStore';
 import { filterToSquad, pendingSets, isConfirmedNewUser, mergeTable, resolveWithQueue } from '../sync/merge';
+import { createRemote } from '../sync/remote';
+import { queueOp as enqueueOp, registerBrowserBackgroundSync } from '../sync/queue';
+import { flushQueue as flushQueueWith } from '../sync/flush';
+import { markRecentlyDeleted as markRecentlyDeletedIn, getRecentlyDeleted as getRecentlyDeletedIn } from '../sync/recentlyDeleted';
 
 /* ════════════════════════════════════════════════════════════════
    WOMBATWATCH — ARCHITECTURE OVERVIEW
@@ -650,45 +654,12 @@ const _computeSquadCenter=sq=>(sq?.boundsSwLat!=null&&sq?.boundsNeLat!=null?{lat
 let _syncSeq=0;
 
 
-// ── 401 / auth-error hook ─────────────────────────────────────
-// Set by the App component so global Supabase helpers can trigger a sign-out
-// when they receive an auth error (expired token, revoked account, etc.)
+// ── Remote ops (src/sync/remote.ts) ─────────────────────────
+// onAuthError is set by the App component so a 401 from any write signs the volunteer out.
 let onAuthError=null;
-function checkAuthError(error){
-  if(!error)return;
-  const msg=(error.message||'').toLowerCase();
-  const isAuth=error.status===401||error.code==='PGRST301'||msg.includes('jwt')||msg.includes('not authenticated');
-  if(isAuth&&onAuthError)onAuthError();
-}
-
-// ── Remote ops ───────────────────────────────────────────────
-let _lastSupaError=''; // captured for the flushQueue dropped-record alert
-async function supaUpsert(table,row){
-  try{
-    const{error}=await supa.from(table).upsert(row,{onConflict:'id'});
-    if(error){
-      _lastSupaError=`${error.message}${error.code?' ('+error.code+')':''}`;
-      console.warn('[Supa] upsert FAILED',table,row?.id,error.message,error.code);
-      checkAuthError(error);
-    }else console.debug('[Supa] upsert ok',table,row?.id);
-    return!error;
-  }catch(e){
-    _lastSupaError=String(e);
-    console.warn('[Supa] upsert exception',table,e);
-    return false;
-  }
-}
-async function supaDelete(table,id){
-  try{
-    const{error}=await supa.from(table).delete().eq('id',id);
-    if(error){
-      _lastSupaError=`${error.message}${error.code?' ('+error.code+')':''}`;
-      console.warn('[Supa] delete',table,error.message);
-      checkAuthError(error);
-    }
-    return!error;
-  }catch(e){_lastSupaError=String(e);return false;}
-}
+const remote=createRemote(supa,{onAuthError:()=>onAuthError&&onAuthError()});
+const supaUpsert=(table,row)=>remote.upsert(table,row).then(r=>r.ok);
+const supaDelete=(table,id)=>remote.remove(table,id).then(r=>r.ok);
 
 // ── Supabase Storage — photo upload ──────────────────────────
 // Convert a base64 data URL to a Blob without using fetch() — Safari iOS does not
@@ -768,187 +739,14 @@ async function resolvePhotoUrl(dataUrl,photoId,localKey){
   return url||dataUrl; // fall back to base64 if storage fails (still functional, just big)
 }
 
-// ── Recently-deleted ID cache ─────────────────────────────────
-// When a delete reaches Supabase successfully, we remove the op from the pending queue.
-// But if supaFullSync was already in flight at that moment, its stale response still
-// contains the deleted record — and since the op is no longer in the queue, deletedIds
-// won't filter it out, causing the record to reappear in the UI ("zombie resurrection").
-// Fix: track successfully-deleted IDs in IDB meta so the merge can filter them even
-// after the queue op is gone. Entries older than SD_TTL are pruned automatically.
-const SD_TTL=30*60*1000; // 30 minutes — long enough to survive a slow flush after reconnect
-async function markRecentlyDeleted(id){
-  try{
-    const existing=await idbMetaGet('recently_deleted')||[];
-    const now=Date.now();
-    const pruned=existing.filter(e=>now-e.ts<SD_TTL);
-    pruned.push({id,ts:now});
-    await idbMetaSet('recently_deleted',pruned);
-  }catch(e){}
-}
-async function getRecentlyDeleted(){
-  try{
-    const entries=await idbMetaGet('recently_deleted')||[];
-    const now=Date.now();
-    return new Set(entries.filter(e=>now-e.ts<SD_TTL).map(e=>e.id));
-  }catch(e){return new Set();}
-}
-
-// ── Offline queue ─────────────────────────────────────────────
-// Queue ops are persisted in IndexedDB ('wombatwatch_v1' → 'queue' store).
-// IDB is much more resilient to iOS eviction than localStorage, which was
-// silently cleared by iOS when storage was low, destroying pending sync ops.
-const SQ_MAX_RETRIES=5; // drop an op after this many consecutive genuine failures
-async function queueOp(op){
-  try{
-    await idbEnqueue(op);
-  }catch(e){
-    // IDB write failed — this record won't be synced.
-    console.error('[Queue] IDB write failed — record may be lost:',op.t,op.table||op.path,e);
-    try{
-      if(typeof alert!=='undefined') alert(
-        '⚠️ Could not save this record for offline sync.\n\n'+
-        'Your device storage may be full. Please free up space and check '+
-        'that your data was saved before closing the app.'
-      );
-    }catch{}
-  }
-  // Register a Background Sync tag so the queue flushes once connectivity is confirmed stable.
-  // No-op on iOS (BackgroundSync not supported there) and degrades silently on older browsers.
-  try{navigator.serviceWorker?.ready.then(r=>r.sync?.register('ww-queue-flush')).catch(()=>{});}catch(e){}
-}
-// Returns true if an error string looks like a transient network failure rather
-// than a real Supabase error. Transient errors should never consume retry budget.
-function isNetworkError(errStr){
-  if(!navigator.onLine)return true;
-  return/TypeError|Load failed|Failed to fetch|NetworkError|net::ERR|AbortError/i.test(errStr||'');
-}
-// Returns true if an error string looks like an authentication failure.
-// Auth failures abort the flush — ops are re-queued to retry after sign-in.
-function isAuthErrorStr(errStr){
-  return/401|PGRST301|jwt expired|jwt|not authenticated/i.test(errStr||'');
-}
-// Returns a Set of photo IDs that were successfully uploaded to Supabase Storage
-// during this flush. Callers use this to force-re-cache those specific blobs into
-// ww_photo_data via cacheRemotePhotosToIdb(forcedIds) after the post-flush sync.
-async function flushQueue(userId){
-  // Bail immediately if we know we're offline — avoids burning a failed op and
-  // polluting _lastSupaError with a network error before networkAbort kicks in.
-  if(!navigator.onLine)return new Set();
-  const uploadedPhotoIds=new Set(); // track photo IDs whose Storage upload succeeded
-  const lostPhotoIds=new Set();     // photo ops whose IDB blob was evicted before upload
-  try{
-    const q=await idbGetQueue();
-    if(!q.length)return new Set();
-    // Process parents before children so FK constraints are never violated
-    // wombats/burrows → treatments/sightings/logs → photos
-    const TABLE_PRI={wombats:0,burrows:0,treatments:1,sightings:1,burrow_logs:1,wombat_photos:2,burrow_photos:2};
-    // storage-delete ops have no .table field — run them last (after photos, priority 3)
-    const getOpPri=op=>op.t==='storage-delete'?3:(TABLE_PRI[op.table]??1);
-    q.sort((a,b)=>getOpPri(a)-getOpPri(b));
-    let networkAbort=false; // set when a transient network failure is detected
-    let authAbort=false;    // set when an auth error is detected — re-auth needed before retry
-    const lsKeyMap={wombats:'w',burrows:'b',treatments:'t',sightings:'s',burrow_logs:'bl',wombat_photos:'wp',burrow_photos:'bp'};
-    for(const op of q){
-      // Once a network or auth failure is detected, stop processing — leave remaining ops
-      // in IDB unchanged (they'll be retried on next reconnect / re-auth).
-      if(networkAbort||authAbort)break;
-      let ok=false;
-      let skip=false;
-      let netErr=false;
-      _lastSupaError=''; // reset so stale errors from prior ops don't bleed into netErr check
-      try{
-        if(op.t==='upsert'){
-          let row={...op.row,created_by:op.row.created_by||userId};
-          // Photo rows: if data_url is still base64, upload it; if null, load from IDB first
-          if(op.table==='wombat_photos'||op.table==='burrow_photos'){
-            if(row.data_url&&row.data_url.startsWith('data:')){
-              const lk=op.table==='wombat_photos'?SK.wp:SK.bp;
-              const url=await resolvePhotoUrl(row.data_url,row.id,lk);
-              row={...row,data_url:url};
-              // If we got a Storage URL back, write it to the IDB record immediately so
-              // the record survives with data_url:'https://...' even if ww_photo_data is evicted.
-              if(url?.startsWith('https://')){
-                try{
-                  const existing=await idbGetOne(STORE[lk],op.row.id);
-                  if(existing)await idbSaveAll(STORE[lk],(await idbGetAll(STORE[lk])).map(r=>r.id===op.row.id?{...r,dataUrl:url}:r));
-                }catch(e){}
-              }
-            }else if(!row.data_url){
-              const idbData=await idbGetPhoto(row.id);
-              if(!idbData){
-                // Blob is gone from IDB — silently discard to avoid pushing a null record
-                console.warn('[Queue] Photo blob missing from IDB, discarding op:',row.id);
-                skip=true;
-              }else{
-                const url=await resolvePhotoUrl(idbData,row.id,op.table==='wombat_photos'?SK.wp:SK.bp);
-                row={...row,data_url:url};
-              }
-            }
-          }
-          if(!skip) ok=await supaUpsert(op.table,row);
-        }else if(op.t==='delete'){
-          ok=await supaDelete(op.table,op.id);
-        }else if(op.t==='storage-delete'){
-          // Remove a file from Supabase Storage (queued when photo was deleted offline)
-          const{error}=await supa.storage.from('photos').remove([op.path]);
-          ok=!error;
-          if(error){
-            _lastSupaError=`${error.message}${error.code?' ('+error.code+')':''}`;
-            console.warn('[Queue] Storage delete failed:',op.path,error.message);
-          }
-        }
-        // After any failure, check whether it was a network error vs a real Supabase error
-        if(!ok&&!skip) netErr=isNetworkError(_lastSupaError);
-      }catch(e){
-        console.warn('[Queue] op threw:',op.t,op.table||op.id,e);
-        netErr=true; // uncaught exceptions are almost always network issues
-      }
-      if(skip){
-        // Discard — blob evicted from IDB before upload could happen. Record the loss
-        // so the caller can surface a user-facing warning.
-        lostPhotoIds.add(op.row?.id);
-        await idbDequeueOp(op._qid);
-      }else if(ok){
-        // Mark successfully-pushed records as _sync:true in IDB so that future full syncs
-        // treat them as server-authoritative. Without this, _sync:false records permanently
-        // win every merge and changes from other devices never land locally.
-        await idbDequeueOp(op._qid);
-        if(op.t==='upsert'&&op.row?.id){
-          const lk=lsKeyMap[op.table];
-          if(lk)await idbMarkSynced(STORE[lk],op.row.id);
-          // Track photo uploads so callers can force-re-cache those blobs after sync
-          if(op.table==='wombat_photos'||op.table==='burrow_photos') uploadedPhotoIds.add(op.row.id);
-        }else if(op.t==='delete'&&op.id){
-          // Mark in the recently-deleted cache so in-flight syncs don't re-introduce
-          // this record when the queue op is no longer present.
-          await markRecentlyDeleted(op.id);
-        }
-      }else if(netErr){
-        // Transient network failure — leave op in IDB unchanged (retries NOT incremented)
-        // and abort the rest of the flush so subsequent ops aren't wasted either.
-        console.warn('[Queue] Network error — pausing flush, will retry on reconnect:',op.t,op.table||op.id);
-        networkAbort=true;
-      }else if(isAuthErrorStr(_lastSupaError)){
-        // Auth error — token expired or revoked. Leave op in IDB without charging retry budget.
-        // onAuthError() (called inside supaUpsert/supaDelete via checkAuthError) will
-        // trigger a sign-out; the flush will resume automatically after re-authentication.
-        console.warn('[Queue] Auth error — pausing flush until re-auth:',op.t,op.table||op.id);
-        authAbort=true;
-      }else{
-        // Genuine Supabase error (bad data, permission denied, etc.) — charge the retry budget.
-        const retries=(op._retries||0)+1;
-        if(retries>=SQ_MAX_RETRIES){
-          console.warn('[Queue] Dropping op after',retries,'failures:',op.t,op.table||op.id);
-          await idbDequeueOp(op._qid);
-          if(typeof alert!=='undefined') alert(`⚠️ A record could not be synced after several attempts and has been dropped.\n\nTable: ${op.table||'unknown'}\nError: ${_lastSupaError||'unknown'}\n\nPlease screenshot this and check your data.`);
-        }else{
-          await idbUpdateQueueOp({...op,_retries:retries});
-        }
-      }
-    }
-  }catch(e){console.warn('[Queue] flush error',e);}
-  return{uploadedPhotoIds,lostPhotoIds};
-}
+// ── Offline queue + flush (src/sync/queue.ts, flush.ts, recentlyDeleted.ts) ──
+const alertVolunteer=m=>{if(typeof alert!=='undefined')alert(m);};
+const markRecentlyDeleted=id=>markRecentlyDeletedIn(id,appDb);
+const getRecentlyDeleted=()=>getRecentlyDeletedIn(appDb);
+const queueOp=op=>enqueueOp(op,{appDb,notify:alertVolunteer,registerBackgroundSync:registerBrowserBackgroundSync});
+const flushQueue=userId=>flushQueueWith(userId,{
+  appDb,remote,getLocalPhoto:idbGetPhoto,resolvePhotoUrl,isOnline:()=>navigator.onLine,notify:alertVolunteer,
+});
 
 // ── Sync single action → Supabase ─────────────────────────────
 async function syncAction(action,userId){
