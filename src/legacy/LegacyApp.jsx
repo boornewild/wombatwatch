@@ -10,6 +10,12 @@ import {
   wombatToDb, dbToWombat, burrowToDb, dbToBurrow, treatmentToDb, dbToTreatment, sightingToDb, dbToSighting,
   burrowLogToDb, dbToBurrowLog, wombatPhotoToDb, dbToWombatPhoto, burrowPhotoToDb, dbToBurrowPhoto,
 } from '../data/mappers';
+import {
+  fmtDate, fmtDateTime, timeAgo, today, statusTone, statusLabel, isInactive, isArchived, burrowTone, burrowStatusLabel,
+} from '../domain/format';
+import { toCSV, parseCSV } from '../domain/csv';
+import { weekKeyToDate } from '../domain/streak';
+import { loadStreak, activeStreakCount, touchStreak } from '../state/streakStorage';
 
 /* ════════════════════════════════════════════════════════════════
    WOMBATWATCH — ARCHITECTURE OVERVIEW
@@ -129,17 +135,6 @@ const uid=()=>{
   // Fallback for older browsers
   return'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==='x'?r:(r&0x3|0x8)).toString(16);});
 };
-const fmtDate=s=>{if(!s)return'—';const d=new Date(s);if(isNaN(d.getTime()))return'—';return`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;};
-// Like fmtDate but also shows time (h:mm AM/PM) when the string includes a time component.
-const fmtDateTime=s=>{if(!s)return'—';const hasTime=s.length>10&&s.includes('T')||s.includes(' ')&&s.split(' ')[1]?.includes(':');const d=new Date(s);if(isNaN(d.getTime()))return'—';const date=`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;if(!hasTime)return date;const h=d.getHours(),m=String(d.getMinutes()).padStart(2,'0');return`${date} ${h%12||12}:${m} ${h<12?'AM':'PM'}`;};
-const timeAgo=s=>{if(!s)return'';const h=Math.floor((Date.now()-new Date(s))/36e5);if(h<1)return'Just now';if(h<24)return`${h}h ago`;const d=Math.floor(h/24);return d===1?'Yesterday':`${d}d ago`;};
-const today=()=>new Date().toISOString().slice(0,10);
-const statusTone=s=>({healthy:'sage',under_treatment:'amber',deceased:'rose',archived:'pearl'}[s]||'pearl');
-const statusLabel=s=>({healthy:'Healthy',under_treatment:'Treatment',deceased:'Deceased',archived:'Archived'}[s]||(s?s.charAt(0).toUpperCase()+s.slice(1):s));
-const isInactive=w=>w.status==='deceased';
-const isArchived=w=>w.status==='archived';
-const burrowTone=s=>({active:'sage',inactive:'amber',damaged:'rose'}[s]||'pearl');
-const burrowStatusLabel=s=>({active:'Active',inactive:'Inactive',damaged:'Damaged'}[s]||(s?s.charAt(0).toUpperCase()+s.slice(1):s));
 /* GPS helper — always uses the hardware GPS chip (enableHighAccuracy:true).
    Network/WiFi positioning (the default) is only accurate to 20-100m and
    causes nearby burrows to all land on the same point. */
@@ -149,16 +144,7 @@ const gpsLocate=(onSuccess,onError)=>navigator.geolocation.getCurrentPosition(
   {enableHighAccuracy:true,timeout:15000,maximumAge:0}
 );
 /* CSV helpers */
-const toCSV=(headers,rows)=>{const esc=v=>{if(v==null)return'';const s=String(v);return(s.includes(',')||s.includes('"')||s.includes('\n'))?`"${s.replace(/"/g,'""')}"`:`${s}`;};return[headers,...rows].map(r=>r.map(esc).join(',')).join('\r\n');};
 const dlCSV=(filename,headers,rows)=>{const blob=new Blob(['\uFEFF'+toCSV(headers,rows)],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=filename;a.click();URL.revokeObjectURL(url);};
-const parseCSV=text=>{
-  const lines=text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').trim().split('\n');
-  if(!lines.length)return{headers:[],rows:[]};
-  const splitLine=line=>{const cols=[];let cur='';let inQ=false;for(let i=0;i<line.length;i++){if(line[i]==='"')inQ=!inQ;else if(line[i]===','&&!inQ){cols.push(cur);cur='';}else cur+=line[i];}cols.push(cur);return cols.map(c=>c.replace(/^"|"$/g,'').replace(/""/g,'"').trim());};
-  const headers=splitLine(lines[0]);
-  const rows=lines.slice(1).map(splitLine).filter(r=>r.some(c=>c));
-  return{headers,rows};
-};
 
 /* ════════════════════════════════════════════════════════════════
    ICON LIBRARY
@@ -844,61 +830,6 @@ async function recoverBlankPhotos(wombatPhotos,burrowPhotos,dispatch){
   }catch(e){}
 }
 
-/* ── Streak helpers ──────────────────────────────────────────────
-   A "week key" is YYYY-WNN. Any logging activity within a calendar
-   week counts. Missing a full week resets the streak to 1.        */
-function getWeekKey(date=new Date()){
-  const d=new Date(Date.UTC(date.getFullYear(),date.getMonth(),date.getDate()));
-  d.setUTCDate(d.getUTCDate()+4-(d.getUTCDay()||7));
-  const y=d.getUTCFullYear();
-  const wk=Math.ceil(((d-new Date(Date.UTC(y,0,1)))/86400000+1)/7);
-  return`${y}-W${String(wk).padStart(2,'0')}`;
-}
-// Convert an ISO week key (e.g. '2026-W18') to the Monday of that week as a UTC Date.
-// This is the only correct way to calculate week gaps — naive string arithmetic on the
-// week number gives wildly wrong results (e.g. '2026-W18' → '2026-01-18' = January 18,
-// which is nothing to do with week 18). Year-boundary transitions (W52 → W01) are also
-// handled correctly because we anchor to Jan 4 (always in ISO week 1).
-function weekKeyToDate(wk){
-  if(!wk)return null;
-  try{
-    const[ys,ws]=wk.split('-W');
-    const y=Number(ys),w=Number(ws);
-    if(!y||!w)return null;
-    const jan4=new Date(Date.UTC(y,0,4)); // Jan 4 is always in ISO week 1
-    const mon1=new Date(jan4);
-    mon1.setUTCDate(jan4.getUTCDate()-(jan4.getUTCDay()||7)+1); // Monday of week 1
-    return new Date(mon1.getTime()+(w-1)*7*86400000);
-  }catch{return null;}
-}
-function weekGap(wk1,wk2){
-  const d1=weekKeyToDate(wk1),d2=weekKeyToDate(wk2);
-  if(!d1||!d2)return 99;
-  return Math.round(Math.abs(d1.getTime()-d2.getTime())/(7*86400000));
-}
-function loadStreak(){try{return JSON.parse(localStorage.getItem(SK.streak))||{count:0,weekKey:''};}catch{return{count:0,weekKey:''};}}
-// Returns the streak count the UI should display. Shows the streak if:
-//   - The user logged activity this week (weekKey === now), OR
-//   - The user logged last week and hasn't yet this week (streak still alive — show it to
-//     encourage them to act before the week is over).
-// Returns 0 if the streak has expired (gap > 1 week) so the pill correctly disappears.
-function activeStreakCount(){
-  const s=loadStreak();
-  if(!s.count)return 0;
-  const gap=weekGap(getWeekKey(),s.weekKey);
-  return gap<=1?s.count:0; // expired if more than 1 week since last activity
-}
-function touchStreak(){
-  const now=getWeekKey();
-  const s=loadStreak();
-  if(s.weekKey===now)return s.count; // already active this week — no change
-  // Compute gap in whole weeks between last active week and now using proper date math.
-  // gap=1 → consecutive weeks (increment streak); gap>1 → missed week(s) (reset to 1).
-  const gap=weekGap(now,s.weekKey||'');
-  const count=gap===1&&s.count>0?s.count+1:1;
-  try{localStorage.setItem(SK.streak,JSON.stringify({count,weekKey:now}));}catch{}
-  return count;
-}
 
 /* Compress an image File to a JPEG dataUrl ≤ maxPx wide/tall at the given quality */
 function compressImage(file,maxPx=1200,quality=0.75){
@@ -1947,6 +1878,8 @@ function SearchInHeader({value,onChange,placeholder='Search by name or location�
     <input value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} className="search-input" style={{flex:1,color:'rgba(255,255,255,0.9)',fontSize:14,fontWeight:400}} />
   </div>;
 }
+// Icon-only tabs need names for screen readers (and tests).
+const TAB_LABELS={dashboard:'Home',map:'Map',wombats:'Wombats',burrows:'Burrows'};
 function TabBar({active,onNav,onFAB}){
   const t=useTheme();
   /* Filled icon variants used for the selected tab state */
@@ -1964,7 +1897,7 @@ function TabBar({active,onNav,onFAB}){
   </svg>;
   const tab=(key,icon,selIcon,sz=22)=>{
     const on=active===key;
-    return <button key={key} onClick={()=>onNav(key)} style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center'}}>
+    return <button key={key} aria-label={TAB_LABELS[key]} aria-current={on?'page':undefined} onClick={()=>onNav(key)} style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center'}}>
       <div style={{width:40,height:40,borderRadius:20,background:on?'rgba(45,95,63,0.1)':'transparent',display:'flex',alignItems:'center',justifyContent:'center'}}>
         {on&&selIcon ? selIcon(t.f700,sz) : icon(t.f700,sz)}
       </div>

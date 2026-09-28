@@ -29,6 +29,7 @@ export default defineConfig(({ command, mode }) => {
       globals: true,
       setupFiles: ['./vitest.setup.ts'],
       include: ['src/**/*.test.{ts,tsx}'],
+      env: { TZ: 'Australia/Sydney' }, // volunteers are in NSW; date formatting tests depend on it
     },
   };
 });
