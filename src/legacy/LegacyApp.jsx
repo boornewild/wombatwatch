@@ -16,19 +16,20 @@ import {
 import { toCSV, parseCSV } from '../domain/csv';
 import { weekKeyToDate } from '../domain/streak';
 import { loadStreak, activeStreakCount, touchStreak } from '../state/streakStorage';
+import { reducer } from '../state/reducer';
+import { withPersistence } from '../state/persistence';
 
 /* ════════════════════════════════════════════════════════════════
    WOMBATWATCH — ARCHITECTURE OVERVIEW
    ────────────────────────────────────────────────────────────────
-   Single-file React 18 PWA. No build step — @babel/standalone
-   transpiles JSX at runtime. To deploy: copy WombatWatch.html →
-   index.html and push to GitHub Pages alongside sw.js + manifest.json.
+   React 18 PWA built with Vite (see README / docs/superpowers/plans).
+   This file is the legacy remainder being moved into typed modules.
 
    DATA FLOW
-     load() → useReducer(reducer, ...) → dispatch(action)
-                                        → reducer mutates + saves
-                                        → save(key, value)
-                                        → localStorage
+     load() → useReducer(reducerWithSaves, ...) → dispatch(action)
+       reducer            src/state/reducer.ts (pure)
+       withPersistence    src/state/persistence.ts → save(key, value)
+                          → IndexedDB (primary) + localStorage (backup)
 
    STATE  All app state lives in one `data` object:
      data.wombats       Wombat[]
@@ -485,6 +486,8 @@ async function idbDeletePhoto(id){
 // Strip base64 dataUrls before saving to localStorage (they live in IDB instead).
 // Supabase Storage URLs (https://...) are small and safe to keep.
 const noB64=p=>p.dataUrl?.startsWith('data:')?{...p,dataUrl:null}:p;
+// Pure reducer (src/state/reducer.ts) + saving each changed collection to IDB/localStorage.
+const reducerWithSaves=withPersistence(reducer,save);
 
 // ── App data IDB (records + queue + meta) ─────────────────────────────────────
 // All wombat/burrow/etc records, the sync queue, and recently-deleted cache live
@@ -6480,238 +6483,6 @@ function AddSightingModal({wombats,onClose,onSave}){
    ADD_BURROW_LOG also updates burrow.status and burrow.lastChecked
    as a side-effect.
 ════════════════════════════════════════════════════════════════ */
-function reducer(state,action){
-  // NOTE ON PHOTO SAVES: all photo arrays are saved via .map(noB64) which strips
-  // base64 dataUrls before writing to localStorage. The actual blobs live in
-  // IndexedDB (see idbPutPhoto). HYDRATE_PHOTO_DATA re-merges IDB data into
-  // state after startup — it does NOT write to localStorage.
-  switch(action.type){
-
-    // ── Wombats ──────────────────────────────────────────────────
-    case 'ADD_WOMBAT':{const wombats=[...state.wombats,{...action.wombat,_sync:false}];save('w',wombats);return{...state,wombats};}
-    case 'UPDATE_WOMBAT':{const wombats=state.wombats.map(w=>w.id===action.id?{...w,...action.patch,_sync:false}:w);save('w',wombats);return{...state,wombats};}
-    // ASSIGNMENT FEATURE — UI hidden pending rollout (search "ASSIGNMENT UI HIDDEN").
-    // Reducer + sync layer fully implemented; syncAction pushes these as wombat upserts
-    // (not RPCs) so they flow through the offline queue correctly.
-    case 'ASSIGN_WOMBAT':{const wombats=state.wombats.map(w=>w.id===action.wombatId?{...w,assignees:[...(w.assignees||[]).filter(a=>a.userId!==action.userId),{userId:action.userId,name:action.name}],_sync:false}:w);save('w',wombats);return{...state,wombats};}
-    case 'UNASSIGN_WOMBAT':{const wombats=state.wombats.map(w=>w.id===action.wombatId?{...w,assignees:(w.assignees||[]).filter(a=>a.userId!==action.userId),_sync:false}:w);save('w',wombats);return{...state,wombats};}
-    // _sync:false ensures local version wins on next supaFullSync merge even if the
-    // page is refreshed before the async Supabase push completes (edit never gets lost).
-    case 'MARK_WOMBAT_INACTIVE':{
-      // Sets status to 'deceased' and records the inactiveAt/inactiveCause/inactiveNotes fields.
-      const wombats=state.wombats.map(w=>w.id===action.id?{...w,status:action.status,inactiveAt:action.inactiveAt,inactiveCause:action.inactiveCause||null,inactiveNotes:action.inactiveNotes||null,_sync:false}:w);
-      save('w',wombats);return{...state,wombats};
-    }
-    case 'MARK_WOMBAT_ACTIVE':{
-      // Restores an inactive wombat to an active status, clearing inactive fields.
-      const wombats=state.wombats.map(w=>w.id===action.id?{...w,status:action.status,inactiveAt:null,inactiveCause:null,inactiveNotes:null,_sync:false}:w);
-      save('w',wombats);return{...state,wombats};
-    }
-    case 'ARCHIVE_WOMBAT':{
-      // Moves a healthy wombat to the archive — preserves all data, hidden from active lists.
-      const wombats=state.wombats.map(w=>w.id===action.id?{...w,status:'archived',_sync:false}:w);
-      save('w',wombats);return{...state,wombats};
-    }
-    case 'IMPORT_WOMBATS':{const wombats=[...state.wombats,...action.wombats];save('w',wombats);return{...state,wombats};}
-    case 'DELETE_WOMBAT':{
-      // Cascade: remove all child records (treatments, sightings, photos)
-      // and unlink from any burrows that referenced this wombat.
-      // ON DELETE CASCADE in Supabase handles the server side; this mirrors it locally.
-      // _sync:false on affected burrows so the server version (still with the ghost wombat ID)
-      // doesn't win the next merge — syncAction will push the corrected burrows to Supabase.
-      const wombats=state.wombats.filter(w=>w.id!==action.id);
-      const treatments=state.treatments.filter(tr=>tr.wombatId!==action.id);
-      const sightings=state.sightings.filter(s=>s.wombatId!==action.id);
-      const wombatPhotos=state.wombatPhotos.filter(p=>p.wombatId!==action.id);
-      const burrows=state.burrows.map(b=>b.wombatIds?.includes(action.id)?{...b,wombatIds:b.wombatIds.filter(id=>id!==action.id),_sync:false}:b);
-      save('w',wombats);save('t',treatments);save('s',sightings);save('wp',wombatPhotos.map(noB64));save('b',burrows);
-      return{...state,wombats,treatments,sightings,wombatPhotos,burrows};
-    }
-
-    // ── Burrows ──────────────────────────────────────────────────
-    case 'ADD_BURROW':{const burrows=[...state.burrows,{...action.burrow,_sync:false}];save('b',burrows);return{...state,burrows};}
-    case 'ASSIGN_MISSING_CODES':{
-      const allSoFar=[...state.burrows.filter(b=>b.code)];
-      const burrows=state.burrows.map(b=>{
-        if(b.code)return b;
-        const code=nextBurrowCode(allSoFar);
-        allSoFar.push({...b,code});
-        return{...b,code,_sync:false};
-      });
-      const wAllSoFar=[...state.wombats.filter(w=>w.code)];
-      const wombats=state.wombats.map(w=>{
-        if(w.code)return w;
-        const code=nextWombatCode(wAllSoFar);
-        wAllSoFar.push({...w,code});
-        return{...w,code,_sync:false};
-      });
-      save('b',burrows);save('w',wombats);return{...state,burrows,wombats};
-    }
-    case 'RENUMBER_BURROWS':{
-      const sorted=[...state.burrows].sort((a,b)=>new Date(a._createdAt||'2099').getTime()-new Date(b._createdAt||'2099').getTime());
-      const codeMap=new Map(sorted.map((b,i)=>[b.id,'B'+String(i+1).padStart(4,'0')]));
-      const burrows=state.burrows.map(b=>({...b,code:codeMap.get(b.id)||b.code,_sync:false}));
-      save('b',burrows);return{...state,burrows};
-    }
-    case 'IMPORT_BURROWS':{
-      const allSoFar=[...state.burrows];
-      const withCodes=action.burrows.map(b=>{
-        if(b.code)return b;
-        const code=nextBurrowCode(allSoFar);
-        allSoFar.push({...b,code});
-        return{...b,code};
-      });
-      const burrows=[...state.burrows,...withCodes];
-      save('b',burrows);return{...state,burrows};
-    }
-    case 'UPDATE_BURROW':{const burrows=state.burrows.map(b=>b.id===action.id?{...b,...action.patch,_sync:false}:b);save('b',burrows);return{...state,burrows};}
-    // _sync:false mirrors the UPDATE_WOMBAT fix: local edit wins merge until server confirms.
-    case 'DELETE_BURROW':{
-      // Cascade: remove all child records (logs, photos) and unlink from wombats.
-      // _sync:false on affected wombats so the server version (still with the ghost burrow ID)
-      // doesn't win the next merge — syncAction will push the corrected wombats to Supabase.
-      const burrows=state.burrows.filter(b=>b.id!==action.id);
-      const burrowLogs=state.burrowLogs.filter(l=>l.burrowId!==action.id);
-      const burrowPhotos=state.burrowPhotos.filter(p=>p.burrowId!==action.id);
-      const wombats=state.wombats.map(w=>w.burrowIds?.includes(action.id)?{...w,burrowIds:w.burrowIds.filter(id=>id!==action.id),_sync:false}:w);
-      save('b',burrows);save('bl',burrowLogs);save('bp',burrowPhotos.map(noB64));save('w',wombats);
-      return{...state,burrows,burrowLogs,burrowPhotos,wombats};
-    }
-
-    // ── Treatments ───────────────────────────────────────────────
-    case 'ADD_TREATMENT':{const treatments=[...state.treatments,{...action.treatment,_sync:false}];save('t',treatments);return{...state,treatments};}
-    case 'EDIT_TREATMENT':{const treatments=state.treatments.map(tr=>tr.id===action.treatment.id?{...action.treatment,_sync:false}:tr);save('t',treatments);return{...state,treatments};}
-    case 'DELETE_TREATMENT':{const treatments=state.treatments.filter(tr=>tr.id!==action.treatmentId);save('t',treatments);return{...state,treatments};}
-
-    // ── Sightings ────────────────────────────────────────────────
-    // Sighting cases — not an active UI feature but kept for data model completeness
-    // (seed data includes sightings; these ensure they persist correctly).
-    case 'ADD_SIGHTING':{const sightings=[...state.sightings,{...action.sighting,_sync:false}];save('s',sightings);return{...state,sightings};}
-    case 'DELETE_SIGHTING':{const sightings=state.sightings.filter(s=>s.id!==action.sightingId);save('s',sightings);return{...state,sightings};}
-
-    // ── Photos ───────────────────────────────────────────────────
-    // base64 blobs live in IDB; localStorage only holds metadata (dataUrl:null).
-    // _sync:false on new photos so a concurrent server pull doesn't clobber the local record.
-    case 'ADD_WOMBAT_PHOTO':{const wombatPhotos=[...state.wombatPhotos,{...action.photo,_sync:false}];save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};}
-    case 'SET_PROFILE_PHOTO':{
-      // Mark one photo as the profile image; clear the flag on all others for this wombat.
-      // _sync:false on all affected photos so isProfile changes survive any concurrent server pull.
-      const wombatPhotos=state.wombatPhotos.map(p=>p.wombatId===action.wombatId?{...p,isProfile:p.id===action.photoId,_sync:false}:p);
-      save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};
-    }
-    case 'DELETE_WOMBAT_PHOTO':{const wombatPhotos=state.wombatPhotos.filter(p=>p.id!==action.photoId);save('wp',wombatPhotos.map(noB64));return{...state,wombatPhotos};}
-    case 'ADD_BURROW_PHOTO':{const burrowPhotos=[...state.burrowPhotos,{...action.photo,_sync:false}];save('bp',burrowPhotos.map(noB64));return{...state,burrowPhotos};}
-    case 'SET_BURROW_PROFILE_PHOTO':{
-      // Mark one photo as the profile image; clear the flag on all others for this burrow.
-      // _sync:false on all affected photos so isProfile changes survive any concurrent server pull.
-      const burrowPhotos=state.burrowPhotos.map(p=>p.burrowId===action.burrowId?{...p,isProfile:p.id===action.photoId,_sync:false}:p);
-      save('bp',burrowPhotos.map(noB64));return{...state,burrowPhotos};
-    }
-    case 'DELETE_BURROW_PHOTO':{const burrowPhotos=state.burrowPhotos.filter(p=>p.id!==action.photoId);save('bp',burrowPhotos.map(noB64));return{...state,burrowPhotos};}
-    case 'HYDRATE_PHOTO_DATA':{
-      // Runs once on startup (and after every REPLACE_ALL sync).
-      // Merges IDB blobs back into in-memory state so photos render.
-      // Does NOT write to localStorage — blobs belong in IDB only.
-      const m=action.map; // { [photoId]: dataUrl }
-      const wombatPhotos=(state.wombatPhotos||[]).map(p=>m[p.id]?{...p,dataUrl:m[p.id]}:p);
-      const burrowPhotos=(state.burrowPhotos||[]).map(p=>m[p.id]?{...p,dataUrl:m[p.id]}:p);
-      return{...state,wombatPhotos,burrowPhotos};
-    }
-
-    // ── Burrow logs ──────────────────────────────────────────────
-    case 'DELETE_BURROW_LOG':{
-      const bl=state.burrowLogs.filter(l=>l.id!==action.logId);
-      // Revert burrow.status and burrow.lastChecked to the most recent remaining log.
-      // If no logs remain, leave the existing values in place.
-      // _sync:false ensures the reverted burrow state wins any concurrent server pull.
-      const remaining=bl.filter(l=>l.burrowId===action.burrowId).sort((a,b)=>new Date(b.at)-new Date(a.at));
-      const burs=state.burrows.map(b=>b.id===action.burrowId?{...b,status:remaining[0]?.status||b.status,lastChecked:remaining[0]?.at||b.lastChecked,_sync:false}:b);
-      save('bl',bl);save('b',burs);
-      return{...state,burrowLogs:bl,burrows:burs};}
-    case 'ADD_BURROW_LOG':{
-      const bl=[...state.burrowLogs,{...action.log,_sync:false}];
-      // Mirror log data onto the parent burrow: status, lastChecked, entrance
-      // measurements, and habitat fields (substrate, vegetation, trailCamera).
-      // Only fields present in the log are patched — missing fields are left alone.
-      // _sync:false on the burrow ensures the update isn't overwritten by a server
-      // pull that completes before the async Supabase push finishes.
-      const logPatch={status:action.log.status,lastChecked:action.log.at};
-      if(action.log.heightCm!=null&&action.log.heightCm!=='') logPatch.entranceHeightCm=action.log.heightCm;
-      if(action.log.widthCm!=null&&action.log.widthCm!=='') logPatch.entranceWidthCm=action.log.widthCm;
-      if(action.log.orientation) logPatch.orientation=action.log.orientation;
-      const burs=state.burrows.map(b=>{
-        if(b.id!==action.log.burrowId) return b;
-        const habitatPatch={};
-        if(action.log.substrate) habitatPatch.substrate=action.log.substrate;
-        if(action.log.vegetation) habitatPatch.vegetation=action.log.vegetation;
-        if(action.log.trailCamera!==undefined) habitatPatch.trailCamera=action.log.trailCamera;
-        return{...b,...logPatch,habitat:{...b.habitat,...habitatPatch},_sync:false};
-      });
-      save('bl',bl);save('b',burs);
-      return{...state,burrowLogs:bl,burrows:burs};
-    }
-
-    // ── Links ────────────────────────────────────────────────────
-    case 'LINK_WOMBAT_BURROW':{
-      // Wombat↔burrow links are bidirectional: wombat.burrowIds and burrow.wombatIds
-      // both need updating. Always use this action — never patch either array directly.
-      // Deduplicates before adding so dispatching twice is safe.
-      // _sync:false on both records ensures the link isn't dropped if a server pull
-      // completes before the Supabase push finishes.
-      const{wombatId,burrowId}=action;
-      const wombats=state.wombats.map(w=>w.id===wombatId?{...w,burrowIds:[...(w.burrowIds||[]).filter(id=>id!==burrowId),burrowId],_sync:false}:w);
-      const burrows=state.burrows.map(b=>b.id===burrowId?{...b,wombatIds:[...(b.wombatIds||[]).filter(id=>id!==wombatId),wombatId],_sync:false}:b);
-      save('w',wombats);save('b',burrows);
-      return{...state,wombats,burrows};
-    }
-    case 'UNLINK_WOMBAT_BURROW':{
-      const{wombatId,burrowId}=action;
-      const wombats=state.wombats.map(w=>w.id===wombatId?{...w,burrowIds:(w.burrowIds||[]).filter(id=>id!==burrowId),_sync:false}:w);
-      const burrows=state.burrows.map(b=>b.id===burrowId?{...b,wombatIds:(b.wombatIds||[]).filter(id=>id!==wombatId),_sync:false}:b);
-      save('w',wombats);save('b',burrows);
-      return{...state,wombats,burrows};
-    }
-
-    // ── Incremental sync ─────────────────────────────────────────
-    case 'PATCH_RECORDS':{
-      // Merges only the records that changed since last sync into existing state.
-      // Local pending changes (_sync:false) always win — server never overwrites unsaved edits.
-      // Deletions are NOT handled here — the daily full sync (REPLACE_ALL) covers those.
-      const patch=(existing,changed)=>{
-        if(!changed||!changed.length)return existing;
-        const m=new Map(existing.map(r=>[r.id,r]));
-        changed.forEach(r=>{const loc=m.get(r.id);if(!loc||loc._sync!==false)m.set(r.id,r);});
-        return[...m.values()];
-      };
-      const burrows=patch(state.burrows,action.data.burrows);
-      const wombats=patch(state.wombats,action.data.wombats);
-      const treatments=patch(state.treatments,action.data.treatments);
-      const sightings=patch(state.sightings,action.data.sightings);
-      const burrowLogs=patch(state.burrowLogs,action.data.burrowLogs);
-      const wombatPhotos=patch(state.wombatPhotos,action.data.wombatPhotos);
-      const burrowPhotos=patch(state.burrowPhotos,action.data.burrowPhotos);
-      // Persist ALL collections so incremental sync data survives a reload.
-      save('b',burrows);save('w',wombats);
-      save('t',treatments);save('s',sightings);save('bl',burrowLogs);
-      save('wp',wombatPhotos.map(noB64));save('bp',burrowPhotos.map(noB64));
-      return{...state,wombats,burrows,treatments,sightings,burrowLogs,wombatPhotos,burrowPhotos};
-    }
-
-    // ── Full sync ────────────────────────────────────────────────
-    case 'REPLACE_ALL':{
-      // Dispatched by supaFullSync after a successful server pull.
-      // action.data is already queue-aware merged (local edits preserved).
-      // After this runs, the App re-dispatches HYDRATE_PHOTO_DATA to
-      // restore any IDB photo blobs that don't live in Supabase.
-      const{wombats,burrows,treatments,sightings,burrowLogs,wombatPhotos,burrowPhotos}=action.data;
-      save('w',wombats);save('b',burrows);save('t',treatments);
-      save('s',sightings);save('bl',burrowLogs);save('wp',wombatPhotos.map(noB64));save('bp',burrowPhotos.map(noB64));
-      return{...state,wombats,burrows,treatments,sightings,burrowLogs,wombatPhotos,burrowPhotos};
-    }
-
-    default:return state;
-  }
-}
 
 /* ════════════════════════════════════════════════════════════════
    EDIT MODALS
@@ -7114,7 +6885,7 @@ function SignInModal({onClose}){
 ════════════════════════════════════════════════════════════════ */
 function App(){
   // Lazy initialisers: load() reads localStorage — runs once on mount, not on every re-render.
-  const [data,dispatch]=React.useReducer(reducer,null,()=>{
+  const [data,dispatch]=React.useReducer(reducerWithSaves,null,()=>{
     const init=load();
     return{wombats:init.wombats,burrows:init.burrows,treatments:init.treatments,
       sightings:init.sightings||[],burrowLogs:init.burrowLogs||[],wombatPhotos:init.wombatPhotos||[],burrowPhotos:init.burrowPhotos||[]};

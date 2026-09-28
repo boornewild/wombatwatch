@@ -7,6 +7,10 @@ import type { Json } from '../data/database.types';
 
 type SyncMeta = { _createdBy?: string | null; _sync?: boolean };
 
+export type Assignee = { userId: string; name?: string };
+/** Burrow habitat is free-form JSON in the DB; these are the keys the app writes. */
+export type Habitat = { substrate?: string; vegetation?: string; trailCamera?: unknown; [key: string]: unknown };
+
 export type Wombat = SyncMeta & {
   id: string;
   name: string;
@@ -26,7 +30,7 @@ export type Wombat = SyncMeta & {
   inactiveCause?: string | null;
   inactiveNotes?: string | null;
   squadId?: string | null;
-  assignees?: Json;
+  assignees?: Assignee[];
 };
 
 export type Burrow = SyncMeta & {
@@ -36,7 +40,7 @@ export type Burrow = SyncMeta & {
   location?: string | null;
   lat?: number | null;
   lng?: number | null;
-  habitat?: Json;
+  habitat?: Habitat;
   wombatIds?: string[];
   lastChecked?: string | null;
   nextCheck?: string | null;
@@ -79,15 +83,29 @@ export type BurrowLog = SyncMeta & {
   status?: string | null;
   condition?: string | null;
   occupants?: number | null;
-  heightCm?: number | null;
-  widthCm?: number | null;
+  // Form inputs may hand over '' for an empty measurement.
+  heightCm?: number | string | null;
+  widthCm?: number | string | null;
   orientation?: string | null;
   substrate?: string | null;
   vegetation?: string | null;
   note?: string | null;
   by?: string | null;
+  /** Not stored on the log row; copied onto the burrow's habitat. */
+  trailCamera?: unknown;
 };
 
 type PhotoBase = SyncMeta & { id: string; isProfile?: boolean; dataUrl?: string | null; at?: string };
 export type WombatPhoto = PhotoBase & { wombatId: string };
 export type BurrowPhoto = PhotoBase & { burrowId: string };
+
+/** Everything the app holds in memory; one array per Supabase table. */
+export type AppData = {
+  wombats: Wombat[];
+  burrows: Burrow[];
+  treatments: Treatment[];
+  sightings: Sighting[];
+  burrowLogs: BurrowLog[];
+  wombatPhotos: WombatPhoto[];
+  burrowPhotos: BurrowPhoto[];
+};

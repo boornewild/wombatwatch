@@ -3,8 +3,8 @@
  * generated in database.types.ts). Ported unchanged from the legacy app, including its quirks
  * (see mappers.test.ts). If a column is added to the DB, `npm run db:types` then update both directions here.
  */
-import type { Database } from './database.types';
-import type { Burrow, BurrowLog, BurrowPhoto, Sighting, Treatment, Wombat, WombatPhoto } from '../domain/types';
+import type { Database, Json } from './database.types';
+import type { Assignee, Burrow, BurrowLog, Habitat, BurrowPhoto, Sighting, Treatment, Wombat, WombatPhoto } from '../domain/types';
 
 type Tables = Database['public']['Tables'];
 type Row<T extends keyof Tables> = Tables[T]['Row'];
@@ -32,7 +32,7 @@ export const wombatToDb = (w: Wombat, uid: UserId): Insert<'wombats'> => ({
   inactive_at: w.inactiveAt || null,
   inactive_cause: w.inactiveCause || null,
   inactive_notes: w.inactiveNotes || null,
-  assignees: w.assignees || [],
+  assignees: (w.assignees || []) as Json,
 });
 
 export const dbToWombat = (r: Row<'wombats'>): Wombat => ({
@@ -55,7 +55,7 @@ export const dbToWombat = (r: Row<'wombats'>): Wombat => ({
   inactiveCause: r.inactive_cause || null,
   inactiveNotes: r.inactive_notes || null,
   squadId: r.squad_id || null,
-  assignees: r.assignees || [],
+  assignees: (r.assignees || []) as Assignee[],
   _createdBy: r.created_by,
   _sync: true,
 });
@@ -70,7 +70,7 @@ export const burrowToDb = (b: Burrow, uid: UserId): Insert<'burrows'> => ({
   location: b.location || null,
   lat: b.lat || null,
   lng: b.lng || null,
-  habitat: b.habitat || {},
+  habitat: (b.habitat || {}) as NonNullable<Json>,
   wombat_ids: b.wombatIds || [],
   last_checked: b.lastChecked || null,
   next_check: b.nextCheck || null,
@@ -87,7 +87,7 @@ export const dbToBurrow = (r: Row<'burrows'>): Burrow => ({
   location: r.location,
   lat: r.lat,
   lng: r.lng,
-  habitat: r.habitat || {},
+  habitat: (r.habitat || {}) as Habitat,
   wombatIds: r.wombat_ids || [],
   lastChecked: r.last_checked,
   nextCheck: r.next_check,
@@ -166,8 +166,8 @@ export const burrowLogToDb = (l: BurrowLog, uid: UserId): Insert<'burrow_logs'> 
   status: l.status || null,
   condition: l.condition || null,
   occupants: l.occupants || null,
-  height_cm: l.heightCm || null,
-  width_cm: l.widthCm || null,
+  height_cm: (l.heightCm || null) as number | null,
+  width_cm: (l.widthCm || null) as number | null,
   orientation: l.orientation || null,
   substrate: l.substrate || null,
   vegetation: l.vegetation || null,
