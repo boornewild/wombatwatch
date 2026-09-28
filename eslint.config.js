@@ -11,7 +11,7 @@ export default tseslint.config(
     files: ['src/**/*.{ts,tsx}'],
     languageOptions: { globals: { ...globals.browser } },
     plugins: { 'react-hooks': reactHooks },
-    rules: reactHooks.configs.recommended.rules,
+    rules: { ...reactHooks.configs.recommended.rules, 'no-var': 'error', 'prefer-const': 'error' },
   },
   {
     files: ['src/**/*.test.{ts,tsx}'],
