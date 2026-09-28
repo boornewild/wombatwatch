@@ -779,7 +779,7 @@ Every production release is a merged PR. To roll back: `git revert <merge-sha> &
 | # | Bug | Where | Impact |
 |---|---|---|---|
 | 1 | Invite join runs after the first sync starts; join errors from `?join=` links are silent | `LegacyApp` auth effect (`loadSquad` not awaited) | New invitees see an empty app (Phase 4) |
-| 2 | Queued writes rejected by the database are dropped after 5 tries | `flushQueue`, `SQ_MAX_RETRIES` | Silent data loss (Phase 3) |
+| 2 | Queued writes rejected by the database are deleted after 5 tries (after an `alert()`) | `flushQueue`, `SQ_MAX_RETRIES` | Record lost from the device's upload queue |
 | 3 | No DELETE/UPDATE storage policy on the `photos` bucket | prod storage policies | Photo deletes/re-uploads fail (Phase 4) |
 | 4 | `deduplicateCodes` sorts by `createdAt`, which records never have | `domain/codes.ts` | Arbitrary record keeps a duplicated W/B code, not the earliest |
 | 5 | `today()` is the UTC date | `domain/format.ts` | Before 10–11am in NSW, new records default to yesterday |
@@ -788,3 +788,5 @@ Every production release is a merged PR. To roll back: `git revert <merge-sha> &
 | 8 | `Card` ignores `onClick` | `LegacyApp` `Card` | Dashboard/Activity items look tappable but do nothing |
 | 9 | `saveWombatOrder` read `authUser` before declaration | fixed in Phase 1 | Custom order didn't sync to profile on fresh sign-in |
 | 10 | Macdonald River height request blocked by CORS | `WeatherWidget` (BOM API) | River height always shows "—" |
+| 11 | `wombats` and `burrows` have no `updated_at` trigger | DB schema | Other volunteers' wombat/burrow edits arrive only on the next full sync |
+| 12 | `RENUMBER_BURROWS` pushes directly, never queued | `syncAction` | Renumbering offline never reaches the server |
