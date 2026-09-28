@@ -22,6 +22,8 @@ export default defineConfig(({ command, mode }) => {
         injectManifest: { globPatterns: ['**/*.{js,css,html,png,json}'] },
       }),
     ],
+    // Temporary HTTPS tunnels for testing staging builds on a phone (npm run preview:phone)
+    preview: { allowedHosts: ['.trycloudflare.com'] },
     test: {
       environment: 'jsdom',
       globals: true,
