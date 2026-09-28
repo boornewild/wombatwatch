@@ -56,14 +56,14 @@ Rule: no file over 400 lines. `domain/` never imports from `data/`, `sync/` or R
 | Env | Frontend | Supabase | Who uses it |
 |---|---|---|---|
 | Local | `npm run dev` (localhost:5173) | `supabase start` (Docker, seeded) | Developers |
-| Preview | Cloudflare Pages, one URL per PR | Staging project | Reviewer + your friend, on their phone |
+| Preview | Cloudflare Pages, one URL per PR | `wombatwatch-staging` (`hmctmtqzdbleojvhctkr`, seeded; DB password in macOS Keychain `supabase-db-password`) | Reviewer + your friend, on their phone |
 | Production | GitHub Pages (`boornewild.github.io/wombatwatch`) | `xzfccubfoavpaqphofht` | Volunteers |
 
 Schema changes flow one way only: `supabase/migrations/` → local → staging → production (`supabase db push`). Nobody edits production tables in the dashboard again.
 
 ## Global Constraints
 
-- Production has ~20–30 active users, some offline in the field. **No release may lose a queued offline write.**
+- Production (checked 2026-09-28): 4 user accounts, 2 squads, 44 wombats, 523 burrows, 0 records without a squad; some use it offline in the field. **No release may lose a queued offline write.**
 - Keep IndexedDB database names and schemas unchanged: `wombatwatch_v1` (stores `wombats, burrows, treatments, sightings, burrow_logs, wombat_photos, burrow_photos, queue, meta`) and `ww_photo_data`.
 - Keep all `localStorage` keys unchanged: `ww_all_squads_cache ww_auth_cache ww_last_full_sync_date ww_last_sync_ts ww_photo_data ww_profile_cache ww_signed_in ww_squad_cache ww_streak ww_sync_deleted ww_sync_queue ww_theme ww_user_name ww_vol_count ww_weather_cache ww_wombat_order`.
 - Keep the Background Sync tag `ww-queue-flush` and the SW → page message `{type:'WW_FLUSH_QUEUE'}`.
