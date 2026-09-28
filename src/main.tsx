@@ -13,3 +13,12 @@ try {
   const err = e as Error;
   root.innerHTML = `<div style="padding:24px;font-family:monospace;font-size:13px;color:#c00;background:#fff;position:fixed;inset:0;overflow:auto;z-index:99999"><h2 style="margin:0 0 12px">⚠️ WombatWatch render error</h2><pre style="white-space:pre-wrap">${err?.stack ?? String(e)}</pre></div>`;
 }
+
+// Offline support + home-screen install. Production builds only; dev uses no service worker.
+if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker
+      .register(`${import.meta.env.BASE_URL}sw.js`, { scope: import.meta.env.BASE_URL })
+      .catch((err) => console.warn('Service worker registration failed:', err));
+  });
+}
