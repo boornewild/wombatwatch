@@ -12,7 +12,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.sw.json",
     "lint": "eslint src",
-    "db:types": "supabase gen types typescript --local > src/data/database.types.ts",
+    "db:types": "supabase gen types typescript --local > src/data/database.types.ts && prettier --write src/data/database.types.ts",
     "test:e2e": "playwright test",
     "test:upgrade": "vite build && playwright test -c playwright.upgrade.config.ts"
   },
