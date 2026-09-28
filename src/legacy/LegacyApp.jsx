@@ -28,6 +28,7 @@ import { syncAction as syncActionWith } from '../sync/syncAction';
 import { createSyncSession, squadCenter as centreOfSquad } from '../sync/session';
 import { supaFullSync as pullFullSync, supaIncrementalSync as pullIncrementalSync } from '../sync/pull';
 import { cacheRemotePhotos, recoverBlankPhotos as recoverBlankPhotosWith, uploadPhotoToStorage as uploadPhotoWith, resolvePhotoUrl as resolvePhotoUrlWith } from '../sync/photos';
+import { runFullSync } from '../sync/runFullSync';
 import { markRecentlyDeleted as markRecentlyDeletedIn, getRecentlyDeleted as getRecentlyDeletedIn } from '../sync/recentlyDeleted';
 
 /* ════════════════════════════════════════════════════════════════
@@ -5771,6 +5772,13 @@ function App(){
     return{wombats:init.wombats,burrows:init.burrows,treatments:init.treatments,
       sightings:init.sightings||[],burrowLogs:init.burrowLogs||[],wombatPhotos:init.wombatPhotos||[],burrowPhotos:init.burrowPhotos||[]};
   });
+  // One full-sync routine for every trigger (src/sync/runFullSync.ts).
+  const runSync=opts=>runFullSync({
+    session:syncSession,fullSync:supaFullSync,resolveWithQueue:resolveWithCurrentQueue,dispatch,
+    getAllLocalPhotos:idbGetAllPhotos,cacheRemotePhotos:cacheRemotePhotosToIdb,recoverBlankPhotos,
+    patchCode:(table,id,code)=>{Promise.resolve(supa.from(table).update({code}).eq('id',id)).catch(e=>console.warn('[sync] code patch failed',e));},
+    geocodeBackfill,
+  },opts);
   // Live ref so async callbacks (e.g. syncDispatch called from reconnect handlers)
   // always read current data rather than a stale closure snapshot.
   const dataRef=React.useRef(data);
@@ -6151,31 +6159,7 @@ function App(){
         // Show the sync bar briefly, then hide it — sync continues in background
         setSyncing(true);
         setTimeout(()=>setSyncing(false),2000);
-        supaFullSync().then(async merged=>{
-          if(merged){
-            // Detect and fix any duplicate W/B codes caused by offline users
-            // independently auto-assigning the same number. Earliest record keeps
-            // its code; later duplicates are silently renumbered upward.
-            const fresh=await resolveWithCurrentQueue(merged);
-            const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
-            const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
-            const synced=filterSyncToSquad({...fresh,wombats,burrows},syncSession.currentSquadId);
-            dispatch({type:'REPLACE_ALL',data:synced});
-            // Re-hydrate IDB photo data after the sync wipes dataUrls from state
-            idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
-            // Cache any remote (https://) photos into IDB so they render offline
-            cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
-            recoverBlankPhotos(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
-            // Patch renumbered records back to Supabase so everyone stays consistent
-            changedW.forEach(w=>Promise.resolve(supa.from('wombats').update({code:w.code}).eq('id',w.id)).catch(e=>console.warn('[sync] code patch failed',e)));
-            changedB.forEach(b=>Promise.resolve(supa.from('burrows').update({code:b.code}).eq('id',b.id)).catch(e=>console.warn('[sync] code patch failed',e)));
-            // Silently fill in any missing suburb names for records created offline
-            geocodeBackfill(synced,dispatch);
-          }else if(merged===null){
-            // confirmed new user — no data on the server yet, clear any seed data
-            dispatch({type:'REPLACE_ALL',data:{wombats:[],burrows:[],treatments:[],sightings:[],burrowLogs:[],wombatPhotos:[],burrowPhotos:[]}});
-          }
-          // merged===undefined means all queries failed (offline) — local state untouched
+        runSync().then(()=>{
           flushQueue(user.id).then(r=>{if(r?.lostPhotoIds?.size)console.error('[Queue] Lost photos on login flush:',Array.from(r.lostPhotoIds));}).catch(()=>{});
         }).catch(e=>console.warn('[Supa] full sync error',e));
       }else{
@@ -6195,22 +6179,7 @@ function App(){
       //  (a) any data added on other devices appears immediately, and
       //  (b) offline-added photo metadata is in state before flushQueue
       //      tries to upload the corresponding blobs.
-      try{
-        const merged=await supaFullSync();
-        if(merged){
-          const fresh=await resolveWithCurrentQueue(merged);
-          const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
-          const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
-          const synced=filterSyncToSquad({...fresh,wombats,burrows},syncSession.currentSquadId);
-          dispatch({type:'REPLACE_ALL',data:synced});
-          idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
-          cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
-          recoverBlankPhotos(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
-          changedW.forEach(w=>Promise.resolve(supa.from('wombats').update({code:w.code}).eq('id',w.id)).catch(e=>console.warn('[sync] code patch failed',e)));
-          changedB.forEach(b=>Promise.resolve(supa.from('burrows').update({code:b.code}).eq('id',b.id)).catch(e=>console.warn('[sync] code patch failed',e)));
-          geocodeBackfill(synced,dispatch);
-        }
-      }catch(e){console.warn('[Sync] reconnect sync failed',e);}
+      try{await runSync();}catch(e){console.warn('[Sync] reconnect sync failed',e);}
       // After flushing, do a second full sync so records created by other volunteers
       // while we were offline appear immediately. The queue is empty at this point so
       // whatever the server returns is authoritative.
@@ -6227,23 +6196,8 @@ function App(){
         .catch(()=>{})
         .finally(()=>{
         refreshQueue();
-        supaFullSync().then(async merged=>{
-          if(merged){
-            const fresh=await resolveWithCurrentQueue(merged);
-            const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
-            const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
-            const synced=filterSyncToSquad({...fresh,wombats,burrows},syncSession.currentSquadId);
-            dispatch({type:'REPLACE_ALL',data:synced});
-            idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
-            // Pass _uploadedPhotoIds so just-synced photos are force-recached into ww_photo_data
-            // even if a (potentially stale) offline blob already exists for them.
-            cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch,_uploadedPhotoIds).catch(()=>{});
-            recoverBlankPhotos(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
-            changedW.forEach(w=>Promise.resolve(supa.from('wombats').update({code:w.code}).eq('id',w.id)).catch(e=>console.warn('[sync] code patch failed',e)));
-            changedB.forEach(b=>Promise.resolve(supa.from('burrows').update({code:b.code}).eq('id',b.id)).catch(e=>console.warn('[sync] code patch failed',e)));
-            geocodeBackfill(synced,dispatch);
-          }
-        }).catch(e=>console.warn('[Sync] post-flush re-sync failed',e));
+        // Force-refresh photos just uploaded, even if a stale offline copy exists on the device.
+        runSync({forcedPhotoIds:_uploadedPhotoIds}).catch(e=>console.warn('[Sync] post-flush re-sync failed',e));
       });
     };
     const off=()=>setOnline(false);
@@ -6269,15 +6223,7 @@ function App(){
       const today=new Date().toDateString();
       const lastFullDate=localStorage.getItem(LS_FULL_SYNC_DATE);
       if(lastFullDate!==today){
-        supaFullSync().then(async merged=>{
-          if(!merged)return;
-          const fresh=await resolveWithCurrentQueue(merged);
-          const{records:wombats}=deduplicateCodes(fresh.wombats,'W');
-          const{records:burrows}=deduplicateCodes(fresh.burrows,'B');
-          const synced2=filterSyncToSquad({...fresh,wombats,burrows},syncSession.currentSquadId);
-          dispatch({type:'REPLACE_ALL',data:synced2});
-          idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
-        }).catch(()=>{});
+        runSync().catch(()=>{});
       }else{
         supaIncrementalSync().then(patch=>{
           if(!patch)return;
@@ -6440,22 +6386,9 @@ function App(){
     nav('dashboard'); // always land on dashboard so stale page data isn't visible during switch
     setSyncing(true);
     try{
-      const merged=await supaFullSync();
-      if(merged){
-        // Sync succeeded — now safe to wipe old data and replace with new squad's
-        const fresh=await resolveWithCurrentQueue(merged);
-        const{records:wombats,changed:changedW}=deduplicateCodes(fresh.wombats,'W');
-        const{records:burrows,changed:changedB}=deduplicateCodes(fresh.burrows,'B');
-        // Final belt-and-suspenders filter: guarantee only the target squad's records
-        // are dispatched regardless of any leak from resolveWithCurrentQueue or dedup.
-        const synced=filterSyncToSquad({...fresh,wombats,burrows},sq.id);
-        dispatch({type:'REPLACE_ALL',data:synced});
-        idbGetAllPhotos().then(map=>{if(Object.keys(map).length)dispatch({type:'HYDRATE_PHOTO_DATA',map});}).catch(()=>{});
-        cacheRemotePhotosToIdb(synced.wombatPhotos,synced.burrowPhotos,dispatch).catch(()=>{});
-        changedW.forEach(w=>Promise.resolve(supa.from('wombats').update({code:w.code}).eq('id',w.id)).catch(e=>console.warn('[sync] code patch failed',e)));
-        changedB.forEach(b=>Promise.resolve(supa.from('burrows').update({code:b.code}).eq('id',b.id)).catch(e=>console.warn('[sync] code patch failed',e)));
-      }else{
-        // merged===undefined means all requests failed — we're offline.
+      const outcome=await runSync();
+      if(outcome==='skipped'){
+        // 'skipped': every request failed (offline) or a newer sync superseded this one.
         // Revert so the user keeps their cached data for the squad they were on.
         syncSession.currentSquadId=prevSquad?.id||null; // must revert eagerly — useEffect fires too late
         syncSession.squadCenter=centreOfSquad(prevSquad);
