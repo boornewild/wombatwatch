@@ -31,7 +31,11 @@ export type NewQueueOp =
   | { t: 'upsert'; table: string; row: Record<string, unknown> }
   | { t: 'delete'; table: string; id: string }
   | { t: 'storage-delete'; path: string };
-export type QueueOp = NewQueueOp & { _qid: number; _retries: number };
+/**
+ * `_failed`: the database rejected this op MAX_RETRIES times. It stays on the device (never deleted
+ * automatically), is skipped by the flush, and is shown to the volunteer to retry or discard.
+ */
+export type QueueOp = NewQueueOp & { _qid: number; _retries: number; _failed?: boolean; _error?: string; _failedAt?: number };
 
 /** Only core data counts towards the "N pending" badge; photo blobs and storage deletes are noise there. */
 const DATA_TABLES = new Set(['wombats', 'burrows', 'treatments', 'burrow_logs', 'sightings']);
@@ -192,16 +196,16 @@ export function createAppDb({ name = APP_DB_NAME, idb }: AppDbOptions = {}) {
     }
   }
 
-  /** Pending ops for core data tables. Never throws: the badge just shows 0. */
+  /** Pending ops for core data tables, excluding parked (failed) ones. Never throws: the badge just shows 0. */
   async function dataQueueCount(): Promise<number> {
     try {
       const db = await open();
-      const all = await new Promise<Array<{ table?: string }>>((res, rej) => {
+      const all = await new Promise<Array<{ table?: string; _failed?: boolean }>>((res, rej) => {
         const req = db.transaction(QUEUE, 'readonly').objectStore(QUEUE).getAll();
         req.onsuccess = () => res(req.result || []);
         req.onerror = () => rej(req.error);
       });
-      return all.filter((op) => DATA_TABLES.has(op.table as string)).length;
+      return all.filter((op) => DATA_TABLES.has(op.table as string) && !op._failed).length;
     } catch {
       return 0;
     }
