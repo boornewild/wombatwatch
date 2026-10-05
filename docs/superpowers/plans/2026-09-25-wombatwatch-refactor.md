@@ -789,5 +789,6 @@ Every production release is a merged PR. To roll back: `git revert <merge-sha> &
 | 9 | `saveWombatOrder` read `authUser` before declaration | fixed in Phase 1 | Custom order didn't sync to profile on fresh sign-in |
 | 10 | Macdonald River height request blocked by CORS | `WeatherWidget` (BOM API) | River height always shows "—" |
 | 11 | ~~`wombats` and `burrows` have no `updated_at` trigger~~ **Fixed** (migration 20261005000000; local + staging, prod at release) | DB schema | Other volunteers' wombat/burrow edits arrive only on the next full sync |
-| 12 | `RENUMBER_BURROWS` pushes directly, never queued | `syncAction` | Renumbering offline never reaches the server |
+| 12 | ~~`RENUMBER_BURROWS` pushes directly, never queued~~ **Fixed**: queued offline / on failure, and marked synced on success | `syncAction` | Renumbering offline never reached the server; renumbered burrows stayed "local edits" forever |
 | 13 | After a queued photo upload, the URL write-back to the stored photo record never runs (store looked up by the localStorage key) | legacy `flushQueue` (not reproduced in `sync/flush.ts`) | Stored photo record keeps `dataUrl: null`; a later sync restores the URL |
+| 14 | Every push sets `created_by` to the current user | `data/mappers.ts` (`*ToDb(record, uid)`) | The original creator is overwritten by the last editor ("Top Contributor", ownership) |

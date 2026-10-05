@@ -30,7 +30,7 @@ function setup(world: World = {}) {
   };
   const run = (a: Action) => syncAction(a, 'u1', deps);
   const kinds = () => calls.map((c) => c[0]);
-  return { calls, run, kinds };
+  return { calls, run, kinds, deps };
 }
 
 const treatment = { type: 'ADD_TREATMENT', treatment: { id: 't1', wombatId: 'w1', at: '2026-01-01' } } as const;
@@ -118,11 +118,29 @@ describe('photos', () => {
   });
 });
 
-// Characterisation: bug #12 — renumbering is sent directly in chunks and never queued.
-it('RENUMBER_BURROWS sends batches even offline and never queues (known bug #12)', async () => {
-  const s = setup({ online: false, records: { 'burrows:b1': { id: 'b1', name: 'B' } } });
-  await s.run({ type: 'RENUMBER_BURROWS' });
-  expect(s.calls).toEqual([['upsertBatch', 'burrows', 1]]);
+describe('RENUMBER_BURROWS (bug #12)', () => {
+  const burrows = { 'burrows:b1': { id: 'b1', name: 'B', code: 'B0001' }, 'burrows:b2': { id: 'b2', name: 'C', code: 'B0002' } };
+  it('online: sends one batch, then marks every burrow synced', async () => {
+    const s = setup({ records: burrows });
+    await s.run({ type: 'RENUMBER_BURROWS' });
+    expect(s.calls).toEqual([['upsertBatch', 'burrows', 2], ['synced', 'burrows', 'b1'], ['synced', 'burrows', 'b2']]);
+  });
+  it('offline: queues every burrow instead of losing the renumbering', async () => {
+    const s = setup({ online: false, records: burrows });
+    await s.run({ type: 'RENUMBER_BURROWS' });
+    expect(s.calls).toEqual([
+      ['queue', { t: 'upsert', table: 'burrows', row: expect.objectContaining({ id: 'b1', code: 'B0001' }) }],
+      ['queue', { t: 'upsert', table: 'burrows', row: expect.objectContaining({ id: 'b2', code: 'B0002' }) }],
+    ]);
+  });
+  it('a failed or thrown batch queues its rows', async () => {
+    for (const fail of [{ ok: false }, 'throw'] as const) {
+      const s = setup({ records: burrows });
+      s.deps.remote.upsertBatch = async () => { if (fail === 'throw') throw new Error('net'); return fail; };
+      await s.run({ type: 'RENUMBER_BURROWS' });
+      expect(s.kinds()).toEqual(['queue', 'queue']);
+    }
+  });
 });
 
 // Characterisation: the reducer replaces the name of an existing assignment; sync keeps the old one.

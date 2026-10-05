@@ -192,9 +192,28 @@ export async function syncAction(action: Action, userId: string, deps: SyncActio
         break;
       }
       case 'RENUMBER_BURROWS': {
-        // Characterisation: bug #12 — pushed directly in chunks, never queued, so it is lost offline.
+        // Every burrow changes, so rows go in batches when online. Offline, or if a batch fails, each row is
+        // queued like any other edit so the new numbers still reach the server.
         const rows = (await deps.getAllRecords<Burrow>('burrows')).map((b) => burrowToDb(b, userId));
-        for (let i = 0; i < rows.length; i += RENUMBER_CHUNK) await remote.upsertBatch('burrows', rows.slice(i, i + RENUMBER_CHUNK));
+        const queueRows = async (chunk: typeof rows) => {
+          for (const row of chunk) await deps.queueOp({ t: 'upsert', table: 'burrows', row });
+        };
+        for (let i = 0; i < rows.length; i += RENUMBER_CHUNK) {
+          const chunk = rows.slice(i, i + RENUMBER_CHUNK);
+          if (!isOnline()) {
+            await queueRows(chunk);
+            continue;
+          }
+          let ok = false;
+          try {
+            ok = (await remote.upsertBatch('burrows', chunk)).ok;
+          } catch (e) {
+            console.warn('[Supa] renumber batch threw, queuing for retry:', e);
+          }
+          // Confirmed rows must be marked synced, or the local copy would keep overriding the server forever.
+          if (ok) for (const row of chunk) await deps.markSynced('burrows', row.id);
+          else await queueRows(chunk);
+        }
         break;
       }
       case 'DELETE_BURROW': {
