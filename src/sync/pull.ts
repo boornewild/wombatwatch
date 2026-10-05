@@ -136,8 +136,8 @@ export async function supaFullSync(deps: PullDeps): Promise<FullSyncResult | nul
 }
 
 /**
- * Rows changed since the last sync. Does not see deletions (the daily full sync handles those), nor edits to
- * wombats/burrows until bug #11 is fixed (those tables have no updated_at trigger).
+ * Rows changed since the last sync. Relies on every synced table bumping updated_at on UPDATE (wombats and
+ * burrows got their triggers in migration 20261005000000). Does not see deletions; the daily full sync does.
  */
 export async function supaIncrementalSync(deps: PullDeps): Promise<AppData | null | undefined> {
   const { session } = deps;
