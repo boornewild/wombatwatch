@@ -29,6 +29,8 @@ import { createSyncSession, squadCenter as centreOfSquad } from '../sync/session
 import { supaFullSync as pullFullSync, supaIncrementalSync as pullIncrementalSync } from '../sync/pull';
 import { cacheRemotePhotos, recoverBlankPhotos as recoverBlankPhotosWith, uploadPhotoToStorage as uploadPhotoWith, resolvePhotoUrl as resolvePhotoUrlWith } from '../sync/photos';
 import { runFullSync } from '../sync/runFullSync';
+import { listFailed, retryFailed, retryAllFailed, discardFailed, describeFailedOp } from '../sync/failedOps';
+import { FailedSyncChip, FailedSyncList } from '../features/sync/FailedSync';
 import { markRecentlyDeleted as markRecentlyDeletedIn, getRecentlyDeleted as getRecentlyDeletedIn } from '../sync/recentlyDeleted';
 
 /* ════════════════════════════════════════════════════════════════
@@ -1278,7 +1280,7 @@ function RecoveryModal({name,photoUrl,onClose}){
 }
 
 /* ── DASHBOARD ── */
-function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunteerCount='—',squadLat,squadLng,squadName}){
+function Dashboard({data,nav,onFAB,online,queueLen=0,failedCount=0,onOpenFailed,openProfile,streak=0,volunteerCount='—',squadLat,squadLng,squadName}){
   const t=useTheme();
   const wombats=data.wombats.filter(w=>!isInactive(w)&&!isArchived(w)); // active only for stats
   const inactiveWombats=data.wombats.filter(isInactive);
@@ -1301,6 +1303,7 @@ function Dashboard({data,nav,onFAB,online,queueLen=0,openProfile,streak=0,volunt
     <Header overline="WOMBATWATCH" title={<span>{(()=>{const h=new Date().getHours();return h<12?'Good morning':h<17?'Good afternoon':'Good evening';})()},<br/>Ranger! 👋</span>} subtitle="It's time to help some creatures" showAvatar onAvatarClick={openProfile}>
       <div style={{marginTop:14,display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
         <SyncChip online={online} queueLen={queueLen}/>
+        <FailedSyncChip count={failedCount} onOpen={onOpenFailed}/>
         {streak>0&&<span style={{display:'inline-flex',alignItems:'center',gap:6,background:'rgba(255,255,255,0.14)',color:'#D8E6D8',borderRadius:999,padding:'5px 10px',fontSize:11.5,fontWeight:600}}><svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="#D8E6D8" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M13 2L4 14h7v8l9-12h-7z"/></svg> {streak} week{streak!==1?'s':''} streak</span>}
       </div>
     </Header>
@@ -5915,7 +5918,13 @@ function App(){
   const [burrowFilterStatus,setBurrowFilterStatus]=useState('all');
   const [burrowSortBy,setBurrowSortBy]=useState('date_added');
   const [queueLen,setQueueLen]=useState(0);
-  const refreshQueue=()=>{idbQueueCount().then(n=>setQueueLen(n)).catch(()=>{});};
+  // Writes the server kept rejecting, parked on the device (src/sync/failedOps.ts).
+  const [failedOps,setFailedOps]=useState([]);
+  const [discardingOp,setDiscardingOp]=useState(null);
+  const refreshQueue=()=>{
+    idbQueueCount().then(n=>setQueueLen(n)).catch(()=>{});
+    listFailed(appDb).then(setFailedOps).catch(()=>{});
+  };
   // Heartbeat: re-read the IDB queue count every 3 s so the pending pill stays
   // accurate even when a flush path doesn't explicitly call refreshQueue.
   React.useEffect(()=>{
@@ -5968,6 +5977,14 @@ function App(){
   // Also prime syncSession.currentSquadId eagerly from cache so supaFullSync filters
   // correctly on the very first run (before any useEffect fires).
   const [authSquad,setAuthSquad]=useState(()=>{const c=getCachedSquad();if(c){syncSession.currentSquadId=c.id;syncSession.squadCenter=centreOfSquad(c);}return c;});
+  // Parked writes get a fresh round of tries whenever the account or squad changes: the usual reason the
+  // server refused them is that the volunteer wasn't in a squad yet (bug #2).
+  useEffect(()=>{
+    if(!authUser)return;
+    retryAllFailed(appDb).then(n=>{
+      if(n>0&&navigator.onLine)return flushQueue(authUser.id);
+    }).catch(()=>{}).finally(refreshQueue);
+  },[authUser?.id,authSquad?.id]);
   const [allSquads,setAllSquads]=useState(()=>getCachedAllSquads()||[]);
   // true once we've completed at least one squad fetch (online or from cache)
   const [squadChecked,setSquadChecked]=useState(()=>!!getCachedSquad());
@@ -6524,7 +6541,7 @@ function App(){
       </div>}
       {/* ── content area: grows to fill space above the tab bar ── */}
       <div className="content-area">
-        {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} queueLen={queueLen} openProfile={openProfile} streak={streak} volunteerCount={volunteerCount} squadLat={squadCenter?.lat} squadLng={squadCenter?.lng} squadName={authSquad?.name}/></div>}
+        {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} queueLen={queueLen} failedCount={failedOps.length} onOpenFailed={()=>setModal('failed-sync')} openProfile={openProfile} streak={streak} volunteerCount={volunteerCount} squadLat={squadCenter?.lat} squadLng={squadCenter?.lng} squadName={authSquad?.name}/></div>}
         {screen==='activity'&&<div className="scroll noscroll"><ActivityScreen data={data} nav={nav}/></div>}
         {screen==='map'&&<MapScreen data={data} nav={nav} onFAB={onFAB} openProfile={openProfile} theme={theme} onAddAt={onAddAt} wombatFilters={mapWombatFilters} setWombatFilters={setMapWombatFilters} burrowFilters={mapBurrowFilters} setBurrowFilters={setMapBurrowFilters} cameraFilter={mapCameraFilter} setCameraFilter={setMapCameraFilter} authSquad={authSquad}/>}
         {/* Keep list mounted while profile is open so scroll position is preserved on back */}
@@ -6543,6 +6560,23 @@ function App(){
       {modal==='edit-profile'&&<EditProfileModal onClose={()=>setModal(null)}/>}
       {modal==='faq'&&<FAQSheet onClose={()=>setModal(null)} onBack={()=>setModal('profile')} squadContacts={authSquad?.emergencyContacts||[]}/>}
       {modal==='export'&&authProfile?.role==='admin'&&<ExportSheet data={data} onClose={()=>setModal(null)} onBack={()=>setModal('profile')}/>}
+      {modal==='failed-sync'&&(()=>{
+        const names={wombats:Object.fromEntries(data.wombats.map(w=>[w.id,w.name])),burrows:Object.fromEntries(data.burrows.map(b=>[b.id,b.name]))};
+        const items=failedOps.map(op=>({qid:op._qid,error:op._error,...describeFailedOp(op,names)}));
+        const flushAfter=()=>{if(authUser)return flushQueue(authUser.id).finally(refreshQueue);refreshQueue();};
+        return <ModalWrap title="Couldn't sync" subtitle={items.length?`${items.length} change${items.length===1?'':'s'} waiting on this device`:undefined}
+          onClose={()=>setModal(null)} saveLabel="Retry all"
+          onSave={()=>{retryAllFailed(appDb).then(flushAfter).catch(()=>{});setModal(null);}}>
+          <FailedSyncList items={items} theme={t}
+            onRetry={qid=>{retryFailed(appDb,qid).then(flushAfter).catch(()=>{});}}
+            onDiscard={item=>setDiscardingOp(item)}/>
+        </ModalWrap>;
+      })()}
+      {discardingOp&&<ConfirmModal title={`Discard this ${discardingOp.kind.toLowerCase()}?`}
+        message={`${discardingOp.kind} · ${discardingOp.name} will be removed from this device and will never reach the server. This cannot be undone.`}
+        confirmLabel="Discard"
+        onConfirm={()=>{discardFailed(appDb,discardingOp.qid).finally(refreshQueue);setDiscardingOp(null);}}
+        onCancel={()=>setDiscardingOp(null)}/>}
       {modal==='csv-import'&&authProfile?.role==='admin'&&<CSVImportModal onClose={()=>setModal(null)} onImportWombats={wombats=>{syncDispatch({type:'IMPORT_WOMBATS',wombats:wombats.map(w=>({...w,squadId:authSquad?.id||null}))});nav('wombats');}} onImportBurrows={burrows=>{syncDispatch({type:'IMPORT_BURROWS',burrows:burrows.map(b=>({...b,squadId:authSquad?.id||null}))});nav('burrows');}}/>}
       {modal==='fab'&&<FABSheet onClose={()=>setModal(null)} onSelect={fabSelect}/>}
       {modal==='add-wombat'&&<AddWombatModal burrows={data.burrows} initialLocation={addAtLoc} recentFix={addAtLoc?null:getHeaterFix()} nextCode={nextWombatCode(data.wombats)} onClose={()=>{setModal(null);setAddAtLoc(null);}} onSave={(w,linkedBurrowId,photo)=>{syncDispatch({type:'ADD_WOMBAT',wombat:{...w,squadId:authSquad?.id||null},linkedBurrowId:linkedBurrowId||null});if(linkedBurrowId)syncDispatch({type:'LINK_WOMBAT_BURROW',wombatId:w.id,burrowId:linkedBurrowId});if(photo)syncDispatch({type:'ADD_WOMBAT_PHOTO',photo});setModal(null);setAddAtLoc(null);nav('wombat-profile',w.id);}}/>}

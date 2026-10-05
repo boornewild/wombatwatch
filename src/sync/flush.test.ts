@@ -127,13 +127,32 @@ it('a genuine error charges one retry and carries on with the next op', async ()
   expect(await s.appDb.getQueue()).toEqual([expect.objectContaining({ row: { id: 'w1' }, _retries: 1 })]);
 });
 
-// Characterisation: bug #2 — the record is removed from the queue after MAX_RETRIES, with an alert.
-it(`drops the op on the ${MAX_RETRIES}th genuine failure and tells the volunteer (known bug #2)`, async () => {
-  const s = setup({ script: { 'upsert:wombats:w1': rlsErr } });
-  await s.appDb.enqueue({ ...upsert('wombats', 'w1'), _retries: MAX_RETRIES - 1 });
-  await flushQueue('u1', s.deps);
-  expect(await s.appDb.getQueue()).toEqual([]);
-  expect(s.notify).toHaveBeenCalledWith(expect.stringContaining('Table: wombats\nError: new row violates row-level security policy (42501)'));
+describe('records the database keeps rejecting (bug #2)', () => {
+  it(`are parked on the ${MAX_RETRIES}th genuine failure: kept on the device with the error, never deleted`, async () => {
+    const s = setup({ script: { 'upsert:wombats:w1': rlsErr } });
+    await s.appDb.enqueue({ ...upsert('wombats', 'w1'), _retries: MAX_RETRIES - 1 });
+    await flushQueue('u1', s.deps);
+    expect(await s.appDb.getQueue()).toEqual([
+      expect.objectContaining({ row: { id: 'w1' }, _retries: MAX_RETRIES, _failed: true, _error: 'new row violates row-level security policy (42501)', _failedAt: expect.any(Number) }),
+    ]);
+    expect(s.notify).not.toHaveBeenCalled();
+  });
+
+  it('parked ops are skipped by later flushes and do not block the rest of the queue', async () => {
+    const s = setup();
+    await s.appDb.enqueue({ ...upsert('wombats', 'w1'), _retries: MAX_RETRIES, _failed: true } as never);
+    await s.enqueue(upsert('treatments', 't1'));
+    await flushQueue('u1', s.deps);
+    expect(s.calls).toEqual(['upsert:treatments:t1']);
+    expect(await s.appDb.getQueue()).toEqual([expect.objectContaining({ row: { id: 'w1' }, _failed: true })]);
+  });
+
+  it('parked ops are not counted as pending', async () => {
+    const s = setup();
+    await s.appDb.enqueue({ ...upsert('wombats', 'w1'), _failed: true } as never);
+    await s.enqueue(upsert('treatments', 't1'));
+    expect(await s.appDb.dataQueueCount()).toBe(1);
+  });
 });
 
 describe('photos', () => {

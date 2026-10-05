@@ -6,8 +6,8 @@
  * - photo whose image data is gone everywhere: dequeue and report it as lost
  * - network failure (or offline, or the op threw): stop the whole flush, retry budget untouched
  * - auth failure: stop the whole flush until the user signs in again, retry budget untouched
- * - any other failure: charge one retry; at MAX_RETRIES the op is dropped and the volunteer is told
- *   (known bug #2: the record is then lost from the queue; fixed in a later branch)
+ * - any other failure: charge one retry; at MAX_RETRIES the op is parked (`_failed`), kept on the device
+ *   and shown to the volunteer to retry or discard (see failedOps.ts). Parked ops are skipped here.
  */
 import { isAuthErrorStr, isNetworkError } from './classify';
 import type { AppDb, QueueOp } from './idb/appDb';
@@ -32,8 +32,9 @@ export interface FlushDeps {
   /** Uploads base64 image data to Storage and returns its URL; passes URLs through; falls back to the base64. */
   resolvePhotoUrl: (dataUrl: string, photoId: string, localStorageKey: string) => Promise<string | null>;
   isOnline: () => boolean;
-  /** Tells the volunteer a record was dropped (legacy: window.alert). */
-  notify: (message: string) => void;
+  /** Unused since bug #2 (parked ops are shown in the app instead of an alert); kept for callers. */
+  notify?: (message: string) => void;
+  now?: () => number;
 }
 
 export interface FlushResult {
@@ -82,7 +83,7 @@ export async function flushQueue(userId: string, deps: FlushDeps): Promise<Flush
   try {
     const queue = await deps.appDb.getQueue();
     if (!queue.length) return result;
-    for (const op of sortQueue(queue)) {
+    for (const op of sortQueue(queue.filter((op) => !op._failed))) {
       let outcome: Outcome;
       let networkError = false;
       try {
@@ -116,9 +117,8 @@ export async function flushQueue(userId: string, deps: FlushDeps): Promise<Flush
       } else {
         const retries = (op._retries || 0) + 1;
         if (retries >= MAX_RETRIES) {
-          console.warn('[Queue] Dropping op after', retries, 'failures:', op.t);
-          await deps.appDb.dequeue(op._qid);
-          deps.notify(droppedMessage('table' in op ? op.table : undefined, outcome.error));
+          console.warn('[Queue] Parking op after', retries, 'failures:', op.t, outcome.error);
+          await deps.appDb.updateQueueOp({ ...op, _retries: retries, _failed: true, _error: outcome.error, _failedAt: (deps.now ?? Date.now)() });
         } else {
           await deps.appDb.updateQueueOp({ ...op, _retries: retries });
         }
@@ -129,6 +129,3 @@ export async function flushQueue(userId: string, deps: FlushDeps): Promise<Flush
   }
   return result;
 }
-
-export const droppedMessage = (table: string | undefined, error: string) =>
-  `⚠️ A record could not be synced after several attempts and has been dropped.\n\nTable: ${table || 'unknown'}\nError: ${error || 'unknown'}\n\nPlease screenshot this and check your data.`;
