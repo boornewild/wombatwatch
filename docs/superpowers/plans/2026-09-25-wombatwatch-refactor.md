@@ -778,7 +778,7 @@ Every production release is a merged PR. To roll back: `git revert <merge-sha> &
 
 | # | Bug | Where | Impact |
 |---|---|---|---|
-| 1 | Invite join runs after the first sync starts; join errors from `?join=` links are silent | `LegacyApp` auth effect (`loadSquad` not awaited) | New invitees see an empty app (Phase 4) |
+| 1 | ~~Invite join runs after the first sync starts; join errors from `?join=` links are silent~~ **Fixed**: sign-in waits for join + squad load; setup-screen join syncs immediately; refusals shown as a banner | `LegacyApp` auth effect (`loadSquad` not awaited) | New invitees see an empty app (Phase 4) |
 | 2 | ~~Queued writes rejected by the database are deleted after 5 tries (after an `alert()`)~~ **Fixed**: parked on the device, shown via the dashboard chip with Retry/Discard, auto-retried on sign-in and squad change | `sync/flush.ts`, `sync/failedOps.ts` | Record lost from the device's upload queue |
 | 3 | ~~No DELETE/UPDATE storage policy on the `photos` bucket~~ **Fixed** (migration 20261022000000: uploader or app admin) | prod storage policies | Photo deletes/re-uploads fail (Phase 4) |
 | 4 | `deduplicateCodes` sorts by `createdAt`, which records never have | `domain/codes.ts` | Arbitrary record keeps a duplicated W/B code, not the earliest |
