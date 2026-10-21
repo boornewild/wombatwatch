@@ -58,7 +58,7 @@ test('a write the server keeps refusing is parked, shown, and can be discarded',
   await expect(chip).toHaveCount(0, { timeout: 10_000 });
 });
 
-/** Removes Bob from every squad straight in the local DB. (Through the API even an admin can't: bug #15.) */
+/** Removes Bob from every squad straight in the local DB, so each test starts with him in no squad. */
 const resetBob = () =>
   execSync(
     `npx supabase db query --local "delete from squad_members where user_id='00000000-0000-0000-0000-00000000000b'"`,

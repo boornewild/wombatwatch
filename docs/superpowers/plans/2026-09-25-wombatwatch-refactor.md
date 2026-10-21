@@ -780,7 +780,7 @@ Every production release is a merged PR. To roll back: `git revert <merge-sha> &
 |---|---|---|---|
 | 1 | Invite join runs after the first sync starts; join errors from `?join=` links are silent | `LegacyApp` auth effect (`loadSquad` not awaited) | New invitees see an empty app (Phase 4) |
 | 2 | ~~Queued writes rejected by the database are deleted after 5 tries (after an `alert()`)~~ **Fixed**: parked on the device, shown via the dashboard chip with Retry/Discard, auto-retried on sign-in and squad change | `sync/flush.ts`, `sync/failedOps.ts` | Record lost from the device's upload queue |
-| 3 | No DELETE/UPDATE storage policy on the `photos` bucket | prod storage policies | Photo deletes/re-uploads fail (Phase 4) |
+| 3 | ~~No DELETE/UPDATE storage policy on the `photos` bucket~~ **Fixed** (migration 20261022000000: uploader or app admin) | prod storage policies | Photo deletes/re-uploads fail (Phase 4) |
 | 4 | `deduplicateCodes` sorts by `createdAt`, which records never have | `domain/codes.ts` | Arbitrary record keeps a duplicated W/B code, not the earliest |
 | 5 | `today()` is the UTC date | `domain/format.ts` | Before 10–11am in NSW, new records default to yesterday |
 | 6 | `parseCSV` drops quote marks and breaks on quoted newlines | `domain/csv.ts` | CSV import mangles some notes |
@@ -792,4 +792,4 @@ Every production release is a merged PR. To roll back: `git revert <merge-sha> &
 | 12 | ~~`RENUMBER_BURROWS` pushes directly, never queued~~ **Fixed**: queued offline / on failure, and marked synced on success | `syncAction` | Renumbering offline never reached the server; renumbered burrows stayed "local edits" forever |
 | 13 | After a queued photo upload, the URL write-back to the stored photo record never runs (store looked up by the localStorage key) | legacy `flushQueue` (not reproduced in `sync/flush.ts`) | Stored photo record keeps `dataUrl: null`; a later sync restores the URL |
 | 14 | Every push sets `created_by` to the current user | `data/mappers.ts` (`*ToDb(record, uid)`) | The original creator is overwritten by the last editor ("Top Contributor", ownership) |
-| 15 | `squad_members_delete` policy queries `squad_members` from its own policy | prod RLS | Every delete fails with "infinite recursion detected in policy": squad admins cannot remove members (Phase 4) |
+| 15 | ~~`squad_members_delete` (and `_insert`) policy queries `squad_members` from its own policy~~ **Fixed** (migration 20261022000000, uses `is_squad_admin`) | prod RLS | Every delete fails with "infinite recursion detected in policy": squad admins cannot remove members (Phase 4) |
