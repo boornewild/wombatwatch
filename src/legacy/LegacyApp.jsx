@@ -31,6 +31,7 @@ import { cacheRemotePhotos, recoverBlankPhotos as recoverBlankPhotosWith, upload
 import { runFullSync } from '../sync/runFullSync';
 import { listFailed, retryFailed, retryAllFailed, discardFailed, describeFailedOp } from '../sync/failedOps';
 import { FailedSyncChip, FailedSyncList } from '../features/sync/FailedSync';
+import { InviteErrorBanner, inviteErrorMessage } from '../features/squads/InviteErrorBanner';
 import { markRecentlyDeleted as markRecentlyDeletedIn, getRecentlyDeleted as getRecentlyDeletedIn } from '../sync/recentlyDeleted';
 
 /* ════════════════════════════════════════════════════════════════
@@ -2899,10 +2900,7 @@ function SquadSetupScreen({onSquadReady,pendingToken}){
     setBusy(true);setErr(null);
     const{data,error}=await supa.rpc('join_squad_by_invite',{p_token:tk});
     if(error||!data?.ok){
-      const msg=data?.error==='invalid_token'?'That invite link is invalid or has already been revoked.'
-        :data?.error==='expired'?'This invite link has expired.'
-        :data?.error==='max_uses_reached'?'This invite link has reached its maximum uses.'
-        :error?.message||data?.error||'Could not join squad.';
+      const msg=data?.error?inviteErrorMessage(data.error):error?.message||'Could not join squad.';
       setErr(msg);setBusy(false);return;
     }
     await fetchSquadAndFinish();
@@ -5996,6 +5994,8 @@ function App(){
   // Detect an invite token in the URL (e.g. ?join=TOKEN). This is read once on mount;
   // if the user is already signed in we join immediately, otherwise we store it and
   // join after sign-in completes.
+  // join_squad_by_invite refusal code for a ?join= link, shown as a dismissible banner.
+  const [inviteError,setInviteError]=useState(null);
   const [pendingInviteToken]=useState(()=>{
     try{return new URLSearchParams(window.location.search).get('join')||null;}catch{return null;}
   });
@@ -6143,6 +6143,7 @@ function App(){
             if(inviteToken){
               const{data:jr}=await supa.rpc('join_squad_by_invite',{p_token:inviteToken});
               if(jr?.ok)console.info('[Squad] joined via invite token:',jr.squad_name);
+              else if(jr?.error)setInviteError(jr.error); // shown as a banner (bug #1: was silent)
               // Clear the token from the URL so refreshing doesn't re-trigger
               try{const u=new URL(window.location.href);u.searchParams.delete('join');window.history.replaceState({},'',u);}catch{}
             }
@@ -6172,11 +6173,12 @@ function App(){
           }catch{const c=getCachedSquad();if(c)setAuthSquad(c);const ca=getCachedAllSquads();if(ca)setAllSquads(ca);}
           finally{setSquadChecked(true);}
         };
-        loadSquad(pendingInviteToken);
         // Show the sync bar briefly, then hide it — sync continues in background
         setSyncing(true);
         setTimeout(()=>setSyncing(false),2000);
-        runSync().then(()=>{
+        // Join (if invited) and load the squad BEFORE the first sync. Run together, the sync could finish
+        // before the volunteer was a member, get nothing back, and leave them with an empty app (bug #1).
+        loadSquad(pendingInviteToken).then(()=>runSync()).then(()=>{
           flushQueue(user.id).then(r=>{if(r?.lostPhotoIds?.size)console.error('[Queue] Lost photos on login flush:',Array.from(r.lostPhotoIds));}).catch(()=>{});
         }).catch(e=>console.warn('[Supa] full sync error',e));
       }else{
@@ -6517,7 +6519,13 @@ function App(){
       <div data-theme={theme} className="app" style={{background:t.bg}}>
         <SquadSetupScreen
           pendingToken={pendingInviteToken}
-          onSquadReady={sq=>{cacheSquad(sq);setAuthSquad(sq);}}
+          onSquadReady={sq=>{
+            cacheSquad(sq);setAuthSquad(sq);
+            // Set eagerly so the sync below filters to the new squad, then pull its data straight away
+            // instead of waiting for the background sync (bug #1).
+            syncSession.currentSquadId=sq.id;syncSession.squadCenter=centreOfSquad(sq);
+            runSync().then(()=>flushQueue(authUser.id)).catch(e=>console.warn('[Squad] post-join sync failed',e)).finally(refreshQueue);
+          }}
         />
       </div>
     </ThemeCtx.Provider>;
@@ -6539,6 +6547,7 @@ function App(){
       {syncing&&<div style={{position:'fixed',top:0,left:'max(0px,calc(50vw - 240px))',right:'max(0px,calc(50vw - 240px))',height:3,zIndex:9999,overflow:'hidden'}}>
         <div style={{position:'absolute',top:0,left:0,right:0,bottom:0,background:'#fff',transformOrigin:'left',animation:'syncBar 1.4s ease-in-out infinite'}}/>
       </div>}
+      {inviteError&&<InviteErrorBanner code={inviteError} onDismiss={()=>setInviteError(null)}/>}
       {/* ── content area: grows to fill space above the tab bar ── */}
       <div className="content-area">
         {screen==='dashboard'&&<div className="scroll noscroll"><Dashboard data={data} nav={nav} onFAB={onFAB} online={online} queueLen={queueLen} failedCount={failedOps.length} onOpenFailed={()=>setModal('failed-sync')} openProfile={openProfile} streak={streak} volunteerCount={volunteerCount} squadLat={squadCenter?.lat} squadLng={squadCenter?.lng} squadName={authSquad?.name}/></div>}
